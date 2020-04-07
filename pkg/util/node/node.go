@@ -17,6 +17,7 @@ limitations under the License.
 package node
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -112,14 +113,14 @@ func GetNodeHostIP(node *v1.Node) (net.IP, error) {
 func GetNodeIP(client clientset.Interface, hostname string) net.IP {
 	var nodeIP net.IP
 	backoff := wait.Backoff{
-		Steps:    5,
+		Steps:    6,
 		Duration: 1 * time.Second,
 		Factor:   2.0,
 		Jitter:   0.2,
 	}
 
 	err := wait.ExponentialBackoff(backoff, func() (bool, error) {
-		node, err := client.CoreV1().Nodes().Get(hostname, metav1.GetOptions{})
+		node, err := client.CoreV1().Nodes().Get(context.TODO(), hostname, metav1.GetOptions{})
 		if err != nil {
 			klog.Errorf("Failed to retrieve node info: %v", err)
 			return false, nil
@@ -139,23 +140,37 @@ func GetNodeIP(client clientset.Interface, hostname string) net.IP {
 
 // GetZoneKey is a helper function that builds a string identifier that is unique per failure-zone;
 // it returns empty-string for no zone.
+// Since there are currently two separate zone keys:
+//   * "failure-domain.beta.kubernetes.io/zone"
+//   * "topology.kubernetes.io/zone"
+// GetZoneKey will first check failure-domain.beta.kubernetes.io/zone and if not exists, will then check
+// topology.kubernetes.io/zone
 func GetZoneKey(node *v1.Node) string {
 	labels := node.Labels
 	if labels == nil {
 		return ""
 	}
 
-	region, _ := labels[v1.LabelZoneRegion]
-	failureDomain, _ := labels[v1.LabelZoneFailureDomain]
+	// TODO: prefer stable labels for zone in v1.18
+	zone, ok := labels[v1.LabelZoneFailureDomain]
+	if !ok {
+		zone, _ = labels[v1.LabelZoneFailureDomainStable]
+	}
 
-	if region == "" && failureDomain == "" {
+	// TODO: prefer stable labels for region in v1.18
+	region, ok := labels[v1.LabelZoneRegion]
+	if !ok {
+		region, _ = labels[v1.LabelZoneRegionStable]
+	}
+
+	if region == "" && zone == "" {
 		return ""
 	}
 
 	// We include the null character just in case region or failureDomain has a colon
 	// (We do assume there's no null characters in a region or failureDomain)
 	// As a nice side-benefit, the null character is not printed by fmt.Print or glog
-	return region + ":\x00:" + failureDomain
+	return region + ":\x00:" + zone
 }
 
 type nodeForConditionPatch struct {
@@ -187,7 +202,7 @@ func SetNodeCondition(c clientset.Interface, node types.NodeName, condition v1.N
 	if err != nil {
 		return nil
 	}
-	_, err = c.CoreV1().Nodes().PatchStatus(string(node), patch)
+	_, err = c.CoreV1().Nodes().PatchStatus(context.TODO(), string(node), patch)
 	return err
 }
 
@@ -212,7 +227,7 @@ func PatchNodeCIDR(c clientset.Interface, node types.NodeName, cidr string) erro
 		return fmt.Errorf("failed to json.Marshal CIDR: %v", err)
 	}
 
-	if _, err := c.CoreV1().Nodes().Patch(string(node), types.StrategicMergePatchType, patchBytes); err != nil {
+	if _, err := c.CoreV1().Nodes().Patch(context.TODO(), string(node), types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{}); err != nil {
 		return fmt.Errorf("failed to patch node CIDR: %v", err)
 	}
 	return nil
@@ -233,7 +248,7 @@ func PatchNodeCIDRs(c clientset.Interface, node types.NodeName, cidrs []string) 
 		return fmt.Errorf("failed to json.Marshal CIDR: %v", err)
 	}
 	klog.V(4).Infof("cidrs patch bytes are:%s", string(patchBytes))
-	if _, err := c.CoreV1().Nodes().Patch(string(node), types.StrategicMergePatchType, patchBytes); err != nil {
+	if _, err := c.CoreV1().Nodes().Patch(context.TODO(), string(node), types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{}); err != nil {
 		return fmt.Errorf("failed to patch node CIDR: %v", err)
 	}
 	return nil
@@ -246,7 +261,7 @@ func PatchNodeStatus(c v1core.CoreV1Interface, nodeName types.NodeName, oldNode 
 		return nil, nil, err
 	}
 
-	updatedNode, err := c.Nodes().Patch(string(nodeName), types.StrategicMergePatchType, patchBytes, "status")
+	updatedNode, err := c.Nodes().Patch(context.TODO(), string(nodeName), types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{}, "status")
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to patch status %q for node %q: %v", patchBytes, nodeName, err)
 	}

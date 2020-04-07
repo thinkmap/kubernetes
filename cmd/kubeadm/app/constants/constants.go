@@ -27,11 +27,12 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/version"
+	"k8s.io/apimachinery/pkg/util/wait"
 	bootstrapapi "k8s.io/cluster-bootstrap/token/api"
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
-	"k8s.io/kubernetes/pkg/registry/core/service/ipallocator"
 	utilnet "k8s.io/utils/net"
 )
 
@@ -181,7 +182,11 @@ const (
 	// PatchNodeTimeout specifies how long kubeadm should wait for applying the label and taint on the control-plane before timing out
 	PatchNodeTimeout = 2 * time.Minute
 	// TLSBootstrapTimeout specifies how long kubeadm should wait for the kubelet to perform the TLS Bootstrap
-	TLSBootstrapTimeout = 2 * time.Minute
+	TLSBootstrapTimeout = 5 * time.Minute
+	// TLSBootstrapRetryInterval specifies how long kubeadm should wait before retrying the TLS Bootstrap check
+	TLSBootstrapRetryInterval = 5 * time.Second
+	// PullImageRetry specifies how many times ContainerRuntime retries when pulling image failed
+	PullImageRetry = 5
 	// PrepullImagesInParallelTimeout specifies how long kubeadm should wait for prepulling images in parallel before timing out
 	PrepullImagesInParallelTimeout = 10 * time.Second
 
@@ -204,7 +209,7 @@ const (
 	CertificateKeySize = 32
 
 	// LabelNodeRoleMaster specifies that a node is a control-plane
-	// This is a duplicate definition of the constant in pkg/controller/service/service_controller.go
+	// This is a duplicate definition of the constant in pkg/controller/service/controller.go
 	LabelNodeRoleMaster = "node-role.kubernetes.io/master"
 
 	// AnnotationKubeadmCRISocket specifies the annotation kubeadm uses to preserve the crisocket information given to kubeadm at
@@ -262,10 +267,7 @@ const (
 	MinExternalEtcdVersion = "3.2.18"
 
 	// DefaultEtcdVersion indicates the default etcd version that kubeadm uses
-	DefaultEtcdVersion = "3.3.15-0"
-
-	// PauseVersion indicates the default pause image version for kubeadm
-	PauseVersion = "3.1"
+	DefaultEtcdVersion = "3.4.4-0"
 
 	// Etcd defines variable used internally when referring to etcd component
 	Etcd = "etcd"
@@ -279,6 +281,12 @@ const (
 	KubeProxy = "kube-proxy"
 	// HyperKube defines variable used internally when referring to the hyperkube image
 	HyperKube = "hyperkube"
+	// CoreDNS defines variable used internally when referring to the CoreDNS component
+	CoreDNS = "CoreDNS"
+	// KubeDNS defines variable used internally when referring to the KubeDNS component
+	KubeDNS = "kube-dns"
+	// Kubelet defines variable used internally when referring to the Kubelet
+	Kubelet = "kubelet"
 
 	// SelfHostingPrefix describes the prefix workloads that are self-hosted by kubeadm has
 	SelfHostingPrefix = "self-hosted-"
@@ -335,7 +343,7 @@ const (
 	KubeDNSVersion = "1.14.13"
 
 	// CoreDNSVersion is the version of CoreDNS to be deployed if it is used
-	CoreDNSVersion = "1.6.2"
+	CoreDNSVersion = "1.6.7"
 
 	// ClusterConfigurationKind is the string kind value for the ClusterConfiguration struct
 	ClusterConfigurationKind = "ClusterConfiguration"
@@ -362,14 +370,22 @@ const (
 	// KubeletPort is the default port for the kubelet server on each host machine.
 	// May be overridden by a flag at startup.
 	KubeletPort = 10250
-	// InsecureSchedulerPort is the default port for the scheduler status server.
+	// KubeSchedulerPort is the default port for the scheduler status server.
 	// May be overridden by a flag at startup.
-	// Deprecated: use the secure KubeSchedulerPort instead.
-	InsecureSchedulerPort = 10251
-	// InsecureKubeControllerManagerPort is the default port for the controller manager status server.
+	KubeSchedulerPort = 10259
+	// KubeControllerManagerPort is the default port for the controller manager status server.
 	// May be overridden by a flag at startup.
-	// Deprecated: use the secure KubeControllerManagerPort instead.
-	InsecureKubeControllerManagerPort = 10252
+	KubeControllerManagerPort = 10257
+
+	// EtcdAdvertiseClientUrlsAnnotationKey is the annotation key on every etcd pod, describing the
+	// advertise client URLs
+	EtcdAdvertiseClientUrlsAnnotationKey = "kubeadm.kubernetes.io/etcd.advertise-client-urls"
+	// KubeAPIServerAdvertiseAddressEndpointAnnotationKey is the annotation key on every apiserver pod,
+	// describing the API endpoint (advertise address and bind port of the api server)
+	KubeAPIServerAdvertiseAddressEndpointAnnotationKey = "kubeadm.kubernetes.io/kube-apiserver.advertise-address.endpoint"
+
+	// ControlPlaneTier is the value used in the tier label to identify control plane components
+	ControlPlaneTier = "control-plane"
 
 	// Mode* constants were copied from pkg/kubeapiserver/authorizer/modes
 	// to avoid kubeadm dependency on the internal module
@@ -412,45 +428,79 @@ var (
 	ControlPlaneComponents = []string{KubeAPIServer, KubeControllerManager, KubeScheduler}
 
 	// MinimumControlPlaneVersion specifies the minimum control plane version kubeadm can deploy
-	MinimumControlPlaneVersion = version.MustParseSemantic("v1.16.0")
+	MinimumControlPlaneVersion = version.MustParseSemantic("v1.17.0")
 
 	// MinimumKubeletVersion specifies the minimum version of kubelet which kubeadm supports
-	MinimumKubeletVersion = version.MustParseSemantic("v1.16.0")
+	MinimumKubeletVersion = version.MustParseSemantic("v1.17.0")
 
 	// CurrentKubernetesVersion specifies current Kubernetes version supported by kubeadm
-	CurrentKubernetesVersion = version.MustParseSemantic("v1.17.0")
+	CurrentKubernetesVersion = version.MustParseSemantic("v1.18.0")
 
 	// SupportedEtcdVersion lists officially supported etcd versions with corresponding Kubernetes releases
 	SupportedEtcdVersion = map[uint8]string{
 		13: "3.2.24",
 		14: "3.3.10",
 		15: "3.3.10",
-		16: "3.3.15-0",
-		17: "3.3.15-0",
-		18: "3.3.15-0",
+		16: "3.3.17-0",
+		17: "3.4.3-0",
+		18: "3.4.3-0",
+		19: "3.4.4-0",
 	}
 
 	// KubeadmCertsClusterRoleName sets the name for the ClusterRole that allows
 	// the bootstrap tokens to access the kubeadm-certs Secret during the join of a new control-plane
 	KubeadmCertsClusterRoleName = fmt.Sprintf("kubeadm:%s", KubeadmCertsSecret)
+
+	// StaticPodMirroringDefaultRetry is used a backoff strategy for
+	// waiting for static pods to be mirrored to the apiserver.
+	StaticPodMirroringDefaultRetry = wait.Backoff{
+		Steps:    30,
+		Duration: 1 * time.Second,
+		Factor:   1.0,
+		Jitter:   0.1,
+	}
 )
 
 // EtcdSupportedVersion returns officially supported version of etcd for a specific Kubernetes release
-// if passed version is not listed, the function returns nil and an error
-func EtcdSupportedVersion(versionString string) (*version.Version, error) {
+// If passed version is not in the given list, the function returns the nearest version with a warning
+func EtcdSupportedVersion(supportedEtcdVersion map[uint8]string, versionString string) (etcdVersion *version.Version, warning, err error) {
 	kubernetesVersion, err := version.ParseSemantic(versionString)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	desiredVersion, etcdStringVersion := uint8(kubernetesVersion.Minor()), ""
+
+	min, max := ^uint8(0), uint8(0)
+	for k, v := range supportedEtcdVersion {
+		if desiredVersion == k {
+			etcdStringVersion = v
+			break
+		}
+		if k < min {
+			min = k
+		}
+		if k > max {
+			max = k
+		}
 	}
 
-	if etcdStringVersion, ok := SupportedEtcdVersion[uint8(kubernetesVersion.Minor())]; ok {
-		etcdVersion, err := version.ParseSemantic(etcdStringVersion)
-		if err != nil {
-			return nil, err
+	if len(etcdStringVersion) == 0 {
+		if desiredVersion < min {
+			etcdStringVersion = supportedEtcdVersion[min]
 		}
-		return etcdVersion, nil
+		if desiredVersion > max {
+			etcdStringVersion = supportedEtcdVersion[max]
+		}
+		warning = fmt.Errorf("could not find officially supported version of etcd for Kubernetes %s, falling back to the nearest etcd version (%s)",
+			versionString, etcdStringVersion)
 	}
-	return nil, errors.Errorf("unsupported or unknown Kubernetes version(%v)", kubernetesVersion)
+
+	etcdVersion, err = version.ParseSemantic(etcdStringVersion)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return etcdVersion, warning, nil
 }
 
 // GetStaticPodDirectory returns the location on the disk where the Static Pod should be present
@@ -532,7 +582,7 @@ func GetDNSIP(svcSubnetList string, isDualStack bool) (net.IP, error) {
 	}
 
 	// Selects the 10th IP in service subnet CIDR range as dnsIP
-	dnsIP, err := ipallocator.GetIndexedIP(svcSubnetCIDR, 10)
+	dnsIP, err := utilnet.GetIndexedIP(svcSubnetCIDR, 10)
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to get internal Kubernetes Service IP from the given service CIDR")
 	}
@@ -569,7 +619,7 @@ func GetAPIServerVirtualIP(svcSubnetList string, isDualStack bool) (net.IP, erro
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to get internal Kubernetes Service IP from the given service CIDR")
 	}
-	internalAPIServerVirtualIP, err := ipallocator.GetIndexedIP(svcSubnet, 1)
+	internalAPIServerVirtualIP, err := utilnet.GetIndexedIP(svcSubnet, 1)
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to get the first IP address from the given CIDR: %s", svcSubnet.String())
 	}

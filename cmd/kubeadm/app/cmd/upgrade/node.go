@@ -29,7 +29,6 @@ import (
 	phases "k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/upgrade/node"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
-	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	configutil "k8s.io/kubernetes/cmd/kubeadm/app/util/config"
 )
 
@@ -94,10 +93,6 @@ func NewCmdNode() *cobra.Command {
 	// command help, adding --skip-phases flag and by adding phases subcommands
 	nodeRunner.BindToCommand(cmd)
 
-	// upgrade node config command is subject to GA deprecation policy, so we should deprecate it
-	// and keep it here for one year or three releases - the longer of the two - starting from v1.15 included
-	cmd.AddCommand(NewCmdUpgradeNodeConfig())
-
 	return cmd
 }
 
@@ -107,6 +102,7 @@ func newNodeOptions() *nodeOptions {
 		kubeConfigPath: constants.GetKubeletKubeConfigPath(),
 		dryRun:         false,
 		renewCerts:     true,
+		etcdUpgrade:    true,
 	}
 }
 
@@ -114,6 +110,7 @@ func addUpgradeNodeFlags(flagSet *flag.FlagSet, nodeOptions *nodeOptions) {
 	options.AddKubeConfigFlag(flagSet, &nodeOptions.kubeConfigPath)
 	flagSet.BoolVar(&nodeOptions.dryRun, options.DryRun, nodeOptions.dryRun, "Do not change any state, just output the actions that would be performed.")
 	flagSet.StringVar(&nodeOptions.kubeletVersion, options.KubeletVersion, nodeOptions.kubeletVersion, "The *desired* version for the kubelet config after the upgrade. If not specified, the KubernetesVersion from the kubeadm-config ConfigMap will be used")
+	flagSet.MarkDeprecated(options.KubeletVersion, "This flag is deprecated and will be removed in a future version.")
 	flagSet.BoolVar(&nodeOptions.renewCerts, options.CertificateRenewal, nodeOptions.renewCerts, "Perform the renewal of certificates used by component changed during upgrades.")
 	flagSet.BoolVar(&nodeOptions.etcdUpgrade, options.EtcdUpgrade, nodeOptions.etcdUpgrade, "Perform the upgrade of etcd.")
 }
@@ -130,7 +127,7 @@ func newNodeData(cmd *cobra.Command, args []string, options *nodeOptions) (*node
 	// isControlPlane checks if a node is a control-plane node by looking up
 	// the kube-apiserver manifest file
 	isControlPlaneNode := true
-	filepath := kubeadmconstants.GetStaticPodFilepath(kubeadmconstants.KubeAPIServer, kubeadmconstants.GetStaticPodDirectory())
+	filepath := constants.GetStaticPodFilepath(constants.KubeAPIServer, constants.GetStaticPodDirectory())
 	if _, err := os.Stat(filepath); os.IsNotExist(err) {
 		isControlPlaneNode = false
 	}
@@ -193,42 +190,4 @@ func (d *nodeData) Client() clientset.Interface {
 // KustomizeDir returns the folder where kustomize patches for static pod manifest are stored
 func (d *nodeData) KustomizeDir() string {
 	return d.kustomizeDir
-}
-
-// NewCmdUpgradeNodeConfig returns the cobra.Command for downloading the new/upgrading the kubelet configuration from the kubelet-config-1.X
-// ConfigMap in the cluster
-// TODO: to remove when 1.18 is released
-func NewCmdUpgradeNodeConfig() *cobra.Command {
-	nodeOptions := newNodeOptions()
-	nodeRunner := workflow.NewRunner()
-
-	cmd := &cobra.Command{
-		Use:        "config",
-		Short:      "Download the kubelet configuration from the cluster ConfigMap kubelet-config-1.X, where X is the minor version of the kubelet",
-		Deprecated: "use \"kubeadm upgrade node\" instead",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			// This is required for preserving the old behavior of `kubeadm upgrade node config`.
-			// The new implementation exposed as a phase under `kubeadm upgrade node` infers the target
-			// kubelet config version from the kubeadm-config ConfigMap
-			if len(nodeOptions.kubeletVersion) == 0 {
-				return errors.New("the --kubelet-version argument is required")
-			}
-
-			return nodeRunner.Run(args)
-		},
-	}
-
-	// adds flags to the node command
-	addUpgradeNodeFlags(cmd.Flags(), nodeOptions)
-
-	// initialize the workflow runner with the list of phases
-	nodeRunner.AppendPhase(phases.NewKubeletConfigPhase())
-
-	// sets the data builder function, that will be used by the runner
-	// both when running the entire workflow or single phases
-	nodeRunner.SetDataInitializer(func(cmd *cobra.Command, args []string) (workflow.RunData, error) {
-		return newNodeData(cmd, args, nodeOptions)
-	})
-
-	return cmd
 }

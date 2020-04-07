@@ -35,7 +35,6 @@ import (
 	api "k8s.io/kubernetes/pkg/apis/core"
 	qoshelper "k8s.io/kubernetes/pkg/apis/core/helper/qos"
 	k8s_api_v1 "k8s.io/kubernetes/pkg/apis/core/v1"
-	schedulerapi "k8s.io/kubernetes/pkg/scheduler/api"
 	"k8s.io/kubernetes/pkg/util/tolerations"
 	pluginapi "k8s.io/kubernetes/plugin/pkg/admission/podtolerationrestriction/apis/podtolerationrestriction"
 )
@@ -102,7 +101,7 @@ func (p *Plugin) Admit(ctx context.Context, a admission.Attributes, o admission.
 
 	if qoshelper.GetPodQOS(pod) != api.PodQOSBestEffort {
 		extraTolerations = append(extraTolerations, api.Toleration{
-			Key:      schedulerapi.TaintNodeMemoryPressure,
+			Key:      corev1.TaintNodeMemoryPressure,
 			Operator: api.TolerationOpExists,
 			Effect:   api.TaintEffectNoSchedule,
 		})
@@ -206,7 +205,7 @@ func (p *Plugin) getNamespace(nsName string) (*corev1.Namespace, error) {
 	namespace, err := p.namespaceLister.Get(nsName)
 	if errors.IsNotFound(err) {
 		// in case of latency in our caches, make a call direct to storage to verify that it truly exists or not
-		namespace, err = p.client.CoreV1().Namespaces().Get(nsName, metav1.GetOptions{})
+		namespace, err = p.client.CoreV1().Namespaces().Get(context.TODO(), nsName, metav1.GetOptions{})
 		if err != nil {
 			if errors.IsNotFound(err) {
 				return nil, err

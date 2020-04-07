@@ -18,6 +18,7 @@ package logs
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -70,6 +71,9 @@ var (
 		# Show all logs from pod nginx written in the last hour
 		kubectl logs --since=1h nginx
 
+		# Show logs from a kubelet with an expired serving certificate
+		kubectl logs --insecure-skip-tls-verify-backend nginx
+
 		# Return snapshot logs from first container of a job named hello
 		kubectl logs job/hello
 
@@ -94,15 +98,16 @@ type LogsOptions struct {
 	ConsumeRequestFn func(rest.ResponseWrapper, io.Writer) error
 
 	// PodLogOptions
-	SinceTime       string
-	SinceSeconds    time.Duration
-	Follow          bool
-	Previous        bool
-	Timestamps      bool
-	IgnoreLogErrors bool
-	LimitBytes      int64
-	Tail            int64
-	Container       string
+	SinceTime                    string
+	SinceSeconds                 time.Duration
+	Follow                       bool
+	Previous                     bool
+	Timestamps                   bool
+	IgnoreLogErrors              bool
+	LimitBytes                   int64
+	Tail                         int64
+	Container                    string
+	InsecureSkipTLSVerifyBackend bool
 
 	// whether or not a container name was given via --container
 	ContainerNameSpecified bool
@@ -149,6 +154,11 @@ func NewCmdLogs(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.C
 			cmdutil.CheckErr(o.RunLogs())
 		},
 	}
+	o.AddFlags(cmd)
+	return cmd
+}
+
+func (o *LogsOptions) AddFlags(cmd *cobra.Command) {
 	cmd.Flags().BoolVar(&o.AllContainers, "all-containers", o.AllContainers, "Get all containers' logs in the pod(s).")
 	cmd.Flags().BoolVarP(&o.Follow, "follow", "f", o.Follow, "Specify if the logs should be streamed.")
 	cmd.Flags().BoolVar(&o.Timestamps, "timestamps", o.Timestamps, "Include timestamps on each line in the log output")
@@ -159,19 +169,21 @@ func NewCmdLogs(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.C
 	cmd.Flags().StringVar(&o.SinceTime, "since-time", o.SinceTime, i18n.T("Only return logs after a specific date (RFC3339). Defaults to all logs. Only one of since-time / since may be used."))
 	cmd.Flags().DurationVar(&o.SinceSeconds, "since", o.SinceSeconds, "Only return logs newer than a relative duration like 5s, 2m, or 3h. Defaults to all logs. Only one of since-time / since may be used.")
 	cmd.Flags().StringVarP(&o.Container, "container", "c", o.Container, "Print the logs of this container")
+	cmd.Flags().BoolVar(&o.InsecureSkipTLSVerifyBackend, "insecure-skip-tls-verify-backend", o.InsecureSkipTLSVerifyBackend,
+		"Skip verifying the identity of the kubelet that logs are requested from.  In theory, an attacker could provide invalid log content back. You might want to use this if your kubelet serving certificates have expired.")
 	cmdutil.AddPodRunningTimeoutFlag(cmd, defaultPodLogsTimeout)
 	cmd.Flags().StringVarP(&o.Selector, "selector", "l", o.Selector, "Selector (label query) to filter on.")
 	cmd.Flags().IntVar(&o.MaxFollowConcurrency, "max-log-requests", o.MaxFollowConcurrency, "Specify maximum number of concurrent logs to follow when using by a selector. Defaults to 5.")
 	cmd.Flags().BoolVar(&o.Prefix, "prefix", o.Prefix, "Prefix each log line with the log source (pod name and container name)")
-	return cmd
 }
 
 func (o *LogsOptions) ToLogOptions() (*corev1.PodLogOptions, error) {
 	logOptions := &corev1.PodLogOptions{
-		Container:  o.Container,
-		Follow:     o.Follow,
-		Previous:   o.Previous,
-		Timestamps: o.Timestamps,
+		Container:                    o.Container,
+		Follow:                       o.Follow,
+		Previous:                     o.Previous,
+		Timestamps:                   o.Timestamps,
+		InsecureSkipTLSVerifyBackend: o.InsecureSkipTLSVerifyBackend,
 	}
 
 	if len(o.SinceTime) > 0 {
@@ -393,7 +405,7 @@ func (o LogsOptions) addPrefixIfNeeded(ref corev1.ObjectReference, writer io.Wri
 // Because the function is defined to read from request until io.EOF, it does
 // not treat an io.EOF as an error to be reported.
 func DefaultConsumeRequest(request rest.ResponseWrapper, out io.Writer) error {
-	readCloser, err := request.Stream()
+	readCloser, err := request.Stream(context.TODO())
 	if err != nil {
 		return err
 	}

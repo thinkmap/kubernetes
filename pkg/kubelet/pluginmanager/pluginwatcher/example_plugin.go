@@ -17,6 +17,7 @@ limitations under the License.
 package pluginwatcher
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -24,7 +25,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"k8s.io/klog"
 
@@ -88,10 +88,9 @@ func NewTestExamplePlugin(pluginName string, pluginType string, endpoint string,
 }
 
 // GetPluginInfo returns a PluginInfo object
-func GetPluginInfo(plugin *examplePlugin, foundInDeprecatedDir bool) cache.PluginInfo {
+func GetPluginInfo(plugin *examplePlugin) cache.PluginInfo {
 	return cache.PluginInfo{
-		SocketPath:           plugin.endpoint,
-		FoundInDeprecatedDir: foundInDeprecatedDir,
+		SocketPath: plugin.endpoint,
 	}
 }
 

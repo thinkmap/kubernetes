@@ -28,7 +28,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	metav1beta1 "k8s.io/apimachinery/pkg/apis/meta/v1beta1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -81,7 +80,6 @@ type ServiceStorage interface {
 	rest.CreaterUpdater
 	rest.GracefulDeleter
 	rest.Watcher
-	rest.TableConvertor
 	rest.Exporter
 	rest.StorageVersionProvider
 }
@@ -550,7 +548,7 @@ func (rs *REST) ResourceLocation(ctx context.Context, id string) (*url.URL, http
 	return nil, nil, errors.NewServiceUnavailable(fmt.Sprintf("no endpoints available for service %q", id))
 }
 
-func (r *REST) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1beta1.Table, error) {
+func (r *REST) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
 	return r.services.ConvertToTable(ctx, object, tableOptions)
 }
 
@@ -561,7 +559,7 @@ func (r *REST) getAllocatorByClusterIP(service *api.Service) ipallocator.Interfa
 	}
 
 	secondaryAllocatorCIDR := r.secondaryServiceIPs.CIDR()
-	if netutil.IsIPv6String(service.Spec.ClusterIP) && netutil.IsIPv6CIDR(&secondaryAllocatorCIDR) {
+	if netutil.IsIPv6String(service.Spec.ClusterIP) == netutil.IsIPv6CIDR(&secondaryAllocatorCIDR) {
 		return r.secondaryServiceIPs
 	}
 
@@ -576,7 +574,7 @@ func (r *REST) getAllocatorBySpec(service *api.Service) ipallocator.Interface {
 	}
 
 	secondaryAllocatorCIDR := r.secondaryServiceIPs.CIDR()
-	if *(service.Spec.IPFamily) == api.IPv6Protocol && netutil.IsIPv6CIDR(&secondaryAllocatorCIDR) {
+	if (*(service.Spec.IPFamily) == api.IPv6Protocol) == netutil.IsIPv6CIDR(&secondaryAllocatorCIDR) {
 		return r.secondaryServiceIPs
 	}
 

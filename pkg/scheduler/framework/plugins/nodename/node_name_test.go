@@ -17,28 +17,26 @@ limitations under the License.
 package nodename
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/kubernetes/pkg/scheduler/algorithm/predicates"
 	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
-	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
+	schedulertypes "k8s.io/kubernetes/pkg/scheduler/types"
 )
 
 func TestNodeName(t *testing.T) {
 	tests := []struct {
 		pod        *v1.Pod
 		node       *v1.Node
-		fits       bool
 		name       string
 		wantStatus *framework.Status
 	}{
 		{
 			pod:  &v1.Pod{},
 			node: &v1.Node{},
-			fits: true,
 			name: "no host specified",
 		},
 		{
@@ -52,7 +50,6 @@ func TestNodeName(t *testing.T) {
 					Name: "foo",
 				},
 			},
-			fits: true,
 			name: "host matches",
 		},
 		{
@@ -66,19 +63,18 @@ func TestNodeName(t *testing.T) {
 					Name: "foo",
 				},
 			},
-			fits:       false,
 			name:       "host doesn't match",
-			wantStatus: framework.NewStatus(framework.UnschedulableAndUnresolvable, predicates.ErrPodNotMatchHostName.GetReason()),
+			wantStatus: framework.NewStatus(framework.UnschedulableAndUnresolvable, ErrReason),
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			nodeInfo := schedulernodeinfo.NewNodeInfo()
+			nodeInfo := schedulertypes.NewNodeInfo()
 			nodeInfo.SetNode(test.node)
 
 			p, _ := New(nil, nil)
-			gotStatus := p.(framework.FilterPlugin).Filter(nil, test.pod, nodeInfo)
+			gotStatus := p.(framework.FilterPlugin).Filter(context.Background(), nil, test.pod, nodeInfo)
 			if !reflect.DeepEqual(gotStatus, test.wantStatus) {
 				t.Errorf("status does not match: %v, want: %v", gotStatus, test.wantStatus)
 			}

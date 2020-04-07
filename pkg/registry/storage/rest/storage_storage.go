@@ -104,14 +104,12 @@ func (p RESTStorageProvider) v1beta1Storage(apiResourceConfigSource serverstorag
 		storage["csinodes"] = csiNodeStorage.CSINode
 	}
 
-	// register csidrivers if CSIDriverRegistry feature gate is enabled
-	if utilfeature.DefaultFeatureGate.Enabled(features.CSIDriverRegistry) {
-		csiDriverStorage, err := csidriverstore.NewStorage(restOptionsGetter)
-		if err != nil {
-			return storage, err
-		}
-		storage["csidrivers"] = csiDriverStorage.CSIDriver
+	// register csidrivers
+	csiDriverStorage, err := csidriverstore.NewStorage(restOptionsGetter)
+	if err != nil {
+		return storage, err
 	}
+	storage["csidrivers"] = csiDriverStorage.CSIDriver
 
 	return storage, nil
 }
@@ -134,6 +132,22 @@ func (p RESTStorageProvider) v1Storage(apiResourceConfigSource serverstorage.API
 		"volumeattachments":        volumeAttachmentStorage.VolumeAttachment,
 		"volumeattachments/status": volumeAttachmentStorage.Status,
 	}
+
+	// register csinodes if CSINodeInfo feature gate is enabled
+	if utilfeature.DefaultFeatureGate.Enabled(features.CSINodeInfo) {
+		csiNodeStorage, err := csinodestore.NewStorage(restOptionsGetter)
+		if err != nil {
+			return nil, err
+		}
+		storage["csinodes"] = csiNodeStorage.CSINode
+	}
+
+	// register csidrivers
+	csiDriverStorage, err := csidriverstore.NewStorage(restOptionsGetter)
+	if err != nil {
+		return storage, err
+	}
+	storage["csidrivers"] = csiDriverStorage.CSIDriver
 
 	return storage, nil
 }

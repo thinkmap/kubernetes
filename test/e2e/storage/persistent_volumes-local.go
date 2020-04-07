@@ -17,6 +17,7 @@ limitations under the License.
 package storage
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -42,7 +43,8 @@ import (
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2epv "k8s.io/kubernetes/test/e2e/framework/pv"
-	e2esset "k8s.io/kubernetes/test/e2e/framework/statefulset"
+	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
+	e2estatefulset "k8s.io/kubernetes/test/e2e/framework/statefulset"
 	"k8s.io/kubernetes/test/e2e/storage/utils"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 )
@@ -215,7 +217,7 @@ var _ = utils.SIGDescribe("PersistentVolumes-local ", func() {
 					writeCmd := createWriteCmd(volumeDir, testFile, testFileContent, testVol.localVolumeType)
 
 					ginkgo.By("Writing in pod1")
-					podRWCmdExec(pod1, writeCmd)
+					podRWCmdExec(f, pod1, writeCmd)
 				})
 
 				ginkgo.AfterEach(func() {
@@ -226,35 +228,35 @@ var _ = utils.SIGDescribe("PersistentVolumes-local ", func() {
 				ginkgo.It("should be able to mount volume and read from pod1", func() {
 					ginkgo.By("Reading in pod1")
 					// testFileContent was written in BeforeEach
-					testReadFileContent(volumeDir, testFile, testFileContent, pod1, testVolType)
+					testReadFileContent(f, volumeDir, testFile, testFileContent, pod1, testVolType)
 				})
 
 				ginkgo.It("should be able to mount volume and write from pod1", func() {
 					// testFileContent was written in BeforeEach
-					testReadFileContent(volumeDir, testFile, testFileContent, pod1, testVolType)
+					testReadFileContent(f, volumeDir, testFile, testFileContent, pod1, testVolType)
 
 					ginkgo.By("Writing in pod1")
 					writeCmd := createWriteCmd(volumeDir, testFile, testVol.ltr.Path /*writeTestFileContent*/, testVolType)
-					podRWCmdExec(pod1, writeCmd)
+					podRWCmdExec(f, pod1, writeCmd)
 				})
 			})
 
 			ginkgo.Context("Two pods mounting a local volume at the same time", func() {
 				ginkgo.It("should be able to write from pod1 and read from pod2", func() {
-					twoPodsReadWriteTest(config, testVol)
+					twoPodsReadWriteTest(f, config, testVol)
 				})
 			})
 
 			ginkgo.Context("Two pods mounting a local volume one after the other", func() {
 				ginkgo.It("should be able to write from pod1 and read from pod2", func() {
-					twoPodsReadWriteSerialTest(config, testVol)
+					twoPodsReadWriteSerialTest(f, config, testVol)
 				})
 			})
 
 			ginkgo.Context("Set fsGroup for local volume", func() {
 				ginkgo.BeforeEach(func() {
 					if testVolType == BlockLocalVolumeType {
-						framework.Skipf("We don't set fsGroup on block device, skipped.")
+						e2eskipper.Skipf("We don't set fsGroup on block device, skipped.")
 					}
 				})
 
@@ -278,7 +280,7 @@ var _ = utils.SIGDescribe("PersistentVolumes-local ", func() {
 				})
 
 				ginkgo.It("should set different fsGroup for second pod if first pod is deleted", func() {
-					framework.Skipf("Disabled temporarily, reopen after #73168 is fixed")
+					e2eskipper.Skipf("Disabled temporarily, reopen after #73168 is fixed")
 					fsGroup1, fsGroup2 := int64(1234), int64(4321)
 					ginkgo.By("Create first pod and check fsGroup is set")
 					pod1 := createPodWithFsGroupTest(config, testVol, fsGroup1, fsGroup1)
@@ -317,14 +319,14 @@ var _ = utils.SIGDescribe("PersistentVolumes-local ", func() {
 
 		ginkgo.It("should fail due to wrong node", func() {
 			if len(config.nodes) < 2 {
-				framework.Skipf("Runs only when number of nodes >= 2")
+				e2eskipper.Skipf("Runs only when number of nodes >= 2")
 			}
 
 			testVols := setupLocalVolumesPVCsPVs(config, DirectoryLocalVolumeType, config.node0, 1, immediateMode)
 			testVol := testVols[0]
 
 			pod := makeLocalPodWithNodeName(config, testVol, config.nodes[1].Name)
-			pod, err := config.client.CoreV1().Pods(config.ns).Create(pod)
+			pod, err := config.client.CoreV1().Pods(config.ns).Create(context.TODO(), pod, metav1.CreateOptions{})
 			framework.ExpectNoError(err)
 
 			err = e2epod.WaitTimeoutForPodRunningInNamespace(config.client, pod.Name, pod.Namespace, framework.PodStartShortTimeout)
@@ -342,7 +344,7 @@ var _ = utils.SIGDescribe("PersistentVolumes-local ", func() {
 
 		ginkgo.BeforeEach(func() {
 			if len(config.nodes) < 2 {
-				framework.Skipf("Runs only when number of nodes >= 2")
+				e2eskipper.Skipf("Runs only when number of nodes >= 2")
 			}
 
 			volumeType = DirectoryLocalVolumeType
@@ -393,7 +395,7 @@ var _ = utils.SIGDescribe("PersistentVolumes-local ", func() {
 
 		ginkgo.It("should use volumes spread across nodes when pod has anti-affinity", func() {
 			if len(config.nodes) < ssReplicas {
-				framework.Skipf("Runs only when number of nodes >= %v", ssReplicas)
+				e2eskipper.Skipf("Runs only when number of nodes >= %v", ssReplicas)
 			}
 			ginkgo.By("Creating a StatefulSet with pod anti-affinity on nodes")
 			ss := createStatefulSet(config, ssReplicas, volsPerNode, true, false)
@@ -408,7 +410,7 @@ var _ = utils.SIGDescribe("PersistentVolumes-local ", func() {
 
 		ginkgo.It("should use volumes spread across nodes when pod management is parallel and pod has anti-affinity", func() {
 			if len(config.nodes) < ssReplicas {
-				framework.Skipf("Runs only when number of nodes >= %v", ssReplicas)
+				e2eskipper.Skipf("Runs only when number of nodes >= %v", ssReplicas)
 			}
 			ginkgo.By("Creating a StatefulSet with pod anti-affinity on nodes")
 			ss := createStatefulSet(config, ssReplicas, 1, true, true)
@@ -455,7 +457,7 @@ var _ = utils.SIGDescribe("PersistentVolumes-local ", func() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				w, err := config.client.CoreV1().PersistentVolumes().Watch(metav1.ListOptions{})
+				w, err := config.client.CoreV1().PersistentVolumes().Watch(context.TODO(), metav1.ListOptions{})
 				framework.ExpectNoError(err)
 				if w == nil {
 					return
@@ -474,7 +476,7 @@ var _ = utils.SIGDescribe("PersistentVolumes-local ", func() {
 						if pv.Status.Phase == v1.VolumeBound || pv.Status.Phase == v1.VolumeAvailable {
 							continue
 						}
-						pv, err = config.client.CoreV1().PersistentVolumes().Get(pv.Name, metav1.GetOptions{})
+						pv, err = config.client.CoreV1().PersistentVolumes().Get(context.TODO(), pv.Name, metav1.GetOptions{})
 						if apierrors.IsNotFound(err) {
 							continue
 						}
@@ -485,7 +487,7 @@ var _ = utils.SIGDescribe("PersistentVolumes-local ", func() {
 								if localVolume.pv.Name != pv.Name {
 									continue
 								}
-								err = config.client.CoreV1().PersistentVolumes().Delete(pv.Name, &metav1.DeleteOptions{})
+								err = config.client.CoreV1().PersistentVolumes().Delete(context.TODO(), pv.Name, metav1.DeleteOptions{})
 								framework.ExpectNoError(err)
 								pvConfig := makeLocalPVConfig(config, localVolume)
 								localVolume.pv, err = e2epv.CreatePV(config.client, e2epv.MakePersistentVolume(pvConfig))
@@ -548,9 +550,15 @@ var _ = utils.SIGDescribe("PersistentVolumes-local ", func() {
 						framework.ExpectNoError(err)
 						pvcs = append(pvcs, pvc)
 					}
-
-					pod := e2epod.MakeSecPod(config.ns, pvcs, nil, false, "sleep 1", false, false, selinuxLabel, nil)
-					pod, err := config.client.CoreV1().Pods(config.ns).Create(pod)
+					podConfig := e2epod.Config{
+						NS:           config.ns,
+						PVCs:         pvcs,
+						Command:      "sleep 1",
+						SeLinuxLabel: selinuxLabel,
+					}
+					pod, err := e2epod.MakeSecPod(&podConfig)
+					framework.ExpectNoError(err)
+					pod, err = config.client.CoreV1().Pods(config.ns).Create(context.TODO(), pod, metav1.CreateOptions{})
 					framework.ExpectNoError(err)
 					pods[pod.Name] = pod
 					numCreated++
@@ -570,8 +578,9 @@ var _ = utils.SIGDescribe("PersistentVolumes-local ", func() {
 			}()
 
 			ginkgo.By("Waiting for all pods to complete successfully")
-			err := wait.PollImmediate(time.Second, 5*time.Minute, func() (done bool, err error) {
-				podsList, err := config.client.CoreV1().Pods(config.ns).List(metav1.ListOptions{})
+			const completeTimeout = 5 * time.Minute
+			waitErr := wait.PollImmediate(time.Second, completeTimeout, func() (done bool, err error) {
+				podsList, err := config.client.CoreV1().Pods(config.ns).List(context.TODO(), metav1.ListOptions{})
 				if err != nil {
 					return false, err
 				}
@@ -589,15 +598,15 @@ var _ = utils.SIGDescribe("PersistentVolumes-local ", func() {
 						delete(pods, pod.Name)
 						numFinished++
 						framework.Logf("%v/%v pods finished", numFinished, totalPods)
-					case v1.PodFailed:
 					case v1.PodUnknown:
 						return false, fmt.Errorf("pod %v is in %v phase", pod.Name, pod.Status.Phase)
+					case v1.PodFailed:
 					}
 				}
 
 				return numFinished == totalPods, nil
 			})
-			framework.ExpectNoError(err)
+			framework.ExpectNoError(waitErr, "some pods failed to complete within %v", completeTimeout)
 		})
 	})
 
@@ -625,7 +634,7 @@ var _ = utils.SIGDescribe("PersistentVolumes-local ", func() {
 				return
 			}
 			ginkgo.By(fmt.Sprintf("Clean PV %s", pv.Name))
-			err := config.client.CoreV1().PersistentVolumes().Delete(pv.Name, &metav1.DeleteOptions{})
+			err := config.client.CoreV1().PersistentVolumes().Delete(context.TODO(), pv.Name, metav1.DeleteOptions{})
 			framework.ExpectNoError(err)
 		})
 
@@ -641,15 +650,23 @@ var _ = utils.SIGDescribe("PersistentVolumes-local ", func() {
 			pvc, err = e2epv.CreatePVC(config.client, config.ns, pvc)
 			framework.ExpectNoError(err)
 			ginkgo.By(fmt.Sprintf("Create %d pods to use this PVC", count))
+			podConfig := e2epod.Config{
+				NS:           config.ns,
+				PVCs:         []*v1.PersistentVolumeClaim{pvc},
+				SeLinuxLabel: selinuxLabel,
+			}
 			for i := 0; i < count; i++ {
-				pod := e2epod.MakeSecPod(config.ns, []*v1.PersistentVolumeClaim{pvc}, nil, false, "", false, false, selinuxLabel, nil)
-				pod, err := config.client.CoreV1().Pods(config.ns).Create(pod)
+
+				pod, err := e2epod.MakeSecPod(&podConfig)
+				framework.ExpectNoError(err)
+				pod, err = config.client.CoreV1().Pods(config.ns).Create(context.TODO(), pod, metav1.CreateOptions{})
 				framework.ExpectNoError(err)
 				pods[pod.Name] = pod
 			}
 			ginkgo.By("Wait for all pods are running")
-			err = wait.PollImmediate(time.Second, 5*time.Minute, func() (done bool, err error) {
-				podsList, err := config.client.CoreV1().Pods(config.ns).List(metav1.ListOptions{})
+			const runningTimeout = 5 * time.Minute
+			waitErr := wait.PollImmediate(time.Second, runningTimeout, func() (done bool, err error) {
+				podsList, err := config.client.CoreV1().Pods(config.ns).List(context.TODO(), metav1.ListOptions{})
 				if err != nil {
 					return false, err
 				}
@@ -662,14 +679,14 @@ var _ = utils.SIGDescribe("PersistentVolumes-local ", func() {
 				}
 				return runningPods == count, nil
 			})
-			framework.ExpectNoError(err)
+			framework.ExpectNoError(waitErr, "Some pods are not running within %v", runningTimeout)
 		})
 	})
 })
 
 func deletePodAndPVCs(config *localTestConfig, pod *v1.Pod) error {
 	framework.Logf("Deleting pod %v", pod.Name)
-	if err := config.client.CoreV1().Pods(config.ns).Delete(pod.Name, nil); err != nil {
+	if err := config.client.CoreV1().Pods(config.ns).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{}); err != nil {
 		return err
 	}
 
@@ -693,7 +710,7 @@ func testPodWithNodeConflict(config *localTestConfig, testVolType localVolumeTyp
 	testVol := testVols[0]
 
 	pod := makeLocalPodFunc(config, testVol, nodeName)
-	pod, err := config.client.CoreV1().Pods(config.ns).Create(pod)
+	pod, err := config.client.CoreV1().Pods(config.ns).Create(context.TODO(), pod, metav1.CreateOptions{})
 	framework.ExpectNoError(err)
 
 	err = e2epod.WaitForPodNameUnschedulableInNamespace(config.client, pod.Name, pod.Namespace)
@@ -703,7 +720,7 @@ func testPodWithNodeConflict(config *localTestConfig, testVolType localVolumeTyp
 // The tests below are run against multiple mount point types
 
 // Test two pods at the same time, write from pod1, and read from pod2
-func twoPodsReadWriteTest(config *localTestConfig, testVol *localTestVolume) {
+func twoPodsReadWriteTest(f *framework.Framework, config *localTestConfig, testVol *localTestVolume) {
 	ginkgo.By("Creating pod1 to write to the PV")
 	pod1, pod1Err := createLocalPod(config, testVol, nil)
 	framework.ExpectNoError(pod1Err)
@@ -712,10 +729,10 @@ func twoPodsReadWriteTest(config *localTestConfig, testVol *localTestVolume) {
 	writeCmd := createWriteCmd(volumeDir, testFile, testFileContent, testVol.localVolumeType)
 
 	ginkgo.By("Writing in pod1")
-	podRWCmdExec(pod1, writeCmd)
+	podRWCmdExec(f, pod1, writeCmd)
 
 	// testFileContent was written after creating pod1
-	testReadFileContent(volumeDir, testFile, testFileContent, pod1, testVol.localVolumeType)
+	testReadFileContent(f, volumeDir, testFile, testFileContent, pod1, testVol.localVolumeType)
 
 	ginkgo.By("Creating pod2 to read from the PV")
 	pod2, pod2Err := createLocalPod(config, testVol, nil)
@@ -723,15 +740,15 @@ func twoPodsReadWriteTest(config *localTestConfig, testVol *localTestVolume) {
 	verifyLocalPod(config, testVol, pod2, config.node0.Name)
 
 	// testFileContent was written after creating pod1
-	testReadFileContent(volumeDir, testFile, testFileContent, pod2, testVol.localVolumeType)
+	testReadFileContent(f, volumeDir, testFile, testFileContent, pod2, testVol.localVolumeType)
 
 	writeCmd = createWriteCmd(volumeDir, testFile, testVol.ltr.Path /*writeTestFileContent*/, testVol.localVolumeType)
 
 	ginkgo.By("Writing in pod2")
-	podRWCmdExec(pod2, writeCmd)
+	podRWCmdExec(f, pod2, writeCmd)
 
 	ginkgo.By("Reading in pod1")
-	testReadFileContent(volumeDir, testFile, testVol.ltr.Path, pod1, testVol.localVolumeType)
+	testReadFileContent(f, volumeDir, testFile, testVol.ltr.Path, pod1, testVol.localVolumeType)
 
 	ginkgo.By("Deleting pod1")
 	e2epod.DeletePodOrFail(config.client, config.ns, pod1.Name)
@@ -740,7 +757,7 @@ func twoPodsReadWriteTest(config *localTestConfig, testVol *localTestVolume) {
 }
 
 // Test two pods one after other, write from pod1, and read from pod2
-func twoPodsReadWriteSerialTest(config *localTestConfig, testVol *localTestVolume) {
+func twoPodsReadWriteSerialTest(f *framework.Framework, config *localTestConfig, testVol *localTestVolume) {
 	ginkgo.By("Creating pod1")
 	pod1, pod1Err := createLocalPod(config, testVol, nil)
 	framework.ExpectNoError(pod1Err)
@@ -749,10 +766,10 @@ func twoPodsReadWriteSerialTest(config *localTestConfig, testVol *localTestVolum
 	writeCmd := createWriteCmd(volumeDir, testFile, testFileContent, testVol.localVolumeType)
 
 	ginkgo.By("Writing in pod1")
-	podRWCmdExec(pod1, writeCmd)
+	podRWCmdExec(f, pod1, writeCmd)
 
 	// testFileContent was written after creating pod1
-	testReadFileContent(volumeDir, testFile, testFileContent, pod1, testVol.localVolumeType)
+	testReadFileContent(f, volumeDir, testFile, testFileContent, pod1, testVol.localVolumeType)
 
 	ginkgo.By("Deleting pod1")
 	e2epod.DeletePodOrFail(config.client, config.ns, pod1.Name)
@@ -763,7 +780,7 @@ func twoPodsReadWriteSerialTest(config *localTestConfig, testVol *localTestVolum
 	verifyLocalPod(config, testVol, pod2, config.node0.Name)
 
 	ginkgo.By("Reading in pod2")
-	testReadFileContent(volumeDir, testFile, testFileContent, pod2, testVol.localVolumeType)
+	testReadFileContent(f, volumeDir, testFile, testFileContent, pod2, testVol.localVolumeType)
 
 	ginkgo.By("Deleting pod2")
 	e2epod.DeletePodOrFail(config.client, config.ns, pod2.Name)
@@ -787,17 +804,17 @@ func setupStorageClass(config *localTestConfig, mode *storagev1.VolumeBindingMod
 		VolumeBindingMode: mode,
 	}
 
-	_, err := config.client.StorageV1().StorageClasses().Create(sc)
+	_, err := config.client.StorageV1().StorageClasses().Create(context.TODO(), sc, metav1.CreateOptions{})
 	framework.ExpectNoError(err)
 }
 
 func cleanupStorageClass(config *localTestConfig) {
-	framework.ExpectNoError(config.client.StorageV1().StorageClasses().Delete(config.scName, nil))
+	framework.ExpectNoError(config.client.StorageV1().StorageClasses().Delete(context.TODO(), config.scName, metav1.DeleteOptions{}))
 }
 
 // podNode wraps RunKubectl to get node where pod is running
 func podNodeName(config *localTestConfig, pod *v1.Pod) (string, error) {
-	runtimePod, runtimePodErr := config.client.CoreV1().Pods(pod.Namespace).Get(pod.Name, metav1.GetOptions{})
+	runtimePod, runtimePodErr := config.client.CoreV1().Pods(pod.Namespace).Get(context.TODO(), pod.Name, metav1.GetOptions{})
 	return runtimePod.Spec.NodeName, runtimePodErr
 }
 
@@ -806,7 +823,7 @@ func setupLocalVolumes(config *localTestConfig, localVolumeType localVolumeType,
 	vols := []*localTestVolume{}
 	for i := 0; i < count; i++ {
 		ltrType, ok := setupLocalVolumeMap[localVolumeType]
-		gomega.Expect(ok).To(gomega.BeTrue())
+		framework.ExpectEqual(ok, true)
 		ltr := config.ltrMgr.Create(node, ltrType, nil)
 		vols = append(vols, &localTestVolume{
 			ltr:             ltr,
@@ -918,25 +935,30 @@ func createLocalPVCsPVs(config *localTestConfig, volumes []*localTestVolume, mod
 			verifyLocalVolume(config, volume)
 		}
 	} else {
-		// Verify PVCs are not bound
+		// Verify PVCs are not bound by waiting for phase==bound with a timeout and asserting that we hit the timeout.
 		// There isn't really a great way to verify this without making the test be slow...
-		err = wait.PollImmediate(time.Second, 10*time.Second, func() (done bool, err error) {
+		const bindTimeout = 10 * time.Second
+		waitErr := wait.PollImmediate(time.Second, bindTimeout, func() (done bool, err error) {
 			for _, volume := range volumes {
-				pvc, err := config.client.CoreV1().PersistentVolumeClaims(volume.pvc.Namespace).Get(volume.pvc.Name, metav1.GetOptions{})
-				framework.ExpectNoError(err)
-				framework.ExpectEqual(pvc.Status.Phase, v1.ClaimPending)
+				pvc, err := config.client.CoreV1().PersistentVolumeClaims(volume.pvc.Namespace).Get(context.TODO(), volume.pvc.Name, metav1.GetOptions{})
+				if err != nil {
+					return false, fmt.Errorf("failed to get PVC %s/%s: %v", volume.pvc.Namespace, volume.pvc.Name, err)
+				}
+				if pvc.Status.Phase != v1.ClaimPending {
+					return true, nil
+				}
 			}
 			return false, nil
 		})
-		framework.ExpectError(err)
+		if waitErr == wait.ErrWaitTimeout {
+			framework.Logf("PVCs were not bound within %v (that's good)", bindTimeout)
+			waitErr = nil
+		}
+		framework.ExpectNoError(waitErr, "Error making sure PVCs are not bound")
 	}
 }
 
 func makeLocalPodWithNodeAffinity(config *localTestConfig, volume *localTestVolume, nodeName string) (pod *v1.Pod) {
-	pod = e2epod.MakeSecPod(config.ns, []*v1.PersistentVolumeClaim{volume.pvc}, nil, false, "", false, false, selinuxLabel, nil)
-	if pod == nil {
-		return
-	}
 	affinity := &v1.Affinity{
 		NodeAffinity: &v1.NodeAffinity{
 			RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
@@ -954,34 +976,61 @@ func makeLocalPodWithNodeAffinity(config *localTestConfig, volume *localTestVolu
 			},
 		},
 	}
+	podConfig := e2epod.Config{
+		NS:            config.ns,
+		PVCs:          []*v1.PersistentVolumeClaim{volume.pvc},
+		SeLinuxLabel:  selinuxLabel,
+		NodeSelection: e2epod.NodeSelection{Affinity: affinity},
+	}
+	pod, err := e2epod.MakeSecPod(&podConfig)
+	if pod == nil || err != nil {
+		return
+	}
 	pod.Spec.Affinity = affinity
 	return
 }
 
 func makeLocalPodWithNodeSelector(config *localTestConfig, volume *localTestVolume, nodeName string) (pod *v1.Pod) {
-	pod = e2epod.MakeSecPod(config.ns, []*v1.PersistentVolumeClaim{volume.pvc}, nil, false, "", false, false, selinuxLabel, nil)
-	if pod == nil {
-		return
-	}
 	ns := map[string]string{
 		"kubernetes.io/hostname": nodeName,
 	}
-	pod.Spec.NodeSelector = ns
+	podConfig := e2epod.Config{
+		NS:            config.ns,
+		PVCs:          []*v1.PersistentVolumeClaim{volume.pvc},
+		SeLinuxLabel:  selinuxLabel,
+		NodeSelection: e2epod.NodeSelection{Selector: ns},
+	}
+	pod, err := e2epod.MakeSecPod(&podConfig)
+	if pod == nil || err != nil {
+		return
+	}
 	return
 }
 
 func makeLocalPodWithNodeName(config *localTestConfig, volume *localTestVolume, nodeName string) (pod *v1.Pod) {
-	pod = e2epod.MakeSecPod(config.ns, []*v1.PersistentVolumeClaim{volume.pvc}, nil, false, "", false, false, selinuxLabel, nil)
-	if pod == nil {
+	podConfig := e2epod.Config{
+		NS:           config.ns,
+		PVCs:         []*v1.PersistentVolumeClaim{volume.pvc},
+		SeLinuxLabel: selinuxLabel,
+	}
+	pod, err := e2epod.MakeSecPod(&podConfig)
+	if pod == nil || err != nil {
 		return
 	}
-	pod.Spec.NodeName = nodeName
+
+	e2epod.SetNodeAffinity(&pod.Spec, nodeName)
 	return
 }
 
 func createLocalPod(config *localTestConfig, volume *localTestVolume, fsGroup *int64) (*v1.Pod, error) {
 	ginkgo.By("Creating a pod")
-	return e2epod.CreateSecPod(config.client, config.ns, []*v1.PersistentVolumeClaim{volume.pvc}, nil, false, "", false, false, selinuxLabel, fsGroup, framework.PodStartShortTimeout)
+	podConfig := e2epod.Config{
+		NS:           config.ns,
+		PVCs:         []*v1.PersistentVolumeClaim{volume.pvc},
+		SeLinuxLabel: selinuxLabel,
+		FsGroup:      fsGroup,
+	}
+	return e2epod.CreateSecPod(config.client, &podConfig, framework.PodStartShortTimeout)
 }
 
 func createWriteCmd(testDir string, testFile string, writeTestFileContent string, volumeType localVolumeType) string {
@@ -1015,16 +1064,16 @@ func createReadCmd(testFileDir string, testFile string, volumeType localVolumeTy
 }
 
 // Read testFile and evaluate whether it contains the testFileContent
-func testReadFileContent(testFileDir string, testFile string, testFileContent string, pod *v1.Pod, volumeType localVolumeType) {
+func testReadFileContent(f *framework.Framework, testFileDir string, testFile string, testFileContent string, pod *v1.Pod, volumeType localVolumeType) {
 	readCmd := createReadCmd(testFileDir, testFile, volumeType)
-	readOut := podRWCmdExec(pod, readCmd)
+	readOut := podRWCmdExec(f, pod, readCmd)
 	gomega.Expect(readOut).To(gomega.ContainSubstring(testFileContent))
 }
 
 // Execute a read or write command in a pod.
 // Fail on error
-func podRWCmdExec(pod *v1.Pod, cmd string) string {
-	out, err := utils.PodExec(pod, cmd)
+func podRWCmdExec(f *framework.Framework, pod *v1.Pod, cmd string) string {
+	out, err := utils.PodExec(f, pod, cmd)
 	framework.Logf("podRWCmdExec out: %q err: %v", out, err)
 	framework.ExpectNoError(err)
 	return out
@@ -1142,15 +1191,15 @@ func createStatefulSet(config *localTestConfig, ssReplicas int32, volumeCount in
 		spec.Spec.PodManagementPolicy = appsv1.ParallelPodManagement
 	}
 
-	ss, err := config.client.AppsV1().StatefulSets(config.ns).Create(spec)
+	ss, err := config.client.AppsV1().StatefulSets(config.ns).Create(context.TODO(), spec, metav1.CreateOptions{})
 	framework.ExpectNoError(err)
 
-	e2esset.WaitForRunningAndReady(config.client, ssReplicas, ss)
+	e2estatefulset.WaitForRunningAndReady(config.client, ssReplicas, ss)
 	return ss
 }
 
 func validateStatefulSet(config *localTestConfig, ss *appsv1.StatefulSet, anti bool) {
-	pods := e2esset.GetPodList(config.client, ss)
+	pods := e2estatefulset.GetPodList(config.client, ss)
 
 	nodes := sets.NewString()
 	for _, pod := range pods.Items {
@@ -1182,11 +1231,12 @@ func validateStatefulSet(config *localTestConfig, ss *appsv1.StatefulSet, anti b
 // and skips if a disk of that type does not exist on the node
 func SkipUnlessLocalSSDExists(config *localTestConfig, ssdInterface, filesystemType string, node *v1.Node) {
 	ssdCmd := fmt.Sprintf("ls -1 /mnt/disks/by-uuid/google-local-ssds-%s-%s/ | wc -l", ssdInterface, filesystemType)
-	res, err := config.hostExec.IssueCommandWithResult(ssdCmd, node)
+	res, err := config.hostExec.Execute(ssdCmd, node)
+	utils.LogResult(res)
 	framework.ExpectNoError(err)
-	num, err := strconv.Atoi(strings.TrimSpace(res))
+	num, err := strconv.Atoi(strings.TrimSpace(res.Stdout))
 	framework.ExpectNoError(err)
 	if num < 1 {
-		framework.Skipf("Requires at least 1 %s %s localSSD ", ssdInterface, filesystemType)
+		e2eskipper.Skipf("Requires at least 1 %s %s localSSD ", ssdInterface, filesystemType)
 	}
 }

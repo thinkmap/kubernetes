@@ -17,13 +17,13 @@ limitations under the License.
 package volumerestrictions
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
-	"k8s.io/api/core/v1"
-	"k8s.io/kubernetes/pkg/scheduler/algorithm/predicates"
+	v1 "k8s.io/api/core/v1"
 	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
-	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
+	schedulertypes "k8s.io/kubernetes/pkg/scheduler/types"
 )
 
 func TestGCEDiskConflicts(t *testing.T) {
@@ -49,24 +49,24 @@ func TestGCEDiskConflicts(t *testing.T) {
 			},
 		},
 	}
-	errStatus := framework.NewStatus(framework.Unschedulable, predicates.ErrDiskConflict.GetReason())
+	errStatus := framework.NewStatus(framework.Unschedulable, ErrReasonDiskConflict)
 	tests := []struct {
 		pod        *v1.Pod
-		nodeInfo   *schedulernodeinfo.NodeInfo
+		nodeInfo   *schedulertypes.NodeInfo
 		isOk       bool
 		name       string
 		wantStatus *framework.Status
 	}{
-		{&v1.Pod{}, schedulernodeinfo.NewNodeInfo(), true, "nothing", nil},
-		{&v1.Pod{}, schedulernodeinfo.NewNodeInfo(&v1.Pod{Spec: volState}), true, "one state", nil},
-		{&v1.Pod{Spec: volState}, schedulernodeinfo.NewNodeInfo(&v1.Pod{Spec: volState}), false, "same state", errStatus},
-		{&v1.Pod{Spec: volState2}, schedulernodeinfo.NewNodeInfo(&v1.Pod{Spec: volState}), true, "different state", nil},
+		{&v1.Pod{}, schedulertypes.NewNodeInfo(), true, "nothing", nil},
+		{&v1.Pod{}, schedulertypes.NewNodeInfo(&v1.Pod{Spec: volState}), true, "one state", nil},
+		{&v1.Pod{Spec: volState}, schedulertypes.NewNodeInfo(&v1.Pod{Spec: volState}), false, "same state", errStatus},
+		{&v1.Pod{Spec: volState2}, schedulertypes.NewNodeInfo(&v1.Pod{Spec: volState}), true, "different state", nil},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			p, _ := New(nil, nil)
-			gotStatus := p.(framework.FilterPlugin).Filter(nil, test.pod, test.nodeInfo)
+			gotStatus := p.(framework.FilterPlugin).Filter(context.Background(), nil, test.pod, test.nodeInfo)
 			if !reflect.DeepEqual(gotStatus, test.wantStatus) {
 				t.Errorf("status does not match: %v, want: %v", gotStatus, test.wantStatus)
 			}
@@ -97,24 +97,24 @@ func TestAWSDiskConflicts(t *testing.T) {
 			},
 		},
 	}
-	errStatus := framework.NewStatus(framework.Unschedulable, predicates.ErrDiskConflict.GetReason())
+	errStatus := framework.NewStatus(framework.Unschedulable, ErrReasonDiskConflict)
 	tests := []struct {
 		pod        *v1.Pod
-		nodeInfo   *schedulernodeinfo.NodeInfo
+		nodeInfo   *schedulertypes.NodeInfo
 		isOk       bool
 		name       string
 		wantStatus *framework.Status
 	}{
-		{&v1.Pod{}, schedulernodeinfo.NewNodeInfo(), true, "nothing", nil},
-		{&v1.Pod{}, schedulernodeinfo.NewNodeInfo(&v1.Pod{Spec: volState}), true, "one state", nil},
-		{&v1.Pod{Spec: volState}, schedulernodeinfo.NewNodeInfo(&v1.Pod{Spec: volState}), false, "same state", errStatus},
-		{&v1.Pod{Spec: volState2}, schedulernodeinfo.NewNodeInfo(&v1.Pod{Spec: volState}), true, "different state", nil},
+		{&v1.Pod{}, schedulertypes.NewNodeInfo(), true, "nothing", nil},
+		{&v1.Pod{}, schedulertypes.NewNodeInfo(&v1.Pod{Spec: volState}), true, "one state", nil},
+		{&v1.Pod{Spec: volState}, schedulertypes.NewNodeInfo(&v1.Pod{Spec: volState}), false, "same state", errStatus},
+		{&v1.Pod{Spec: volState2}, schedulertypes.NewNodeInfo(&v1.Pod{Spec: volState}), true, "different state", nil},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			p, _ := New(nil, nil)
-			gotStatus := p.(framework.FilterPlugin).Filter(nil, test.pod, test.nodeInfo)
+			gotStatus := p.(framework.FilterPlugin).Filter(context.Background(), nil, test.pod, test.nodeInfo)
 			if !reflect.DeepEqual(gotStatus, test.wantStatus) {
 				t.Errorf("status does not match: %v, want: %v", gotStatus, test.wantStatus)
 			}
@@ -151,24 +151,24 @@ func TestRBDDiskConflicts(t *testing.T) {
 			},
 		},
 	}
-	errStatus := framework.NewStatus(framework.Unschedulable, predicates.ErrDiskConflict.GetReason())
+	errStatus := framework.NewStatus(framework.Unschedulable, ErrReasonDiskConflict)
 	tests := []struct {
 		pod        *v1.Pod
-		nodeInfo   *schedulernodeinfo.NodeInfo
+		nodeInfo   *schedulertypes.NodeInfo
 		isOk       bool
 		name       string
 		wantStatus *framework.Status
 	}{
-		{&v1.Pod{}, schedulernodeinfo.NewNodeInfo(), true, "nothing", nil},
-		{&v1.Pod{}, schedulernodeinfo.NewNodeInfo(&v1.Pod{Spec: volState}), true, "one state", nil},
-		{&v1.Pod{Spec: volState}, schedulernodeinfo.NewNodeInfo(&v1.Pod{Spec: volState}), false, "same state", errStatus},
-		{&v1.Pod{Spec: volState2}, schedulernodeinfo.NewNodeInfo(&v1.Pod{Spec: volState}), true, "different state", nil},
+		{&v1.Pod{}, schedulertypes.NewNodeInfo(), true, "nothing", nil},
+		{&v1.Pod{}, schedulertypes.NewNodeInfo(&v1.Pod{Spec: volState}), true, "one state", nil},
+		{&v1.Pod{Spec: volState}, schedulertypes.NewNodeInfo(&v1.Pod{Spec: volState}), false, "same state", errStatus},
+		{&v1.Pod{Spec: volState2}, schedulertypes.NewNodeInfo(&v1.Pod{Spec: volState}), true, "different state", nil},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			p, _ := New(nil, nil)
-			gotStatus := p.(framework.FilterPlugin).Filter(nil, test.pod, test.nodeInfo)
+			gotStatus := p.(framework.FilterPlugin).Filter(context.Background(), nil, test.pod, test.nodeInfo)
 			if !reflect.DeepEqual(gotStatus, test.wantStatus) {
 				t.Errorf("status does not match: %v, want: %v", gotStatus, test.wantStatus)
 			}
@@ -205,24 +205,24 @@ func TestISCSIDiskConflicts(t *testing.T) {
 			},
 		},
 	}
-	errStatus := framework.NewStatus(framework.Unschedulable, predicates.ErrDiskConflict.GetReason())
+	errStatus := framework.NewStatus(framework.Unschedulable, ErrReasonDiskConflict)
 	tests := []struct {
 		pod        *v1.Pod
-		nodeInfo   *schedulernodeinfo.NodeInfo
+		nodeInfo   *schedulertypes.NodeInfo
 		isOk       bool
 		name       string
 		wantStatus *framework.Status
 	}{
-		{&v1.Pod{}, schedulernodeinfo.NewNodeInfo(), true, "nothing", nil},
-		{&v1.Pod{}, schedulernodeinfo.NewNodeInfo(&v1.Pod{Spec: volState}), true, "one state", nil},
-		{&v1.Pod{Spec: volState}, schedulernodeinfo.NewNodeInfo(&v1.Pod{Spec: volState}), false, "same state", errStatus},
-		{&v1.Pod{Spec: volState2}, schedulernodeinfo.NewNodeInfo(&v1.Pod{Spec: volState}), true, "different state", nil},
+		{&v1.Pod{}, schedulertypes.NewNodeInfo(), true, "nothing", nil},
+		{&v1.Pod{}, schedulertypes.NewNodeInfo(&v1.Pod{Spec: volState}), true, "one state", nil},
+		{&v1.Pod{Spec: volState}, schedulertypes.NewNodeInfo(&v1.Pod{Spec: volState}), false, "same state", errStatus},
+		{&v1.Pod{Spec: volState2}, schedulertypes.NewNodeInfo(&v1.Pod{Spec: volState}), true, "different state", nil},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			p, _ := New(nil, nil)
-			gotStatus := p.(framework.FilterPlugin).Filter(nil, test.pod, test.nodeInfo)
+			gotStatus := p.(framework.FilterPlugin).Filter(context.Background(), nil, test.pod, test.nodeInfo)
 			if !reflect.DeepEqual(gotStatus, test.wantStatus) {
 				t.Errorf("status does not match: %v, want: %v", gotStatus, test.wantStatus)
 			}

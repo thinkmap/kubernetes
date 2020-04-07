@@ -40,7 +40,7 @@ For example, let's consider the following `pod.yaml` file:
       containers:
       - args:
         - dns-suffix
-        image: gcr.io/kubernetes-e2e-test-images/agnhost:2.2
+        image: us.gcr.io/k8s-artifacts-prod/e2e-test-images/agnhost:2.11
         name: agnhost
       dnsConfig:
         nameservers:
@@ -189,6 +189,38 @@ Usage:
 ```
 
 
+### guestbook
+
+Starts a HTTP server on the given `--http-port` (default: 80), serving various endpoints representing a
+guestbook app. The endpoints and their purpose are:
+
+- `/register`: A guestbook slave will subscribe to a master, to its given `--slaveof` endpoint. The master
+  will then push any updates it receives to its registered slaves through the `--backend-port` (default: 6379).
+- `/get`: Returns `{"data": value}`, where the `value` is the stored value for the given `key` if non-empty,
+  or the entire store.
+- `/set`: Will set the given key-value pair in its own store and propagate it to its slaves, if any.
+  Will return `{"data": "Updated"}` to the caller on success.
+- `/guestbook`: Will proxy the request to `agnhost-master` if the given `cmd` is `set`, or `agnhost-slave`
+  if the given `cmd` is `get`.
+
+Usage:
+
+```console
+guestbook="test/e2e/testing-manifests/guestbook"
+sed_expr="s|{{.AgnhostImage}}|us.gcr.io/k8s-artifacts-prod/e2e-test-images/agnhost:2.11|"
+
+# create the services.
+kubectl create -f ${guestbook}/frontend-service.yaml
+kubectl create -f ${guestbook}/agnhost-master-service.yaml
+kubectl create -f ${guestbook}/agnhost-slave-service.yaml
+
+# create the deployments.
+cat ${guestbook}/frontend-deployment.yaml.in | sed ${sed_expr} | kubectl create -f -
+cat ${guestbook}/agnhost-master-deployment.yaml.in | sed ${sed_expr} | kubectl create -f -
+cat ${guestbook}/agnhost-slave-deployment.yaml.in | sed ${sed_expr} | kubectl create -f -
+```
+
+
 ### help
 
 Prints the binary's help menu. Additionally, it can be followed by another subcommand
@@ -258,19 +290,50 @@ Examples:
 
 ```console
 docker run -i \
-  gcr.io/kubernetes-e2e-test-images/agnhost:2.2 \
+  us.gcr.io/k8s-artifacts-prod/e2e-test-images/agnhost:2.11 \
   logs-generator --log-lines-total 10 --run-duration 1s
 ```
 
 ```console
 kubectl run logs-generator \
   --generator=run-pod/v1 \
-  --image=gcr.io/kubernetes-e2e-test-images/agnhost:2.2 \
+  --image=us.gcr.io/k8s-artifacts-prod/e2e-test-images/agnhost:2.11 \
   --restart=Never \
   -- logs-generator -t 10 -d 1s
 ```
 
 [![Analytics](https://kubernetes-site.appspot.com/UA-36037335-10/GitHub/test/images/logs-generator/README.md?pixel)]()
+
+
+### mounttest
+
+The `mounttest` subcommand can be used to create files with various permissions, read files,
+and output file system type, mode, owner, and permissions for any given file.
+
+The subcommand can accept the following flags:
+
+- `fs_type`: Path to print the FS type for.
+- `file_mode`: Path to print the mode bits of.
+- `file_perm`: Path to print the perms of.
+- `file_owner`: Path to print the owning UID and GID of.
+- `new_file_0644`: Path to write to and read from with perm 0644.
+- `new_file_0666`: Path to write to and read from with perm 0666.
+- `new_file_0660`: Path to write to and read from with perm 0660.
+- `new_file_0777`: Path to write to and read from with perm 0777.
+- `file_content`: Path to read the file content from.
+- `file_content_in_loop`: Path to read the file content in loop from.
+- `retry_time` (default: 180): Retry time during the loop.
+- `break_on_expected_content` (default: true): Break out of loop on expected content (use with `--file_content_in_loop` flag only).
+
+Usage:
+
+```console
+    kubectl exec test-agnhost -- /agnhost mounttest \
+        [--fs_type <path>] [--file_mode <path>] [--file_perm <path>] [--file_owner <path>] \
+        [--new_file_0644 <path>] [--new_file_0666 <path>] [--new_file_0660 <path>] [--new_file_0777 <path>] \
+        [--file_content <path>] [--file_content_in_loop <path>] \
+        [--retry_time <seconds>] [--break_on_expected_content <true_or_false>]
+```
 
 
 ### net
@@ -312,7 +375,7 @@ HTTP server:
 
 ### netexec
 
-Starts a HTTP server on given TCP / UDP ports with the following endpoints:
+Starts a HTTP server on given port with the following endpoints:
 
 - `/`: Returns the request's timestamp.
 - `/clientip`: Returns the request's IP address.
@@ -326,7 +389,7 @@ Starts a HTTP server on given TCP / UDP ports with the following endpoints:
   - `request`: The HTTP endpoint or data to be sent through UDP. If not specified, it will result
     in a `400 Bad Request` status code being returned.
   - `protocol`: The protocol which will be used when making the request. Default value: `http`.
-    Acceptable values: `http`, `udp`.
+    Acceptable values: `http`, `udp`, `sctp`.
   - `tries`: The number of times the request will be performed. Default value: `1`.
 - `/echo`: Returns the given `msg` (`/echo?msg=echoed_msg`)
 - `/exit`: Closes the server with the given code (`/exit?code=some-code`). The `code`
@@ -344,10 +407,19 @@ Starts a HTTP server on given TCP / UDP ports with the following endpoints:
   Returns a JSON with the fields `output` (containing the file's name on the server) and
   `error` containing any potential server side errors.
 
+It will also start a UDP server on the indicated UDP port that responds to the following commands:
+
+- `hostname`: Returns the server's hostname
+- `echo <msg>`: Returns the given `<msg>`
+- `clientip`: Returns the request's IP address
+
+Additionally, if (and only if) `--sctp-port` is passed, it will start an SCTP server on that port,
+responding to the same commands as the UDP server.
+
 Usage:
 
 ```console
-    kubectl exec test-agnhost -- /agnhost netexec [--http-port <http-port>] [--udp-port <udp-port>]
+    kubectl exec test-agnhost -- /agnhost netexec [--http-port <http-port>] [--udp-port <udp-port>] [--sctp-port <sctp-port>]
 ```
 
 ### nettest
@@ -392,7 +464,7 @@ Usage:
 ```console
     kubectl run test-agnhost \
       --generator=run-pod/v1 \
-      --image=gcr.io/kubernetes-e2e-test-images/agnhost:2.2 \
+      --image=us.gcr.io/k8s-artifacts-prod/e2e-test-images/agnhost:2.11 \
       --restart=Never \
       --env "POD_IP=<POD_IP>" \
       --env "NODE_IP=<NODE_IP>" \
@@ -447,7 +519,7 @@ Usage:
 ```console
     kubectl run test-agnhost \
       --generator=run-pod/v1 \
-      --image=gcr.io/kubernetes-e2e-test-images/agnhost:2.1 \
+      --image=us.gcr.io/k8s-artifacts-prod/e2e-test-images/agnhost:2.11 \
       --restart=Never \
       --env "BIND_ADDRESS=localhost" \
       --env "BIND_PORT=8080" \
@@ -485,6 +557,25 @@ Usage:
 [![Analytics](https://kubernetes-site.appspot.com/UA-36037335-10/GitHub/test/images/porter/README.md?pixel)]()
 
 
+### resource-consumer-controller
+
+This subcommand starts an HTTP server that spreads requests around resource consumers. The HTTP server has the same endpoints and usage as the one spawned by the ``resource-consumer`` subcommand.
+
+The subcommand can accept the following flags:
+
+- `port` (default: 8080): The port number to listen to.
+- `consumer-port` (default: 8080): Port number of consumers.
+- `consumer-service-name` (default: `resource-consumer`): Name of service containing resource consumers.
+- `consumer-service-namespace` (default: `default`): Namespace of service containing resource consumers.
+
+Usage:
+
+```console
+    kubectl exec test-agnhost -- /agnhost resource-consumer-controller \
+        [--port <port>] [--consumer-port <port>] [--consumer-service-name <service-name>] [--consumer-service-namespace <namespace>]
+```
+
+
 ### serve-hostname
 
 This is a small util app to serve your hostname on TCP and/or UDP. Useful for testing.
@@ -510,6 +601,21 @@ Usage:
 [![Analytics](https://kubernetes-site.appspot.com/UA-36037335-10/GitHub/test/images/serve_hostname/README.md?pixel)]()
 
 
+### test-webserver
+
+Starts a simple HTTP fileserver which serves any file specified in the URL path, if it exists.
+
+The subcommand can accept the following flags:
+
+- `port` (default: `80`): The port number to listen to.
+
+Usage:
+
+```console
+    kubectl exec test-agnhost -- /agnhost test-webserver [--port <port>]
+```
+
+
 ### webhook (Kubernetes External Admission Webhook)
 
 The subcommand tests MutatingAdmissionWebhook and ValidatingAdmissionWebhook. After deploying
@@ -529,11 +635,18 @@ Usage:
 
 ## Other tools
 
-The image contains `iperf`.
+The image contains `iperf`, `curl`, `dns-tools` (including `dig`), CoreDNS, for both Windows and Linux.
+
+For Windows, the image is based on `busybox`, meaning that most of the Linux common tools are also
+available on it, making it possible to run most Linux commands in the `agnhost` Windows container
+as well. Keep in mind that there might still be some differences though (e.g.: `wget` does not
+have the `-T` argument on Windows).
+
+The Windows `agnhost` image includes a `nc` binary that is 100% compliant with its Linux equivalent.
 
 
 ## Image
 
-The image can be found at `gcr.io/kubernetes-e2e-test-images/agnhost:2.2` for Linux
-containers, and `e2eteam/agnhost:2.2` for Windows containers. In the future, the same
-repository can be used for both OSes.
+The image can be found at `us.gcr.io/k8s-artifacts-prod/e2e-test-images/agnhost:2.11` for both Linux and
+Windows containers (based on `mcr.microsoft.com/windows/servercore:ltsc2019`,
+`mcr.microsoft.com/windows/servercore:1903`, and `mcr.microsoft.com/windows/servercore:1909`).

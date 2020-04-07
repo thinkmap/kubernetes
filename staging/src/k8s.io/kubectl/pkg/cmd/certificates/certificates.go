@@ -17,6 +17,7 @@ limitations under the License.
 package certificates
 
 import (
+	"context"
 	"fmt"
 	"io"
 
@@ -69,9 +70,9 @@ type CertificateOptions struct {
 }
 
 // NewCertificateOptions creates the options for certificate
-func NewCertificateOptions(ioStreams genericclioptions.IOStreams) *CertificateOptions {
+func NewCertificateOptions(ioStreams genericclioptions.IOStreams, operation string) *CertificateOptions {
 	return &CertificateOptions{
-		PrintFlags: genericclioptions.NewPrintFlags("approved").WithTypeSetter(scheme.Scheme),
+		PrintFlags: genericclioptions.NewPrintFlags(operation).WithTypeSetter(scheme.Scheme),
 		IOStreams:  ioStreams,
 	}
 }
@@ -111,7 +112,7 @@ func (o *CertificateOptions) Validate() error {
 }
 
 func NewCmdCertificateApprove(f cmdutil.Factory, ioStreams genericclioptions.IOStreams) *cobra.Command {
-	o := NewCertificateOptions(ioStreams)
+	o := NewCertificateOptions(ioStreams, "approved")
 
 	cmd := &cobra.Command{
 		Use:                   "approve (-f FILENAME | NAME)",
@@ -166,7 +167,7 @@ func (o *CertificateOptions) RunCertificateApprove(force bool) error {
 }
 
 func NewCmdCertificateDeny(f cmdutil.Factory, ioStreams genericclioptions.IOStreams) *cobra.Command {
-	o := NewCertificateOptions(ioStreams)
+	o := NewCertificateOptions(ioStreams, "denied")
 
 	cmd := &cobra.Command{
 		Use:                   "deny (-f FILENAME | NAME)",
@@ -234,7 +235,7 @@ func (o *CertificateOptions) modifyCertificateCondition(builder *resource.Builde
 			csr := info.Object.(*certificatesv1beta1.CertificateSigningRequest)
 			csr, hasCondition := modify(csr)
 			if !hasCondition || force {
-				csr, err = clientSet.CertificateSigningRequests().UpdateApproval(csr)
+				_, err = clientSet.CertificateSigningRequests().UpdateApproval(context.TODO(), csr, metav1.UpdateOptions{})
 				if errors.IsConflict(err) && i < 10 {
 					if err := info.Get(); err != nil {
 						return err

@@ -17,8 +17,6 @@ limitations under the License.
 package framework
 
 import (
-	"runtime/debug"
-
 	"github.com/onsi/gomega"
 )
 
@@ -48,18 +46,17 @@ func ExpectNoErrorWithOffset(offset int, err error, explain ...interface{}) {
 	gomega.ExpectWithOffset(1+offset, err).NotTo(gomega.HaveOccurred(), explain...)
 }
 
-// ExpectNoErrorWithRetries checks if an error occurs with the given retry count.
-func ExpectNoErrorWithRetries(fn func() error, maxRetries int, explain ...interface{}) {
-	var err error
-	for i := 0; i < maxRetries; i++ {
-		err = fn()
-		if err == nil {
-			return
-		}
-		Logf("(Attempt %d of %d) Unexpected error occurred: %v", i+1, maxRetries, err)
-	}
-	if err != nil {
-		debug.PrintStack()
-	}
-	gomega.ExpectWithOffset(1, err).NotTo(gomega.HaveOccurred(), explain...)
+// ExpectConsistOf expects actual contains precisely the extra elements.  The ordering of the elements does not matter.
+func ExpectConsistOf(actual interface{}, extra interface{}, explain ...interface{}) {
+	gomega.ExpectWithOffset(1, actual).To(gomega.ConsistOf(extra), explain...)
+}
+
+// ExpectHaveKey expects the actual map has the key in the keyset
+func ExpectHaveKey(actual interface{}, key interface{}, explain ...interface{}) {
+	gomega.ExpectWithOffset(1, actual).To(gomega.HaveKey(key), explain...)
+}
+
+// ExpectEmpty expects actual is empty
+func ExpectEmpty(actual interface{}, explain ...interface{}) {
+	gomega.ExpectWithOffset(1, actual).To(gomega.BeEmpty(), explain...)
 }

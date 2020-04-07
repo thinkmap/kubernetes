@@ -75,11 +75,22 @@ type actualStateOfWorld struct {
 
 var _ ActualStateOfWorld = &actualStateOfWorld{}
 
+// NamedPluginHandler holds information for handler and the name of the plugin
+type NamedPluginHandler struct {
+	Handler PluginHandler
+	Name    string
+}
+
+// SocketPluginHandlers contains the map from socket path to NamedPluginHandler
+type SocketPluginHandlers struct {
+	Handlers map[string]NamedPluginHandler
+	sync.Mutex
+}
+
 // PluginInfo holds information of a plugin
 type PluginInfo struct {
-	SocketPath           string
-	FoundInDeprecatedDir bool
-	Timestamp            time.Time
+	SocketPath string
+	Timestamp  time.Time
 }
 
 func (asw *actualStateOfWorld) AddPlugin(pluginInfo PluginInfo) error {

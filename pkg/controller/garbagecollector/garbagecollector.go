@@ -17,6 +17,7 @@ limitations under the License.
 package garbagecollector
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"sync"
@@ -43,6 +44,7 @@ import (
 	_ "k8s.io/client-go/kubernetes"
 )
 
+// ResourceResyncTime defines the resync period of the garbage collector's informers.
 const ResourceResyncTime time.Duration = 0
 
 // GarbageCollector runs reflectors to watch for changes of managed API
@@ -66,11 +68,11 @@ type GarbageCollector struct {
 	dependencyGraphBuilder *GraphBuilder
 	// GC caches the owners that do not exist according to the API server.
 	absentOwnerCache *UIDCache
-	sharedInformers  controller.InformerFactory
 
 	workerLock sync.RWMutex
 }
 
+// NewGarbageCollector creates a new GarbageCollector.
 func NewGarbageCollector(
 	metadataClient metadata.Interface,
 	mapper resettableRESTMapper,
@@ -121,6 +123,7 @@ func (gc *GarbageCollector) resyncMonitors(deletableResources map[schema.GroupVe
 	return nil
 }
 
+// Run starts garbage collector workers.
 func (gc *GarbageCollector) Run(workers int, stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
 	defer gc.attemptToDelete.ShutDown()
@@ -273,6 +276,7 @@ func waitForStopOrTimeout(stopCh <-chan struct{}, timeout time.Duration) <-chan 
 	return stopChWithTimeout
 }
 
+// IsSynced returns true if dependencyGraphBuilder is synced.
 func (gc *GarbageCollector) IsSynced() bool {
 	return gc.dependencyGraphBuilder.IsSynced()
 }
@@ -344,7 +348,7 @@ func (gc *GarbageCollector) isDangling(reference metav1.OwnerReference, item *no
 	// TODO: It's only necessary to talk to the API server if the owner node
 	// is a "virtual" node. The local graph could lag behind the real
 	// status, but in practice, the difference is small.
-	owner, err = gc.metadataClient.Resource(resource).Namespace(resourceDefaultNamespace(namespaced, item.identity.Namespace)).Get(reference.Name, metav1.GetOptions{})
+	owner, err = gc.metadataClient.Resource(resource).Namespace(resourceDefaultNamespace(namespaced, item.identity.Namespace)).Get(context.TODO(), reference.Name, metav1.GetOptions{})
 	switch {
 	case errors.IsNotFound(err):
 		gc.absentOwnerCache.Add(reference.UID)

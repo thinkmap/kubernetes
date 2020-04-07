@@ -17,6 +17,7 @@ limitations under the License.
 package endpoint
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -28,8 +29,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -47,9 +48,8 @@ import (
 	helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
 	"k8s.io/kubernetes/pkg/controller"
 	endpointutil "k8s.io/kubernetes/pkg/controller/util/endpoint"
-
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/kubernetes/pkg/features"
+	utillabels "k8s.io/kubernetes/pkg/util/labels"
 	utilnet "k8s.io/utils/net"
 )
 
@@ -94,11 +94,11 @@ func NewEndpointController(podInformer coreinformers.PodInformer, serviceInforme
 	}
 
 	serviceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: e.enqueueService,
+		AddFunc: e.onServiceUpdate,
 		UpdateFunc: func(old, cur interface{}) {
-			e.enqueueService(cur)
+			e.onServiceUpdate(cur)
 		},
-		DeleteFunc: e.enqueueService,
+		DeleteFunc: e.onServiceDelete,
 	})
 	e.serviceLister = serviceInformer.Lister()
 	e.servicesSynced = serviceInformer.Informer().HasSynced
@@ -119,6 +119,8 @@ func NewEndpointController(podInformer coreinformers.PodInformer, serviceInforme
 	e.eventRecorder = recorder
 
 	e.endpointUpdatesBatchPeriod = endpointUpdatesBatchPeriod
+
+	e.serviceSelectorCache = endpointutil.NewServiceSelectorCache()
 
 	return e
 }
@@ -165,6 +167,10 @@ type EndpointController struct {
 	triggerTimeTracker *endpointutil.TriggerTimeTracker
 
 	endpointUpdatesBatchPeriod time.Duration
+
+	// serviceSelectorCache is a cache of service selectors to avoid high CPU consumption caused by frequent calls
+	// to AsSelectorPreValidated (see #73527)
+	serviceSelectorCache *endpointutil.ServiceSelectorCache
 }
 
 // Run will not return until stopCh is closed. workers determines how many
@@ -192,29 +198,11 @@ func (e *EndpointController) Run(workers int, stopCh <-chan struct{}) {
 	<-stopCh
 }
 
-func (e *EndpointController) getPodServiceMemberships(pod *v1.Pod) (sets.String, error) {
-	set := sets.String{}
-	services, err := e.serviceLister.GetPodServices(pod)
-	if err != nil {
-		// don't log this error because this function makes pointless
-		// errors when no services match.
-		return set, nil
-	}
-	for i := range services {
-		key, err := controller.KeyFunc(services[i])
-		if err != nil {
-			return nil, err
-		}
-		set.Insert(key)
-	}
-	return set, nil
-}
-
 // When a pod is added, figure out what services it will be a member of and
 // enqueue them. obj must have *v1.Pod type.
 func (e *EndpointController) addPod(obj interface{}) {
 	pod := obj.(*v1.Pod)
-	services, err := e.getPodServiceMemberships(pod)
+	services, err := e.serviceSelectorCache.GetPodServiceMemberships(e.serviceLister, pod)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("Unable to get pod %s/%s's service memberships: %v", pod.Namespace, pod.Name, err))
 		return
@@ -282,7 +270,7 @@ func endpointChanged(pod1, pod2 *v1.Pod) bool {
 // and what services it will be a member of, and enqueue the union of these.
 // old and cur must be *v1.Pod types.
 func (e *EndpointController) updatePod(old, cur interface{}) {
-	services := endpointutil.GetServicesToUpdateOnPodChange(e.serviceLister, old, cur, endpointChanged)
+	services := endpointutil.GetServicesToUpdateOnPodChange(e.serviceLister, e.serviceSelectorCache, old, cur, endpointChanged)
 	for key := range services {
 		e.queue.AddAfter(key, e.endpointUpdatesBatchPeriod)
 	}
@@ -297,14 +285,27 @@ func (e *EndpointController) deletePod(obj interface{}) {
 	}
 }
 
-// obj could be an *v1.Service, or a DeletionFinalStateUnknown marker item.
-func (e *EndpointController) enqueueService(obj interface{}) {
+// onServiceUpdate updates the Service Selector in the cache and queues the Service for processing.
+func (e *EndpointController) onServiceUpdate(obj interface{}) {
 	key, err := controller.KeyFunc(obj)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("Couldn't get key for object %+v: %v", obj, err))
 		return
 	}
 
+	_ = e.serviceSelectorCache.Update(key, obj.(*v1.Service).Spec.Selector)
+	e.queue.Add(key)
+}
+
+// onServiceDelete removes the Service Selector from the cache and queues the Service for processing.
+func (e *EndpointController) onServiceDelete(obj interface{}) {
+	key, err := controller.KeyFunc(obj)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("Couldn't get key for object %+v: %v", obj, err))
+		return
+	}
+
+	e.serviceSelectorCache.Delete(key)
 	e.queue.Add(key)
 }
 
@@ -368,7 +369,7 @@ func (e *EndpointController) syncService(key string) error {
 		// service is deleted. However, if we're down at the time when
 		// the service is deleted, we will miss that deletion, so this
 		// doesn't completely solve the problem. See #6877.
-		err = e.client.CoreV1().Endpoints(namespace).Delete(name, nil)
+		err = e.client.CoreV1().Endpoints(namespace).Delete(context.TODO(), name, metav1.DeleteOptions{})
 		if err != nil && !errors.IsNotFound(err) {
 			return err
 		}
@@ -428,11 +429,10 @@ func (e *EndpointController) syncService(key string) error {
 			klog.V(2).Infof("failed to find endpoint for service:%v with ClusterIP:%v on pod:%v with error:%v", service.Name, service.Spec.ClusterIP, pod.Name, err)
 			continue
 		}
-		epa := *ep
 
-		hostname := pod.Spec.Hostname
-		if len(hostname) > 0 && pod.Spec.Subdomain == service.Name && service.Namespace == pod.Namespace {
-			epa.Hostname = hostname
+		epa := *ep
+		if endpointutil.ShouldSetHostname(pod, service) {
+			epa.Hostname = pod.Spec.Hostname
 		}
 
 		// Allow headless service not to have ports.
@@ -444,17 +444,14 @@ func (e *EndpointController) syncService(key string) error {
 		} else {
 			for i := range service.Spec.Ports {
 				servicePort := &service.Spec.Ports[i]
-
-				portName := servicePort.Name
-				portProto := servicePort.Protocol
 				portNum, err := podutil.FindPort(pod, servicePort)
 				if err != nil {
 					klog.V(4).Infof("Failed to find port for service %s/%s: %v", service.Namespace, service.Name, err)
 					continue
 				}
+				epp := endpointPortFromServicePort(servicePort, portNum)
 
 				var readyEps, notReadyEps int
-				epp := &v1.EndpointPort{Name: portName, Port: int32(portNum), Protocol: portProto}
 				subsets, readyEps, notReadyEps = addEndpointSubset(subsets, pod, epa, epp, tolerateUnreadyEndpoints)
 				totalReadyEps = totalReadyEps + readyEps
 				totalNotReadyEps = totalNotReadyEps + notReadyEps
@@ -505,18 +502,18 @@ func (e *EndpointController) syncService(key string) error {
 	}
 
 	if !helper.IsServiceIPSet(service) {
-		newEndpoints.Labels[v1.IsHeadlessService] = ""
+		newEndpoints.Labels = utillabels.CloneAndAddLabel(newEndpoints.Labels, v1.IsHeadlessService, "")
 	} else {
-		delete(newEndpoints.Labels, v1.IsHeadlessService)
+		newEndpoints.Labels = utillabels.CloneAndRemoveLabel(newEndpoints.Labels, v1.IsHeadlessService)
 	}
 
 	klog.V(4).Infof("Update endpoints for %v/%v, ready: %d not ready: %d", service.Namespace, service.Name, totalReadyEps, totalNotReadyEps)
 	if createEndpoints {
 		// No previous endpoints, create them
-		_, err = e.client.CoreV1().Endpoints(service.Namespace).Create(newEndpoints)
+		_, err = e.client.CoreV1().Endpoints(service.Namespace).Create(context.TODO(), newEndpoints, metav1.CreateOptions{})
 	} else {
 		// Pre-existing
-		_, err = e.client.CoreV1().Endpoints(service.Namespace).Update(newEndpoints)
+		_, err = e.client.CoreV1().Endpoints(service.Namespace).Update(context.TODO(), newEndpoints, metav1.UpdateOptions{})
 	}
 	if err != nil {
 		if createEndpoints && errors.IsForbidden(err) {
@@ -525,6 +522,11 @@ func (e *EndpointController) syncService(key string) error {
 			// 2. policy is misconfigured, in which case no service would function anywhere.
 			// Given the frequency of 1, we log at a lower level.
 			klog.V(5).Infof("Forbidden from creating endpoints: %v", err)
+
+			// If the namespace is terminating, creates will continue to fail. Simply drop the item.
+			if errors.HasStatusCause(err, v1.NamespaceTerminatingCause) {
+				return nil
+			}
 		}
 
 		if createEndpoints {
@@ -602,4 +604,16 @@ func shouldPodBeInEndpoints(pod *v1.Pod) bool {
 	default:
 		return true
 	}
+}
+
+func endpointPortFromServicePort(servicePort *v1.ServicePort, portNum int) *v1.EndpointPort {
+	epp := &v1.EndpointPort{
+		Name:     servicePort.Name,
+		Port:     int32(portNum),
+		Protocol: servicePort.Protocol,
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.ServiceAppProtocol) {
+		epp.AppProtocol = servicePort.AppProtocol
+	}
+	return epp
 }

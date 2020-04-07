@@ -17,10 +17,8 @@ aliases:
   sig-auth-authenticators-reviewers:
     - deads2k
     - enj
-    - jianhuiz
     - lavalamp
     - liggitt
-    - mbohlool
     - mikedanese
     - sttts
     - wojtek-t
@@ -30,16 +28,13 @@ aliases:
     - liggitt
     - mikedanese
   sig-auth-authorizers-reviewers:
-    - david-mcmahon
     - deads2k
     - dims
     - enj
     - erictune
     - jianhuiz
-    - krousey
     - lavalamp
     - liggitt
-    - mbohlool
     - mikedanese
     - mml
     - ncdc
@@ -56,16 +51,13 @@ aliases:
   sig-auth-certificates-reviewers:
     - awly
     - caesarxuchao
-    - david-mcmahon
     - deads2k
     - dims
     - enj
     - errordeveloper
-    - hongchaodeng
     - jianhuiz
     - lavalamp
     - liggitt
-    - mbohlool
     - mikedanese
     - smarterclayton
     - sttts
@@ -81,7 +73,6 @@ aliases:
     - immutableT
     - lavalamp
     - liggitt
-    - sakshamsharma
     - smarterclayton
     - wojtek-t
 
@@ -102,11 +93,9 @@ aliases:
     - tallclair
   sig-auth-policy-reviewers:
     - deads2k
-    - hongchaodeng
     - jianhuiz
     - liggitt
     - mbohlool
-    - pweil-
     - tallclair
     - krmayankk
 
@@ -132,18 +121,31 @@ aliases:
     - justaugustus # SIG Chair
     - tpepper # SIG Chair / Patch Release Team
   release-engineering-reviewers:
-    - aleksandra-malinowska # Patch Release Team
     - calebamiles # SIG Chair
+    - cpanato # Branch Manager
     - feiskyer # Patch Release Team
     - hoegaarden # Patch Release Team
     - justaugustus # SIG Chair
+    - saschagrunert # Branch Manager
     - tpepper # SIG Chair / Patch Release Team
+  build-image-approvers:
+    - BenTheElder
+    - cblecker
+    - dims
+    - justaugustus
+    - listx
+  build-image-reviewers:
+    - BenTheElder
+    - cblecker
+    - dims
+    - justaugustus
+    - listx
 
   sig-storage-reviewers:
     - saad-ali
-    - childsb
 
   sig-scheduling-maintainers:
+    - alculquicondor
     - bsalamat
     - k82cn
     - wojtek-t
@@ -161,6 +163,8 @@ aliases:
     - draveness
     - hex108
     - alculquicondor
+    - liu-cong
+    - damemi
 
   sig-cli-maintainers:
     - adohe
@@ -181,9 +185,7 @@ aliases:
     - derekwaynecarr
     - dixudx
     - dims
-    - dshulyak
     - eparis
-    - ghodss
     - juanvallejo
     - mengqiy
     - rootfs
@@ -223,40 +225,44 @@ aliases:
     - pmorie
     - resouer
     - sjenning
-    - sjpotter
     - tallclair
-    - tmrts
     - vishh
     - yifan-gu
     - yujuhong
     - krmayankk
     - mattjmcnaughton
+    - matthyx
+
+  sig-network-driver-approvers:
+    - dcbw
+    - freehan
+
   sig-network-approvers:
+    - andrewsykim
     - bowei
     - caseydavenport
     - danwinship
     - dcbw
-    - dnardo
     - freehan
     - johnbelamaric
     - mrhohn
     - nicksardo
     - thockin
   sig-network-reviewers:
+    - andrewsykim
+    - aojea
     - bowei
     - caseydavenport
+    - cmluciano
     - danwinship
     - dcbw
-    - dnardo
     - freehan
     - johnbelamaric
+    - m1093782566
     - mrhohn
     - nicksardo
-    - thockin
     - rramkumar1
-    - cmluciano
-    - m1093782566
-    - andrewsykim
+    - thockin
   sig-apps-approvers:
     - kow3ns
     - janetkuo
@@ -283,6 +289,7 @@ aliases:
   sig-instrumentation-approvers:
     - piosz
     - brancz
+    - serathius
   sig-instrumentation-reviewers:
     - kawych
     - s-urbaniak
@@ -295,6 +302,7 @@ aliases:
     - monotek
     - logicalhan
     - RainbowMango
+    - serathius
 
   api-approvers:
     - erictune
@@ -359,7 +367,7 @@ aliases:
     - smarterclayton
     - thockin
     - liggitt
-  
+
   api-reviewers:
     - erictune
     - lavalamp
@@ -395,20 +403,19 @@ aliases:
     - soltysh
     - piosz
     - jsafrane
-    - jbeda
 
   # api-reviewers targeted by sig area
   # see https://git.k8s.io/community/sig-architecture/api-review-process.md#training-reviews
-  
+
   sig-api-machinery-api-reviewers:
     - caesarxuchao
     - deads2k
     - jpbetz
     - sttts
-  
+
   # sig-apps-api-reviewers:
-  #   - 
-  #   - 
+  #   -
+  #   -
 
   sig-auth-api-reviewers:
     - enj
@@ -421,34 +428,41 @@ aliases:
   sig-cloud-provider-api-reviewers:
     - andrewsykim
     - cheftako
-  
+
   # sig-cluster-lifecycle-api-reviewers:
-  #   - 
   #   -
-  
+  #   -
+
   sig-node-api-reviewers:
     - dchen1107
     - derekwaynecarr
     - tallclair
     - yujuhong
-  
+
+  sig-scalability-approvers:
+    - mm4tt
+    - wojtek-t
+
+  sig-scalability-reviewers:
+    - mm4tt
+    - wojtek-t
+
   sig-scheduling-api-reviewers:
       - bsalamat
       - k82cn
-  
+
   sig-storage-api-reviewers:
     - saad-ali
     - msau42
     - jsafrane
 
-  
+
   sig-windows-api-reviewers:
     - patricklang
     - ddebroy
     - benmoss
 
   dep-approvers:
-    - apelisse
     - BenTheElder
     - cblecker
     - dims
@@ -456,26 +470,23 @@ aliases:
     - sttts
     - soltysh
   feature-approvers:
+    - andrewsykim     # Cloud Provider
     - bgrant0607      # Architecture
     - brancz          # Instrumentation
-    - bsalamat        # Scheduling
+    - ahg-g           # Scheduling
     - calebamiles     # Release
     - caseydavenport  # Network
-    - childsb         # Storage
     - countspongebob  # Scalability
     - csbell          # Multicluster
     - dcbw            # Network
     - dchen1107       # Node
     - deads2k         # API Machinery
     - derekwaynecarr  # Node
-    - dghubble        # On Premise
-    - jdumars         # Architecture, Cluster Ops, Release
+    - jdumars         # Architecture, Release
     - kow3ns          # Apps
     - lavalamp        # API Machinery
     - liggitt         # Auth
-    - lukemarsden     # Cluster Lifecycle
     - luxas           # Cluster Lifecycle
-    - marcoceppi      # On Premise
     - mattfarina      # Apps
     - michmike        # Windows
     - mwielgus        # Autoscaling
@@ -491,4 +502,9 @@ aliases:
     - thockin         # Network
     - timothysc       # Cluster Lifecycle, Scheduling
     - wojtek-t        # Scalability
-    - zehicle         # Cluster Ops
+
+  # conformance aliases https://git.k8s.io/enhancements/keps/sig-architecture/20190412-conformance-behaviors.md
+  conformance-behavior-approvers:
+    - bgrant0607
+    - smarterclayton
+    - johnbelamaric

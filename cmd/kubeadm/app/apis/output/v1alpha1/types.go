@@ -27,8 +27,33 @@ import (
 // This is a copy of BoostrapToken struct from ../kubeadm/types.go with 2 additions:
 // metav1.TypeMeta and metav1.ObjectMeta
 type BootstrapToken struct {
-	metav1.TypeMeta   `json:",inline"`
-	metav1.ObjectMeta `json:",inline"`
+	metav1.TypeMeta `json:",inline"`
 
 	kubeadmapiv1beta2.BootstrapToken
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// Images represents information for the output produced by 'kubeadm config images list'
+type Images struct {
+	metav1.TypeMeta `json:",inline"`
+
+	Images []string `json:"images"`
+}
+
+// ComponentUpgradePlan represents information about upgrade plan for one component
+type ComponentUpgradePlan struct {
+	Name           string `json:"name"`
+	CurrentVersion string `json:"currentVersion"`
+	NewVersion     string `json:"newVersion"`
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// UpgradePlan represents information about upgrade plan for the output
+// produced by 'kubeadm upgrade plan'
+type UpgradePlan struct {
+	metav1.TypeMeta
+
+	Components []ComponentUpgradePlan `json:"components"`
 }

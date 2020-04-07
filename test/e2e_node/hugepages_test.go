@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package e2e_node
+package e2enode
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -27,10 +29,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
-
 	"k8s.io/kubernetes/pkg/kubelet/cm"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 
 	"github.com/onsi/ginkgo"
@@ -85,6 +87,15 @@ func makePodToVerifyHugePages(baseName string, hugePagesLimit resource.Quantity)
 
 // configureHugePages attempts to allocate 10Mi of 2Mi hugepages for testing purposes
 func configureHugePages() error {
+	// Compact memory to make bigger contiguous blocks of memory available
+	// before allocating huge pages.
+	// https://www.kernel.org/doc/Documentation/sysctl/vm.txt
+	if _, err := os.Stat("/proc/sys/vm/compact_memory"); err == nil {
+		err := exec.Command("/bin/sh", "-c", "echo 1 > /proc/sys/vm/compact_memory").Run()
+		if err != nil {
+			return err
+		}
+	}
 	err := exec.Command("/bin/sh", "-c", "echo 5 > /proc/sys/vm/nr_hugepages").Run()
 	if err != nil {
 		return err
@@ -120,7 +131,7 @@ func isHugePageSupported() bool {
 
 // pollResourceAsString polls for a specified resource and capacity from node
 func pollResourceAsString(f *framework.Framework, resourceName string) string {
-	node, err := f.ClientSet.CoreV1().Nodes().Get(framework.TestContext.NodeName, metav1.GetOptions{})
+	node, err := f.ClientSet.CoreV1().Nodes().Get(context.TODO(), framework.TestContext.NodeName, metav1.GetOptions{})
 	framework.ExpectNoError(err)
 	amount := amountOfResourceAsString(node, resourceName)
 	framework.Logf("amount of %v: %v", resourceName, amount)
@@ -177,7 +188,7 @@ var _ = SIGDescribe("HugePages [Serial] [Feature:HugePages][NodeFeature:HugePage
 		ginkgo.BeforeEach(func() {
 			ginkgo.By("verifying hugepages are supported")
 			if !isHugePageSupported() {
-				framework.Skipf("skipping test because hugepages are not supported")
+				e2eskipper.Skipf("skipping test because hugepages are not supported")
 				return
 			}
 			ginkgo.By("configuring the host to reserve a number of pre-allocated hugepages")

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
@@ -28,21 +29,23 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
+	clientscheme "k8s.io/client-go/kubernetes/scheme"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	utiltesting "k8s.io/client-go/util/testing"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
-	"k8s.io/kubernetes/pkg/api/testapi"
 	endptspkg "k8s.io/kubernetes/pkg/api/v1/endpoints"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/controller"
 	endpointutil "k8s.io/kubernetes/pkg/controller/util/endpoint"
 	"k8s.io/kubernetes/pkg/features"
+	utilpointer "k8s.io/utils/pointer"
 )
 
 var alwaysReady = func() bool { return true }
@@ -137,11 +140,14 @@ func addNotReadyPodsWithSpecifiedRestartPolicyAndPhase(store cache.Store, namesp
 func makeTestServer(t *testing.T, namespace string) (*httptest.Server, *utiltesting.FakeHandler) {
 	fakeEndpointsHandler := utiltesting.FakeHandler{
 		StatusCode:   http.StatusOK,
-		ResponseBody: runtime.EncodeOrDie(testapi.Default.Codec(), &v1.Endpoints{}),
+		ResponseBody: runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{}),
 	}
 	mux := http.NewServeMux()
-	mux.Handle(testapi.Default.ResourcePath("endpoints", namespace, ""), &fakeEndpointsHandler)
-	mux.Handle(testapi.Default.ResourcePath("endpoints/", namespace, ""), &fakeEndpointsHandler)
+	if namespace == "" {
+		t.Fatal("namespace cannot be empty")
+	}
+	mux.Handle("/api/v1/namespaces/"+namespace+"/endpoints", &fakeEndpointsHandler)
+	mux.Handle("/api/v1/namespaces/"+namespace+"/endpoints/", &fakeEndpointsHandler)
 	mux.HandleFunc("/", func(res http.ResponseWriter, req *http.Request) {
 		t.Errorf("unexpected request: %v", req.RequestURI)
 		http.Error(res, "", http.StatusNotFound)
@@ -313,7 +319,7 @@ func TestSyncEndpointsProtocolTCP(t *testing.T) {
 	endpoints.syncService(ns + "/foo")
 
 	endpointsHandler.ValidateRequestCount(t, 1)
-	data := runtime.EncodeOrDie(testapi.Default.Codec(), &v1.Endpoints{
+	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
 			Namespace:       ns,
@@ -327,7 +333,7 @@ func TestSyncEndpointsProtocolTCP(t *testing.T) {
 			Ports:     []v1.EndpointPort{{Port: 8080, Protocol: "TCP"}},
 		}},
 	})
-	endpointsHandler.ValidateRequest(t, testapi.Default.ResourcePath("endpoints", ns, "foo"), "PUT", &data)
+	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints/foo", "PUT", &data)
 }
 
 func TestSyncEndpointsProtocolUDP(t *testing.T) {
@@ -357,7 +363,7 @@ func TestSyncEndpointsProtocolUDP(t *testing.T) {
 	endpoints.syncService(ns + "/foo")
 
 	endpointsHandler.ValidateRequestCount(t, 1)
-	data := runtime.EncodeOrDie(testapi.Default.Codec(), &v1.Endpoints{
+	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
 			Namespace:       ns,
@@ -371,7 +377,7 @@ func TestSyncEndpointsProtocolUDP(t *testing.T) {
 			Ports:     []v1.EndpointPort{{Port: 8080, Protocol: "UDP"}},
 		}},
 	})
-	endpointsHandler.ValidateRequest(t, testapi.Default.ResourcePath("endpoints", ns, "foo"), "PUT", &data)
+	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints/foo", "PUT", &data)
 }
 
 func TestSyncEndpointsProtocolSCTP(t *testing.T) {
@@ -401,7 +407,7 @@ func TestSyncEndpointsProtocolSCTP(t *testing.T) {
 	endpoints.syncService(ns + "/foo")
 
 	endpointsHandler.ValidateRequestCount(t, 1)
-	data := runtime.EncodeOrDie(testapi.Default.Codec(), &v1.Endpoints{
+	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
 			Namespace:       ns,
@@ -415,7 +421,7 @@ func TestSyncEndpointsProtocolSCTP(t *testing.T) {
 			Ports:     []v1.EndpointPort{{Port: 8080, Protocol: "SCTP"}},
 		}},
 	})
-	endpointsHandler.ValidateRequest(t, testapi.Default.ResourcePath("endpoints", ns, "foo"), "PUT", &data)
+	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints/foo", "PUT", &data)
 }
 
 func TestSyncEndpointsItemsEmptySelectorSelectsAll(t *testing.T) {
@@ -441,7 +447,7 @@ func TestSyncEndpointsItemsEmptySelectorSelectsAll(t *testing.T) {
 	})
 	endpoints.syncService(ns + "/foo")
 
-	data := runtime.EncodeOrDie(testapi.Default.Codec(), &v1.Endpoints{
+	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
 			Namespace:       ns,
@@ -455,7 +461,7 @@ func TestSyncEndpointsItemsEmptySelectorSelectsAll(t *testing.T) {
 			Ports:     []v1.EndpointPort{{Port: 8080, Protocol: "TCP"}},
 		}},
 	})
-	endpointsHandler.ValidateRequest(t, testapi.Default.ResourcePath("endpoints", ns, "foo"), "PUT", &data)
+	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints/foo", "PUT", &data)
 }
 
 func TestSyncEndpointsItemsEmptySelectorSelectsAllNotReady(t *testing.T) {
@@ -481,7 +487,7 @@ func TestSyncEndpointsItemsEmptySelectorSelectsAllNotReady(t *testing.T) {
 	})
 	endpoints.syncService(ns + "/foo")
 
-	data := runtime.EncodeOrDie(testapi.Default.Codec(), &v1.Endpoints{
+	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
 			Namespace:       ns,
@@ -495,7 +501,7 @@ func TestSyncEndpointsItemsEmptySelectorSelectsAllNotReady(t *testing.T) {
 			Ports:             []v1.EndpointPort{{Port: 8080, Protocol: "TCP"}},
 		}},
 	})
-	endpointsHandler.ValidateRequest(t, testapi.Default.ResourcePath("endpoints", ns, "foo"), "PUT", &data)
+	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints/foo", "PUT", &data)
 }
 
 func TestSyncEndpointsItemsEmptySelectorSelectsAllMixed(t *testing.T) {
@@ -521,7 +527,7 @@ func TestSyncEndpointsItemsEmptySelectorSelectsAllMixed(t *testing.T) {
 	})
 	endpoints.syncService(ns + "/foo")
 
-	data := runtime.EncodeOrDie(testapi.Default.Codec(), &v1.Endpoints{
+	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
 			Namespace:       ns,
@@ -536,7 +542,7 @@ func TestSyncEndpointsItemsEmptySelectorSelectsAllMixed(t *testing.T) {
 			Ports:             []v1.EndpointPort{{Port: 8080, Protocol: "TCP"}},
 		}},
 	})
-	endpointsHandler.ValidateRequest(t, testapi.Default.ResourcePath("endpoints", ns, "foo"), "PUT", &data)
+	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints/foo", "PUT", &data)
 }
 
 func TestSyncEndpointsItemsPreexisting(t *testing.T) {
@@ -565,7 +571,7 @@ func TestSyncEndpointsItemsPreexisting(t *testing.T) {
 	})
 	endpoints.syncService(ns + "/foo")
 
-	data := runtime.EncodeOrDie(testapi.Default.Codec(), &v1.Endpoints{
+	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
 			Namespace:       ns,
@@ -579,7 +585,7 @@ func TestSyncEndpointsItemsPreexisting(t *testing.T) {
 			Ports:     []v1.EndpointPort{{Port: 8080, Protocol: "TCP"}},
 		}},
 	})
-	endpointsHandler.ValidateRequest(t, testapi.Default.ResourcePath("endpoints", ns, "foo"), "PUT", &data)
+	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints/foo", "PUT", &data)
 }
 
 func TestSyncEndpointsItemsPreexistingIdentical(t *testing.T) {
@@ -641,7 +647,7 @@ func TestSyncEndpointsItems(t *testing.T) {
 			{Name: "port1", Port: 8088, Protocol: "TCP"},
 		},
 	}}
-	data := runtime.EncodeOrDie(testapi.Default.Codec(), &v1.Endpoints{
+	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			ResourceVersion: "",
 			Name:            "foo",
@@ -652,7 +658,7 @@ func TestSyncEndpointsItems(t *testing.T) {
 		Subsets: endptspkg.SortSubsets(expectedSubsets),
 	})
 	endpointsHandler.ValidateRequestCount(t, 1)
-	endpointsHandler.ValidateRequest(t, testapi.Default.ResourcePath("endpoints", ns, ""), "POST", &data)
+	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints", "POST", &data)
 }
 
 func TestSyncEndpointsItemsWithLabels(t *testing.T) {
@@ -691,7 +697,7 @@ func TestSyncEndpointsItemsWithLabels(t *testing.T) {
 	}}
 
 	serviceLabels[v1.IsHeadlessService] = ""
-	data := runtime.EncodeOrDie(testapi.Default.Codec(), &v1.Endpoints{
+	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			ResourceVersion: "",
 			Name:            "foo",
@@ -700,7 +706,7 @@ func TestSyncEndpointsItemsWithLabels(t *testing.T) {
 		Subsets: endptspkg.SortSubsets(expectedSubsets),
 	})
 	endpointsHandler.ValidateRequestCount(t, 1)
-	endpointsHandler.ValidateRequest(t, testapi.Default.ResourcePath("endpoints", ns, ""), "POST", &data)
+	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints", "POST", &data)
 }
 
 func TestSyncEndpointsItemsPreexistingLabelsChange(t *testing.T) {
@@ -738,7 +744,7 @@ func TestSyncEndpointsItemsPreexistingLabelsChange(t *testing.T) {
 	endpoints.syncService(ns + "/foo")
 
 	serviceLabels[v1.IsHeadlessService] = ""
-	data := runtime.EncodeOrDie(testapi.Default.Codec(), &v1.Endpoints{
+	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
 			Namespace:       ns,
@@ -750,7 +756,7 @@ func TestSyncEndpointsItemsPreexistingLabelsChange(t *testing.T) {
 			Ports:     []v1.EndpointPort{{Port: 8080, Protocol: "TCP"}},
 		}},
 	})
-	endpointsHandler.ValidateRequest(t, testapi.Default.ResourcePath("endpoints", ns, "foo"), "PUT", &data)
+	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints/foo", "PUT", &data)
 }
 
 func TestWaitsForAllInformersToBeSynced2(t *testing.T) {
@@ -782,7 +788,7 @@ func TestWaitsForAllInformersToBeSynced2(t *testing.T) {
 				},
 			}
 			endpoints.serviceStore.Add(service)
-			endpoints.enqueueService(service)
+			endpoints.onServiceUpdate(service)
 			endpoints.podsSynced = test.podsSynced
 			endpoints.servicesSynced = test.servicesSynced
 			endpoints.endpointsSynced = test.endpointsSynced
@@ -825,21 +831,24 @@ func TestSyncEndpointsHeadlessService(t *testing.T) {
 		}},
 	})
 	addPods(endpoints.podStore, ns, 1, 1, 0, false)
-	endpoints.serviceStore.Add(&v1.Service{
-		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
+	service := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns, Labels: map[string]string{"a": "b"}},
 		Spec: v1.ServiceSpec{
 			Selector:  map[string]string{},
 			ClusterIP: api.ClusterIPNone,
 			Ports:     []v1.ServicePort{},
 		},
-	})
+	}
+	originalService := service.DeepCopy()
+	endpoints.serviceStore.Add(service)
 	endpoints.syncService(ns + "/foo")
-	data := runtime.EncodeOrDie(testapi.Default.Codec(), &v1.Endpoints{
+	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
 			Namespace:       ns,
 			ResourceVersion: "1",
 			Labels: map[string]string{
+				"a":                  "b",
 				v1.IsHeadlessService: "",
 			},
 		},
@@ -848,8 +857,11 @@ func TestSyncEndpointsHeadlessService(t *testing.T) {
 			Ports:     []v1.EndpointPort{},
 		}},
 	})
+	if !reflect.DeepEqual(originalService, service) {
+		t.Fatalf("syncing endpoints changed service: %s", diff.ObjectReflectDiff(service, originalService))
+	}
 	endpointsHandler.ValidateRequestCount(t, 1)
-	endpointsHandler.ValidateRequest(t, testapi.Default.ResourcePath("endpoints", ns, "foo"), "PUT", &data)
+	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints/foo", "PUT", &data)
 }
 
 func TestSyncEndpointsItemsExcludeNotReadyPodsWithRestartPolicyNeverAndPhaseFailed(t *testing.T) {
@@ -877,7 +889,7 @@ func TestSyncEndpointsItemsExcludeNotReadyPodsWithRestartPolicyNeverAndPhaseFail
 		},
 	})
 	endpoints.syncService(ns + "/foo")
-	data := runtime.EncodeOrDie(testapi.Default.Codec(), &v1.Endpoints{
+	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
 			Namespace:       ns,
@@ -888,7 +900,7 @@ func TestSyncEndpointsItemsExcludeNotReadyPodsWithRestartPolicyNeverAndPhaseFail
 		},
 		Subsets: []v1.EndpointSubset{},
 	})
-	endpointsHandler.ValidateRequest(t, testapi.Default.ResourcePath("endpoints", ns, "foo"), "PUT", &data)
+	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints/foo", "PUT", &data)
 }
 
 func TestSyncEndpointsItemsExcludeNotReadyPodsWithRestartPolicyNeverAndPhaseSucceeded(t *testing.T) {
@@ -916,7 +928,7 @@ func TestSyncEndpointsItemsExcludeNotReadyPodsWithRestartPolicyNeverAndPhaseSucc
 		},
 	})
 	endpoints.syncService(ns + "/foo")
-	data := runtime.EncodeOrDie(testapi.Default.Codec(), &v1.Endpoints{
+	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
 			Namespace:       ns,
@@ -927,7 +939,7 @@ func TestSyncEndpointsItemsExcludeNotReadyPodsWithRestartPolicyNeverAndPhaseSucc
 		},
 		Subsets: []v1.EndpointSubset{},
 	})
-	endpointsHandler.ValidateRequest(t, testapi.Default.ResourcePath("endpoints", ns, "foo"), "PUT", &data)
+	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints/foo", "PUT", &data)
 }
 
 func TestSyncEndpointsItemsExcludeNotReadyPodsWithRestartPolicyOnFailureAndPhaseSucceeded(t *testing.T) {
@@ -955,7 +967,7 @@ func TestSyncEndpointsItemsExcludeNotReadyPodsWithRestartPolicyOnFailureAndPhase
 		},
 	})
 	endpoints.syncService(ns + "/foo")
-	data := runtime.EncodeOrDie(testapi.Default.Codec(), &v1.Endpoints{
+	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
 			Namespace:       ns,
@@ -966,7 +978,7 @@ func TestSyncEndpointsItemsExcludeNotReadyPodsWithRestartPolicyOnFailureAndPhase
 		},
 		Subsets: []v1.EndpointSubset{},
 	})
-	endpointsHandler.ValidateRequest(t, testapi.Default.ResourcePath("endpoints", ns, "foo"), "PUT", &data)
+	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints/foo", "PUT", &data)
 }
 
 func TestSyncEndpointsHeadlessWithoutPort(t *testing.T) {
@@ -985,7 +997,7 @@ func TestSyncEndpointsHeadlessWithoutPort(t *testing.T) {
 	addPods(endpoints.podStore, ns, 1, 1, 0, false)
 	endpoints.syncService(ns + "/foo")
 	endpointsHandler.ValidateRequestCount(t, 1)
-	data := runtime.EncodeOrDie(testapi.Default.Codec(), &v1.Endpoints{
+	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "foo",
 			Labels: map[string]string{
@@ -997,7 +1009,7 @@ func TestSyncEndpointsHeadlessWithoutPort(t *testing.T) {
 			Ports:     nil,
 		}},
 	})
-	endpointsHandler.ValidateRequest(t, testapi.Default.ResourcePath("endpoints", ns, ""), "POST", &data)
+	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints", "POST", &data)
 }
 
 // There are 3*5 possibilities(3 types of RestartPolicy by 5 types of PodPhase). Not list them all here.
@@ -1296,7 +1308,7 @@ func TestPodChanged(t *testing.T) {
 
 	/* dual stack tests */
 	// primary changes, because changing IPs is done by changing sandbox
-	// case 1: add new secondrary IP
+	// case 1: add new secondary IP
 	newPod.Status.PodIP = "1.1.3.1"
 	newPod.Status.PodIPs = []v1.PodIP{
 		{
@@ -1416,7 +1428,7 @@ func TestLastTriggerChangeTimeAnnotation(t *testing.T) {
 	endpoints.syncService(ns + "/foo")
 
 	endpointsHandler.ValidateRequestCount(t, 1)
-	data := runtime.EncodeOrDie(testapi.Default.Codec(), &v1.Endpoints{
+	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
 			Namespace:       ns,
@@ -1433,7 +1445,7 @@ func TestLastTriggerChangeTimeAnnotation(t *testing.T) {
 			Ports:     []v1.EndpointPort{{Port: 8080, Protocol: "TCP"}},
 		}},
 	})
-	endpointsHandler.ValidateRequest(t, testapi.Default.ResourcePath("endpoints", ns, "foo"), "PUT", &data)
+	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints/foo", "PUT", &data)
 }
 
 func TestLastTriggerChangeTimeAnnotation_AnnotationOverridden(t *testing.T) {
@@ -1466,7 +1478,7 @@ func TestLastTriggerChangeTimeAnnotation_AnnotationOverridden(t *testing.T) {
 	endpoints.syncService(ns + "/foo")
 
 	endpointsHandler.ValidateRequestCount(t, 1)
-	data := runtime.EncodeOrDie(testapi.Default.Codec(), &v1.Endpoints{
+	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
 			Namespace:       ns,
@@ -1483,7 +1495,7 @@ func TestLastTriggerChangeTimeAnnotation_AnnotationOverridden(t *testing.T) {
 			Ports:     []v1.EndpointPort{{Port: 8080, Protocol: "TCP"}},
 		}},
 	})
-	endpointsHandler.ValidateRequest(t, testapi.Default.ResourcePath("endpoints", ns, "foo"), "PUT", &data)
+	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints/foo", "PUT", &data)
 }
 
 func TestLastTriggerChangeTimeAnnotation_AnnotationCleared(t *testing.T) {
@@ -1517,7 +1529,7 @@ func TestLastTriggerChangeTimeAnnotation_AnnotationCleared(t *testing.T) {
 	endpoints.syncService(ns + "/foo")
 
 	endpointsHandler.ValidateRequestCount(t, 1)
-	data := runtime.EncodeOrDie(testapi.Default.Codec(), &v1.Endpoints{
+	data := runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "foo",
 			Namespace:       ns,
@@ -1531,7 +1543,7 @@ func TestLastTriggerChangeTimeAnnotation_AnnotationCleared(t *testing.T) {
 			Ports:     []v1.EndpointPort{{Port: 8080, Protocol: "TCP"}},
 		}},
 	})
-	endpointsHandler.ValidateRequest(t, testapi.Default.ResourcePath("endpoints", ns, "foo"), "PUT", &data)
+	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints/foo", "PUT", &data)
 }
 
 // TestPodUpdatesBatching verifies that endpoint updates caused by pod updates are batched together.
@@ -1933,7 +1945,56 @@ func TestSyncEndpointsServiceNotFound(t *testing.T) {
 	})
 	endpoints.syncService(ns + "/foo")
 	endpointsHandler.ValidateRequestCount(t, 1)
-	endpointsHandler.ValidateRequest(t, testapi.Default.ResourcePath("endpoints", ns, "foo"), "DELETE", nil)
+	endpointsHandler.ValidateRequest(t, "/api/v1/namespaces/"+ns+"/endpoints/foo", "DELETE", nil)
+}
+
+func TestEndpointPortFromServicePort(t *testing.T) {
+	http := utilpointer.StringPtr("http")
+	testCases := map[string]struct {
+		featureGateEnabled           bool
+		serviceAppProtocol           *string
+		expectedEndpointsAppProtocol *string
+	}{
+		"feature gate disabled, empty app protocol": {
+			featureGateEnabled:           false,
+			serviceAppProtocol:           nil,
+			expectedEndpointsAppProtocol: nil,
+		},
+		"feature gate disabled, http app protocol": {
+			featureGateEnabled:           false,
+			serviceAppProtocol:           http,
+			expectedEndpointsAppProtocol: nil,
+		},
+		"feature gate enabled, empty app protocol": {
+			featureGateEnabled:           true,
+			serviceAppProtocol:           nil,
+			expectedEndpointsAppProtocol: nil,
+		},
+		"feature gate enabled, http app protocol": {
+			featureGateEnabled:           true,
+			serviceAppProtocol:           http,
+			expectedEndpointsAppProtocol: http,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ServiceAppProtocol, tc.featureGateEnabled)()
+
+			epp := endpointPortFromServicePort(&v1.ServicePort{Name: "test", AppProtocol: tc.serviceAppProtocol}, 80)
+
+			if epp.AppProtocol != tc.expectedEndpointsAppProtocol {
+				t.Errorf("Expected Endpoints AppProtocol to be %s, got %s", stringVal(tc.expectedEndpointsAppProtocol), stringVal(epp.AppProtocol))
+			}
+		})
+	}
+}
+
+func stringVal(str *string) string {
+	if str == nil {
+		return "nil"
+	}
+	return *str
 }
 
 func podChangedHelper(oldPod, newPod *v1.Pod, endpointChanged endpointutil.EndpointsMatch) bool {

@@ -68,7 +68,7 @@ define ALL_HELP_INFO
 #
 # Args:
 #   WHAT: Directory names to build.  If any of these directories has a 'main'
-#     package, the build will produce executable files under $(OUT_DIR)/go/bin.
+#     package, the build will produce executable files under $(OUT_DIR)/bin.
 #     If not specified, "everything" will be built.
 #   GOFLAGS: Extra flags to pass to 'go' when building.
 #   GOLDFLAGS: Extra linking flags passed to 'go' when building.
@@ -202,21 +202,6 @@ test-integration:
 else
 test-integration: generated_files
 	hack/make-rules/test-integration.sh $(WHAT)
-endif
-
-define TEST_E2E_HELP_INFO
-# Build and run end-to-end tests.
-#
-# Example:
-#   make test-e2e
-endef
-.PHONY: test-e2e
-ifeq ($(PRINT_HELP),y)
-test-e2e:
-	@echo "$$TEST_E2E_HELP_INFO"
-else
-test-e2e: ginkgo generated_files
-	go run hack/e2e.go -- --build --up --test --down
 endif
 
 define TEST_E2E_NODE_HELP_INFO
@@ -638,4 +623,6 @@ bazel-release:
 else
 bazel-release:
 	bazel build //build/release-tars
+	bazel shutdown || true
+	pkill ^bazel || true
 endif

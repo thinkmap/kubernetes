@@ -17,6 +17,7 @@ limitations under the License.
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -98,6 +99,7 @@ func NewCmdToken(out io.Writer, errW io.Writer) *cobra.Command {
 
 	var cfgPath string
 	var printJoinCommand bool
+	var certificateKey string
 	bto := options.NewBootstrapTokenOptions()
 
 	createCmd := &cobra.Command{
@@ -132,13 +134,15 @@ func NewCmdToken(out io.Writer, errW io.Writer) *cobra.Command {
 				return err
 			}
 
-			return RunCreateToken(out, client, cfgPath, cfg, printJoinCommand, kubeConfigFile)
+			return RunCreateToken(out, client, cfgPath, cfg, printJoinCommand, certificateKey, kubeConfigFile)
 		},
 	}
 
 	options.AddConfigFlag(createCmd.Flags(), &cfgPath)
 	createCmd.Flags().BoolVar(&printJoinCommand,
 		"print-join-command", false, "Instead of printing only the token, print the full 'kubeadm join' flag needed to join the cluster using the token.")
+	createCmd.Flags().StringVar(&certificateKey,
+		options.CertificateKey, "", "When used together with '--print-join-command', print the full 'kubeadm join' flag needed to join the cluster as a control-plane. To create a new certificate key you must use 'kubeadm init phase upload-certs --upload-certs'.")
 	bto.AddTTLFlagWithName(createCmd.Flags(), "ttl")
 	bto.AddUsagesFlag(createCmd.Flags())
 	bto.AddGroupsFlag(createCmd.Flags())
@@ -226,7 +230,7 @@ func NewCmdTokenGenerate(out io.Writer) *cobra.Command {
 }
 
 // RunCreateToken generates a new bootstrap token and stores it as a secret on the server.
-func RunCreateToken(out io.Writer, client clientset.Interface, cfgPath string, initCfg *kubeadmapiv1beta2.InitConfiguration, printJoinCommand bool, kubeConfigFile string) error {
+func RunCreateToken(out io.Writer, client clientset.Interface, cfgPath string, initCfg *kubeadmapiv1beta2.InitConfiguration, printJoinCommand bool, certificateKey string, kubeConfigFile string) error {
 	// ClusterConfiguration is needed just for the call to LoadOrDefaultInitConfiguration
 	clusterCfg := &kubeadmapiv1beta2.ClusterConfiguration{
 		// KubernetesVersion is not used, but we set this explicitly to avoid
@@ -257,14 +261,28 @@ func RunCreateToken(out io.Writer, client clientset.Interface, cfgPath string, i
 	// otherwise, just print the token
 	if printJoinCommand {
 		skipTokenPrint := false
-		joinCommand, err := cmdutil.GetJoinWorkerCommand(kubeConfigFile, internalcfg.BootstrapTokens[0].Token.String(), skipTokenPrint)
-		if err != nil {
-			return errors.Wrap(err, "failed to get join command")
+		if certificateKey != "" {
+			skipCertificateKeyPrint := false
+			joinCommand, err := cmdutil.GetJoinControlPlaneCommand(kubeConfigFile, internalcfg.BootstrapTokens[0].Token.String(), certificateKey, skipTokenPrint, skipCertificateKeyPrint)
+			if err != nil {
+				return errors.Wrap(err, "failed to get join command")
+			}
+			joinCommand = strings.ReplaceAll(joinCommand, "\\\n", "")
+			joinCommand = strings.ReplaceAll(joinCommand, "\t", "")
+			fmt.Fprintln(out, joinCommand)
+		} else {
+			joinCommand, err := cmdutil.GetJoinWorkerCommand(kubeConfigFile, internalcfg.BootstrapTokens[0].Token.String(), skipTokenPrint)
+			if err != nil {
+				return errors.Wrap(err, "failed to get join command")
+			}
+			joinCommand = strings.ReplaceAll(joinCommand, "\\\n", "")
+			joinCommand = strings.ReplaceAll(joinCommand, "\t", "")
+			fmt.Fprintln(out, joinCommand)
 		}
-		joinCommand = strings.ReplaceAll(joinCommand, "\\\n", "")
-		joinCommand = strings.ReplaceAll(joinCommand, "\t", "")
-		fmt.Fprintln(out, joinCommand)
 	} else {
+		if certificateKey != "" {
+			return errors.Wrap(err, "cannot use --certificate-key without --print-join-command")
+		}
 		fmt.Fprintln(out, internalcfg.BootstrapTokens[0].Token.String())
 	}
 
@@ -287,7 +305,7 @@ func formatBootstrapToken(obj *outputapiv1alpha1.BootstrapToken) string {
 	ttl := "<forever>"
 	expires := "<never>"
 	if obj.Expires != nil {
-		ttl = duration.ShortHumanDuration(obj.Expires.Sub(time.Now()))
+		ttl = duration.ShortHumanDuration(time.Until(obj.Expires.Time))
 		expires = obj.Expires.Format(time.RFC3339)
 	}
 	ttl = fmt.Sprintf("%-9s", ttl)
@@ -363,7 +381,7 @@ func RunListTokens(out io.Writer, errW io.Writer, client clientset.Interface, pr
 	}
 
 	klog.V(1).Info("[token] retrieving list of bootstrap tokens")
-	secrets, err := client.CoreV1().Secrets(metav1.NamespaceSystem).List(listOptions)
+	secrets, err := client.CoreV1().Secrets(metav1.NamespaceSystem).List(context.TODO(), listOptions)
 	if err != nil {
 		return errors.Wrap(err, "failed to list bootstrap tokens")
 	}
@@ -413,7 +431,7 @@ func RunDeleteTokens(out io.Writer, client clientset.Interface, tokenIDsOrTokens
 
 		tokenSecretName := bootstraputil.BootstrapTokenSecretName(tokenID)
 		klog.V(1).Infof("[token] deleting token %q", tokenID)
-		if err := client.CoreV1().Secrets(metav1.NamespaceSystem).Delete(tokenSecretName, nil); err != nil {
+		if err := client.CoreV1().Secrets(metav1.NamespaceSystem).Delete(context.TODO(), tokenSecretName, metav1.DeleteOptions{}); err != nil {
 			return errors.Wrapf(err, "failed to delete bootstrap token %q", tokenID)
 		}
 		fmt.Fprintf(out, "bootstrap token %q deleted\n", tokenID)

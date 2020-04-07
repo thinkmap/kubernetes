@@ -17,6 +17,7 @@ limitations under the License.
 package pluginwatcher
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -24,7 +25,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"k8s.io/klog"
 
@@ -63,11 +63,7 @@ func NewExampleHandler(supportedVersions []string, permitDeprecatedDir bool) *ex
 	}
 }
 
-func (p *exampleHandler) ValidatePlugin(pluginName string, endpoint string, versions []string, foundInDeprecatedDir bool) error {
-	if foundInDeprecatedDir && !p.permitDeprecatedDir {
-		return fmt.Errorf("device plugin socket was found in a directory that is no longer supported and this test does not permit plugins from deprecated dir")
-	}
-
+func (p *exampleHandler) ValidatePlugin(pluginName string, endpoint string, versions []string) error {
 	p.SendEvent(pluginName, exampleEventValidate)
 
 	n, ok := p.DecreasePluginCount(pluginName)
@@ -160,8 +156,8 @@ func dial(unixSocketPath string, timeout time.Duration) (registerapi.Registratio
 	defer cancel()
 
 	c, err := grpc.DialContext(ctx, unixSocketPath, grpc.WithInsecure(), grpc.WithBlock(),
-		grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
-			return net.DialTimeout("unix", addr, timeout)
+		grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", addr)
 		}),
 	)
 

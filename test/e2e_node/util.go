@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package e2e_node
+package e2enode
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -27,14 +28,12 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/net/context"
-
 	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/client-go/kubernetes/scheme"
+	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/component-base/featuregate"
 	internalapi "k8s.io/cri-api/pkg/apis"
 	"k8s.io/klog"
@@ -50,6 +49,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/remote"
 	"k8s.io/kubernetes/pkg/kubelet/util"
 	"k8s.io/kubernetes/test/e2e/framework"
+	e2ekubelet "k8s.io/kubernetes/test/e2e/framework/kubelet"
 	e2emetrics "k8s.io/kubernetes/test/e2e/framework/metrics"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 	imageutils "k8s.io/kubernetes/test/utils/image"
@@ -123,12 +123,8 @@ func getNodeDevices() (*kubeletpodresourcesv1alpha1.ListPodResourcesResponse, er
 
 // Returns the current KubeletConfiguration
 func getCurrentKubeletConfig() (*kubeletconfig.KubeletConfiguration, error) {
-	resp := pollConfigz(5*time.Minute, 5*time.Second)
-	kubeCfg, err := decodeConfigz(resp)
-	if err != nil {
-		return nil, err
-	}
-	return kubeCfg, nil
+	// namespace only relevant if useProxy==true, so we don't bother
+	return e2ekubelet.GetCurrentKubeletConfig(framework.TestContext.NodeName, "", false)
 }
 
 // Must be called within a Context. Allows the function to modify the KubeletConfiguration during the BeforeEach of the context.
@@ -238,7 +234,7 @@ func setNodeConfigSource(f *framework.Framework, source *v1.NodeConfigSource) er
 	nodeclient := f.ClientSet.CoreV1().Nodes()
 
 	// get the node
-	node, err := nodeclient.Get(framework.TestContext.NodeName, metav1.GetOptions{})
+	node, err := nodeclient.Get(context.TODO(), framework.TestContext.NodeName, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
@@ -247,7 +243,7 @@ func setNodeConfigSource(f *framework.Framework, source *v1.NodeConfigSource) er
 	node.Spec.ConfigSource = source
 
 	// update to the new source
-	_, err = nodeclient.Update(node)
+	_, err = nodeclient.Update(context.TODO(), node, metav1.UpdateOptions{})
 	if err != nil {
 		return err
 	}
@@ -255,63 +251,10 @@ func setNodeConfigSource(f *framework.Framework, source *v1.NodeConfigSource) er
 	return nil
 }
 
-// Causes the test to fail, or returns a status 200 response from the /configz endpoint
-func pollConfigz(timeout time.Duration, pollInterval time.Duration) *http.Response {
-	endpoint := fmt.Sprintf("http://127.0.0.1:8080/api/v1/nodes/%s/proxy/configz", framework.TestContext.NodeName)
-	client := &http.Client{}
-	req, err := http.NewRequest("GET", endpoint, nil)
-	framework.ExpectNoError(err)
-	req.Header.Add("Accept", "application/json")
-
-	var resp *http.Response
-	gomega.Eventually(func() bool {
-		resp, err = client.Do(req)
-		if err != nil {
-			klog.Errorf("Failed to get /configz, retrying. Error: %v", err)
-			return false
-		}
-		if resp.StatusCode != 200 {
-			klog.Errorf("/configz response status not 200, retrying. Response was: %+v", resp)
-			return false
-		}
-		return true
-	}, timeout, pollInterval).Should(gomega.Equal(true))
-	return resp
-}
-
-// Decodes the http response from /configz and returns a kubeletconfig.KubeletConfiguration (internal type).
-func decodeConfigz(resp *http.Response) (*kubeletconfig.KubeletConfiguration, error) {
-	// This hack because /configz reports the following structure:
-	// {"kubeletconfig": {the JSON representation of kubeletconfigv1beta1.KubeletConfiguration}}
-	type configzWrapper struct {
-		ComponentConfig kubeletconfigv1beta1.KubeletConfiguration `json:"kubeletconfig"`
-	}
-
-	configz := configzWrapper{}
-	kubeCfg := kubeletconfig.KubeletConfiguration{}
-
-	contentsBytes, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	err = json.Unmarshal(contentsBytes, &configz)
-	if err != nil {
-		return nil, err
-	}
-
-	err = scheme.Scheme.Convert(&configz.ComponentConfig, &kubeCfg, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return &kubeCfg, nil
-}
-
 // creates a configmap containing kubeCfg in kube-system namespace
 func createConfigMap(f *framework.Framework, internalKC *kubeletconfig.KubeletConfiguration) (*v1.ConfigMap, error) {
 	cmap := newKubeletConfigMap("testcfg", internalKC)
-	cmap, err := f.ClientSet.CoreV1().ConfigMaps("kube-system").Create(cmap)
+	cmap, err := f.ClientSet.CoreV1().ConfigMaps("kube-system").Create(context.TODO(), cmap, metav1.CreateOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -332,15 +275,27 @@ func newKubeletConfigMap(name string, internalKC *kubeletconfig.KubeletConfigura
 	return cmap
 }
 
+// listNamespaceEvents lists the events in the given namespace.
+func listNamespaceEvents(c clientset.Interface, ns string) error {
+	ls, err := c.CoreV1().Events(ns).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	for _, event := range ls.Items {
+		klog.Infof("Event(%#v): type: '%v' reason: '%v' %v", event.InvolvedObject, event.Type, event.Reason, event.Message)
+	}
+	return nil
+}
+
 func logPodEvents(f *framework.Framework) {
 	framework.Logf("Summary of pod events during the test:")
-	err := framework.ListNamespaceEvents(f.ClientSet, f.Namespace.Name)
+	err := listNamespaceEvents(f.ClientSet, f.Namespace.Name)
 	framework.ExpectNoError(err)
 }
 
 func logNodeEvents(f *framework.Framework) {
 	framework.Logf("Summary of node events during the test:")
-	err := framework.ListNamespaceEvents(f.ClientSet, "")
+	err := listNamespaceEvents(f.ClientSet, "")
 	framework.ExpectNoError(err)
 }
 

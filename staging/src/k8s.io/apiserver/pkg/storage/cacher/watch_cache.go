@@ -82,6 +82,35 @@ func storeElementKey(obj interface{}) (string, error) {
 	return elem.Key, nil
 }
 
+func storeElementObject(obj interface{}) (runtime.Object, error) {
+	elem, ok := obj.(*storeElement)
+	if !ok {
+		return nil, fmt.Errorf("not a storeElement: %v", obj)
+	}
+	return elem.Object, nil
+}
+
+func storeElementIndexFunc(objIndexFunc cache.IndexFunc) cache.IndexFunc {
+	return func(obj interface{}) (strings []string, e error) {
+		seo, err := storeElementObject(obj)
+		if err != nil {
+			return nil, err
+		}
+		return objIndexFunc(seo)
+	}
+}
+
+func storeElementIndexers(indexers *cache.Indexers) cache.Indexers {
+	if indexers == nil {
+		return cache.Indexers{}
+	}
+	ret := cache.Indexers{}
+	for indexName, indexFunc := range *indexers {
+		ret[indexName] = storeElementIndexFunc(indexFunc)
+	}
+	return ret
+}
+
 // watchCache implements a Store interface.
 // However, it depends on the elements implementing runtime.Object interface.
 //
@@ -116,7 +145,7 @@ type watchCache struct {
 	// history" i.e. from the moment just after the newest cached watched event.
 	// It is necessary to effectively allow clients to start watching at now.
 	// NOTE: We assume that <store> is thread-safe.
-	store cache.Store
+	store cache.Indexer
 
 	// ResourceVersion up to which the watchCache is propagated.
 	resourceVersion uint64
@@ -143,7 +172,8 @@ func newWatchCache(
 	keyFunc func(runtime.Object) (string, error),
 	eventHandler func(*watchCacheEvent),
 	getAttrsFunc func(runtime.Object) (labels.Set, fields.Set, error),
-	versioner storage.Versioner) *watchCache {
+	versioner storage.Versioner,
+	indexers *cache.Indexers) *watchCache {
 	wc := &watchCache{
 		capacity:            capacity,
 		keyFunc:             keyFunc,
@@ -151,7 +181,7 @@ func newWatchCache(
 		cache:               make([]*watchCacheEvent, capacity),
 		startIndex:          0,
 		endIndex:            0,
-		store:               cache.NewStore(storeElementKey),
+		store:               cache.NewIndexer(storeElementKey, storeElementIndexers(indexers)),
 		resourceVersion:     0,
 		listResourceVersion: 0,
 		eventHandler:        eventHandler,
@@ -210,37 +240,6 @@ func (w *watchCache) objectToVersionedRuntimeObject(obj interface{}) (runtime.Ob
 	return object, resourceVersion, nil
 }
 
-func setCachingObjects(event *watchCacheEvent, versioner storage.Versioner) {
-	switch event.Type {
-	case watch.Added, watch.Modified:
-		if object, err := newCachingObject(event.Object); err == nil {
-			event.Object = object
-		} else {
-			klog.Errorf("couldn't create cachingObject from: %#v", event.Object)
-		}
-		// Don't wrap PrevObject for update event (for create events it is nil).
-		// We only encode those to deliver DELETE watch events, so if
-		// event.Object is not nil it can be used only for watchers for which
-		// selector was satisfied for its previous version and is no longer
-		// satisfied for the current version.
-		// This is rare enough that it doesn't justify making deep-copy of the
-		// object (done by newCachingObject) every time.
-	case watch.Deleted:
-		// Don't wrap Object for delete events - these are not to deliver any
-		// events. Only wrap PrevObject.
-		if object, err := newCachingObject(event.PrevObject); err == nil {
-			// Update resource version of the underlying object.
-			// event.PrevObject is used to deliver DELETE watch events and
-			// for them, we set resourceVersion to <current> instead of
-			// the resourceVersion of the last modification of the object.
-			updateResourceVersionIfNeeded(object.object, versioner, event.ResourceVersion)
-			event.PrevObject = object
-		} else {
-			klog.Errorf("couldn't create cachingObject from: %#v", event.Object)
-		}
-	}
-}
-
 // processEvent is safe as long as there is at most one call to it in flight
 // at any point in time.
 func (w *watchCache) processEvent(event watch.Event, resourceVersion uint64, updateFunc func(*storeElement) error) error {
@@ -295,18 +294,7 @@ func (w *watchCache) processEvent(event watch.Event, resourceVersion uint64, upd
 	// This is safe as long as there is at most one call to processEvent in flight
 	// at any point in time.
 	if w.eventHandler != nil {
-		// Set up caching of object serializations only for dispatching this event.
-		//
-		// Storing serializations in memory would result in increased memory usage,
-		// but it would help for caching encodings for watches started from old
-		// versions. However, we still don't have a convincing data that the gain
-		// from it justifies increased memory usage, so for now we drop the cached
-		// serializations after dispatching this event.
-
-		// Make a shallow copy to allow overwriting Object and PrevObject.
-		wce := *wcEvent
-		setCachingObjects(&wce, w.versioner)
-		w.eventHandler(&wce)
+		w.eventHandler(wcEvent)
 	}
 	return nil
 }
@@ -361,11 +349,21 @@ func (w *watchCache) waitUntilFreshAndBlock(resourceVersion uint64, trace *utilt
 }
 
 // WaitUntilFreshAndList returns list of pointers to <storeElement> objects.
-func (w *watchCache) WaitUntilFreshAndList(resourceVersion uint64, trace *utiltrace.Trace) ([]interface{}, uint64, error) {
+func (w *watchCache) WaitUntilFreshAndList(resourceVersion uint64, matchValues []storage.MatchValue, trace *utiltrace.Trace) ([]interface{}, uint64, error) {
 	err := w.waitUntilFreshAndBlock(resourceVersion, trace)
 	defer w.RUnlock()
 	if err != nil {
 		return nil, 0, err
+	}
+
+	// This isn't the place where we do "final filtering" - only some "prefiltering" is happening here. So the only
+	// requirement here is to NOT miss anything that should be returned. We can return as many non-matching items as we
+	// want - they will be filtered out later. The fact that we return less things is only further performance improvement.
+	// TODO: if multiple indexes match, return the one with the fewest items, so as to do as much filtering as possible.
+	for _, matchValue := range matchValues {
+		if result, err := w.store.ByIndex(matchValue.IndexName, matchValue.Value); err == nil {
+			return result, w.resourceVersion, nil
+		}
 	}
 	return w.store.List(), w.resourceVersion, nil
 }
@@ -510,7 +508,7 @@ func (w *watchCache) GetAllEventsSinceThreadUnsafe(resourceVersion uint64) ([]*w
 		return result, nil
 	}
 	if resourceVersion < oldest-1 {
-		return nil, errors.NewGone(fmt.Sprintf("too old resource version: %d (%d)", resourceVersion, oldest-1))
+		return nil, errors.NewResourceExpired(fmt.Sprintf("too old resource version: %d (%d)", resourceVersion, oldest-1))
 	}
 
 	// Binary search the smallest index at which resourceVersion is greater than the given one.

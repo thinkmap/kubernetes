@@ -83,14 +83,16 @@ function set-linux-node-image() {
 # Requires:
 #   WINDOWS_NODE_OS_DISTRIBUTION
 # Sets:
-#   WINDOWS_NODE_IMAGE_FAMILY
 #   WINDOWS_NODE_IMAGE_PROJECT
+#   WINDOWS_NODE_IMAGE
 function set-windows-node-image() {
   WINDOWS_NODE_IMAGE_PROJECT="windows-cloud"
   if [[ "${WINDOWS_NODE_OS_DISTRIBUTION}" == "win2019" ]]; then
-    WINDOWS_NODE_IMAGE_FAMILY="windows-2019-core-for-containers"
+    WINDOWS_NODE_IMAGE="windows-server-2019-dc-core-for-containers-v20200310"
+  elif [[ "${WINDOWS_NODE_OS_DISTRIBUTION}" == "win1909" ]]; then
+    WINDOWS_NODE_IMAGE="windows-server-1909-dc-core-for-containers-v20200310"
   elif [[ "${WINDOWS_NODE_OS_DISTRIBUTION}" == "win1809" ]]; then
-    WINDOWS_NODE_IMAGE_FAMILY="windows-1809-core-for-containers"
+    WINDOWS_NODE_IMAGE="windows-server-1809-dc-core-for-containers-v20200310"
   else
     echo "Unknown WINDOWS_NODE_OS_DISTRIBUTION ${WINDOWS_NODE_OS_DISTRIBUTION}" >&2
     exit 1
@@ -592,7 +594,7 @@ function write-master-env {
     KUBERNETES_MASTER_NAME="${MASTER_NAME}"
   fi
 
-  construct-linux-kubelet-flags true
+  construct-linux-kubelet-flags "master"
   build-linux-kube-env true "${KUBE_TEMP}/master-kube-env.yaml"
   build-kubelet-config true "linux" "${KUBE_TEMP}/master-kubelet-config.yaml"
   build-kube-master-certs "${KUBE_TEMP}/kube-master-certs.yaml"
@@ -603,7 +605,9 @@ function write-linux-node-env {
     KUBERNETES_MASTER_NAME="${MASTER_NAME}"
   fi
 
-  construct-linux-kubelet-flags false
+  construct-linux-kubelet-flags "heapster"
+  build-linux-kube-env false "${KUBE_TEMP}/heapster-kube-env.yaml"
+  construct-linux-kubelet-flags "node"
   build-linux-kube-env false "${KUBE_TEMP}/node-kube-env.yaml"
   build-kubelet-config false "linux" "${KUBE_TEMP}/node-kubelet-config.yaml"
 }
@@ -616,9 +620,9 @@ function write-windows-node-env {
 }
 
 function build-linux-node-labels {
-  local master=$1
+  local node_type=$1
   local node_labels=""
-  if [[ "${KUBE_PROXY_DAEMONSET:-}" == "true" && "${master}" != "true" ]]; then
+  if [[ "${KUBE_PROXY_DAEMONSET:-}" == "true" && "${node_type}" != "master" ]]; then
     # Add kube-proxy daemonset label to node to avoid situation during cluster
     # upgrade/downgrade when there are two instances of kube-proxy running on a node.
     node_labels="node.kubernetes.io/kube-proxy-ds-ready=true"
@@ -626,10 +630,10 @@ function build-linux-node-labels {
   if [[ -n "${NODE_LABELS:-}" ]]; then
     node_labels="${node_labels:+${node_labels},}${NODE_LABELS}"
   fi
-  if [[ -n "${NON_MASTER_NODE_LABELS:-}" && "${master}" != "true" ]]; then
+  if [[ -n "${NON_MASTER_NODE_LABELS:-}" && "${node_type}" != "master" ]]; then
     node_labels="${node_labels:+${node_labels},}${NON_MASTER_NODE_LABELS}"
   fi
-  if [[ -n "${MASTER_NODE_LABELS:-}" && "${master}" == "true" ]]; then
+  if [[ -n "${MASTER_NODE_LABELS:-}" && "${node_type}" == "master" ]]; then
     node_labels="${node_labels:+${node_labels},}${MASTER_NODE_LABELS}"
   fi
   echo $node_labels
@@ -740,7 +744,7 @@ function construct-common-kubelet-flags {
 # Sets KUBELET_ARGS with the kubelet flags for Linux nodes.
 # $1: if 'true', we're rendering flags for a master, else a node
 function construct-linux-kubelet-flags {
-  local master="$1"
+  local node_type="$1"
   local flags="$(construct-common-kubelet-flags)"
   # Keep in sync with CONTAINERIZED_MOUNTER_HOME in configure-helper.sh
   flags+=" --experimental-mounter-path=/home/kubernetes/containerized_mounter/mounter"
@@ -751,7 +755,7 @@ function construct-linux-kubelet-flags {
   flags+=" --dynamic-config-dir=/var/lib/kubelet/dynamic-config"
 
 
-  if [[ "${master}" == "true" ]]; then
+  if [[ "${node_type}" == "master" ]]; then
     flags+=" ${MASTER_KUBELET_TEST_ARGS:-}"
     if [[ "${REGISTER_MASTER_KUBELET:-false}" == "true" ]]; then
       #TODO(mikedanese): allow static pods to start before creating a client
@@ -761,10 +765,23 @@ function construct-linux-kubelet-flags {
       flags+=" --kubeconfig=/var/lib/kubelet/bootstrap-kubeconfig"
       flags+=" --register-schedulable=false"
     fi
+    if [[ "${MASTER_OS_DISTRIBUTION}" == "ubuntu" ]]; then
+      # Configure the file path for host dns configuration
+      # as ubuntu uses systemd-resolved
+      flags+=" --resolv-conf=/run/systemd/resolve/resolv.conf"
+    fi
   else # For nodes
     flags+=" ${NODE_KUBELET_TEST_ARGS:-}"
     flags+=" --bootstrap-kubeconfig=/var/lib/kubelet/bootstrap-kubeconfig"
     flags+=" --kubeconfig=/var/lib/kubelet/kubeconfig"
+    if [[ "${node_type}" == "heapster" ]]; then
+        flags+=" ${HEAPSTER_KUBELET_TEST_ARGS:-}"
+    fi
+    if [[ "${NODE_OS_DISTRIBUTION}" == "ubuntu" ]]; then
+      # Configure the file path for host dns configuration
+      # as ubuntu uses systemd-resolved
+      flags+=" --resolv-conf=/run/systemd/resolve/resolv.conf"
+    fi
   fi
   # Network plugin
   if [[ -n "${NETWORK_PROVIDER:-}" || -n "${NETWORK_POLICY_PROVIDER:-}" ]]; then
@@ -772,7 +789,7 @@ function construct-linux-kubelet-flags {
     if [[ "${NETWORK_POLICY_PROVIDER:-}" == "calico" || "${ENABLE_NETD:-}" == "true" ]]; then
       # Calico uses CNI always.
       # Note that network policy won't work for master node.
-      if [[ "${master}" == "true" ]]; then
+      if [[ "${node_type}" == "master" ]]; then
         flags+=" --network-plugin=${NETWORK_PROVIDER}"
       else
         flags+=" --network-plugin=cni"
@@ -787,7 +804,7 @@ function construct-linux-kubelet-flags {
     flags+=" --non-masquerade-cidr=${NON_MASQUERADE_CIDR}"
   fi
   flags+=" --volume-plugin-dir=${VOLUME_PLUGIN_DIR}"
-  local node_labels="$(build-linux-node-labels ${master})"
+  local node_labels="$(build-linux-node-labels ${node_type})"
   if [[ -n "${node_labels:-}" ]]; then
     flags+=" --node-labels=${node_labels}"
   fi
@@ -796,7 +813,12 @@ function construct-linux-kubelet-flags {
   fi
   if [[ "${CONTAINER_RUNTIME:-}" != "docker" ]]; then
     flags+=" --container-runtime=remote"
+    if [[ "${CONTAINER_RUNTIME}" == "containerd" ]]; then
+      CONTAINER_RUNTIME_ENDPOINT=${KUBE_CONTAINER_RUNTIME_ENDPOINT:-unix:///run/containerd/containerd.sock}
+      flags+=" --runtime-cgroups=/system.slice/containerd.service"
+    fi
   fi
+
   if [[ -n "${CONTAINER_RUNTIME_ENDPOINT:-}" ]]; then
     flags+=" --container-runtime-endpoint=${CONTAINER_RUNTIME_ENDPOINT}"
   fi
@@ -834,17 +856,6 @@ function construct-windows-kubelet-flags {
   # Many of these flags were adapted from
   # https://github.com/Microsoft/SDN/blob/master/Kubernetes/windows/start-kubelet.ps1.
   flags+=" --config=${WINDOWS_KUBELET_CONFIG_FILE}"
-
-  # Path to a kubeconfig file that will be used to get client certificate for
-  # kubelet. If the file specified by --kubeconfig does not exist, the bootstrap
-  # kubeconfig is used to request a client certificate from the API server. On
-  # success, a kubeconfig file referencing the generated client certificate and
-  # key is written to the path specified by --kubeconfig. The client certificate
-  # and key file will be stored in the directory pointed by --cert-dir.
-  #
-  # See also:
-  # https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet-tls-bootstrapping/
-  flags+=" --bootstrap-kubeconfig=${WINDOWS_BOOTSTRAP_KUBECONFIG_FILE}"
   flags+=" --kubeconfig=${WINDOWS_KUBECONFIG_FILE}"
 
   # The directory where the TLS certs are located.
@@ -873,7 +884,7 @@ function construct-windows-kubelet-flags {
   flags+=" --logtostderr=false"
 
   # Configure the file path for host dns configuration
-  flags+=" --resolv-conf=${WINDOWS_CNI_CONFIG_DIR}\hostdns.conf"
+  flags+=" --resolv-conf=${WINDOWS_CNI_DIR}\hostdns.conf"
 
   # Both --cgroups-per-qos and --enforce-node-allocatable should be disabled on
   # windows; the latter requires the former to be enabled to work.
@@ -885,6 +896,14 @@ function construct-windows-kubelet-flags {
   # TODO(#78628): Re-enable KubeletPodResources when the issue is fixed.
   # Force disable KubeletPodResources feature on Windows until #78628 is fixed.
   flags+=" --feature-gates=KubeletPodResources=false"
+
+  if [[ "${CONTAINER_RUNTIME:-}" != "docker" ]]; then
+    flags+=" --container-runtime=remote"
+    if [[ "${CONTAINER_RUNTIME}" == "containerd" ]]; then
+      CONTAINER_RUNTIME_ENDPOINT=${KUBE_CONTAINER_RUNTIME_ENDPOINT:-npipe:////./pipe/containerd-containerd}
+      flags+=" --container-runtime-endpoint=${CONTAINER_RUNTIME_ENDPOINT}"
+    fi
+  fi
 
   KUBELET_ARGS="${flags}"
 }
@@ -950,9 +969,6 @@ function print-common-kubelet-config {
   declare quoted_dns_server_ip
   declare quoted_dns_domain
   quoted_dns_server_ip=$(yaml-quote "${DNS_SERVER_IP}")
-  if [[ "${ENABLE_NODELOCAL_DNS:-}" == "true" ]]; then
-    quoted_dns_server_ip=$(yaml-quote "${LOCAL_DNS_IP}")
-  fi
   quoted_dns_domain=$(yaml-quote "${DNS_DOMAIN}")
   cat <<EOF
 kind: KubeletConfiguration
@@ -1056,7 +1072,7 @@ function print-windows-node-kubelet-config {
   cat <<EOF
 authentication:
   x509:
-    clientCAFile: '${WINDOWS_PKI_DIR}\ca-certificates.crt'
+    clientCAFile: '${WINDOWS_CA_FILE}'
 EOF
 }
 
@@ -1123,8 +1139,6 @@ NETWORK_PROJECT_ID: $(yaml-quote ${NETWORK_PROJECT})
 SERVICE_CLUSTER_IP_RANGE: $(yaml-quote ${SERVICE_CLUSTER_IP_RANGE})
 KUBERNETES_MASTER_NAME: $(yaml-quote ${KUBERNETES_MASTER_NAME})
 ALLOCATE_NODE_CIDRS: $(yaml-quote ${ALLOCATE_NODE_CIDRS:-false})
-ENABLE_CLUSTER_MONITORING: $(yaml-quote ${ENABLE_CLUSTER_MONITORING:-none})
-ENABLE_PROMETHEUS_MONITORING: $(yaml-quote ${ENABLE_PROMETHEUS_MONITORING:-false})
 ENABLE_METRICS_SERVER: $(yaml-quote ${ENABLE_METRICS_SERVER:-false})
 ENABLE_METADATA_AGENT: $(yaml-quote ${ENABLE_METADATA_AGENT:-none})
 METADATA_AGENT_CPU_REQUEST: $(yaml-quote ${METADATA_AGENT_CPU_REQUEST:-})
@@ -1140,7 +1154,8 @@ NODE_PROBLEM_DETECTOR_VERSION: $(yaml-quote ${NODE_PROBLEM_DETECTOR_VERSION:-})
 NODE_PROBLEM_DETECTOR_TAR_HASH: $(yaml-quote ${NODE_PROBLEM_DETECTOR_TAR_HASH:-})
 NODE_PROBLEM_DETECTOR_RELEASE_PATH: $(yaml-quote ${NODE_PROBLEM_DETECTOR_RELEASE_PATH:-})
 NODE_PROBLEM_DETECTOR_CUSTOM_FLAGS: $(yaml-quote ${NODE_PROBLEM_DETECTOR_CUSTOM_FLAGS:-})
-CNI_STORAGE_PATH: $(yaml-quote ${CNI_STORAGE_PATH:-})
+CNI_STORAGE_URL_BASE: $(yaml-quote ${CNI_STORAGE_URL_BASE:-})
+CNI_TAR_PREFIX: $(yaml-quote ${CNI_TAR_PREFIX:-})
 CNI_VERSION: $(yaml-quote ${CNI_VERSION:-})
 CNI_SHA1: $(yaml-quote ${CNI_SHA1:-})
 ENABLE_NODE_LOGGING: $(yaml-quote ${ENABLE_NODE_LOGGING:-false})
@@ -1175,6 +1190,7 @@ MULTIZONE: $(yaml-quote ${MULTIZONE:-})
 MULTIMASTER: $(yaml-quote ${MULTIMASTER:-})
 NON_MASQUERADE_CIDR: $(yaml-quote ${NON_MASQUERADE_CIDR:-})
 ENABLE_DEFAULT_STORAGE_CLASS: $(yaml-quote ${ENABLE_DEFAULT_STORAGE_CLASS:-})
+ENABLE_VOLUME_SNAPSHOTS: $(yaml-quote ${ENABLE_VOLUME_SNAPSHOTS:-})
 ENABLE_APISERVER_ADVANCED_AUDIT: $(yaml-quote ${ENABLE_APISERVER_ADVANCED_AUDIT:-})
 ENABLE_APISERVER_DYNAMIC_AUDIT: $(yaml-quote ${ENABLE_APISERVER_DYNAMIC_AUDIT:-})
 ENABLE_CACHE_MUTATION_DETECTOR: $(yaml-quote ${ENABLE_CACHE_MUTATION_DETECTOR:-false})
@@ -1208,6 +1224,9 @@ DISABLE_PROMETHEUS_TO_SD_IN_DS: $(yaml-quote ${DISABLE_PROMETHEUS_TO_SD_IN_DS:-f
 CONTAINER_RUNTIME: $(yaml-quote ${CONTAINER_RUNTIME:-})
 CONTAINER_RUNTIME_ENDPOINT: $(yaml-quote ${CONTAINER_RUNTIME_ENDPOINT:-})
 CONTAINER_RUNTIME_NAME: $(yaml-quote ${CONTAINER_RUNTIME_NAME:-})
+CONTAINER_RUNTIME_TEST_HANDLER: $(yaml-quote ${CONTAINER_RUNTIME_TEST_HANDLER:-})
+UBUNTU_INSTALL_CONTAINERD_VERSION: $(yaml-quote ${UBUNTU_INSTALL_CONTAINERD_VERSION:-})
+UBUNTU_INSTALL_RUNC_VERSION: $(yaml-quote ${UBUNTU_INSTALL_RUNC_VERSION:-})
 NODE_LOCAL_SSDS_EXT: $(yaml-quote ${NODE_LOCAL_SSDS_EXT:-})
 LOAD_IMAGE_COMMAND: $(yaml-quote ${LOAD_IMAGE_COMMAND:-})
 ZONE: $(yaml-quote ${ZONE})
@@ -1223,6 +1242,7 @@ CUSTOM_CALICO_NODE_DAEMONSET_YAML: |
 $(echo "${CUSTOM_CALICO_NODE_DAEMONSET_YAML:-}" | sed -e "s/'/''/g")
 CUSTOM_TYPHA_DEPLOYMENT_YAML: |
 $(echo "${CUSTOM_TYPHA_DEPLOYMENT_YAML:-}" | sed -e "s/'/''/g")
+CONCURRENT_SERVICE_SYNCS: $(yaml-quote ${CONCURRENT_SERVICE_SYNCS:-})
 EOF
   if [[ "${master}" == "true" && "${MASTER_OS_DISTRIBUTION}" == "gci" ]] || \
      [[ "${master}" == "false" && "${NODE_OS_DISTRIBUTION}" == "gci" ]]  || \
@@ -1482,7 +1502,7 @@ EOF
           # TODO(kubernetes/autoscaler#718): AUTOSCALER_ENV_VARS is a hotfix for cluster autoscaler,
           # which reads the kube-env to determine the shape of a node and was broken by #60020.
           # This should be removed as soon as a more reliable source of information is available!
-          local node_labels="$(build-linux-node-labels false)"
+          local node_labels="$(build-linux-node-labels node)"
           local node_taints="${NODE_TAINTS:-}"
           local autoscaler_env_vars="node_labels=${node_labels};node_taints=${node_taints}"
           cat >>$file <<EOF
@@ -1505,6 +1525,11 @@ EOF
 ENABLE_EGRESS_VIA_KONNECTIVITY_SERVICE: $(yaml-quote ${ENABLE_EGRESS_VIA_KONNECTIVITY_SERVICE})
 EOF
   fi
+  if [[ -n "${KONNECTIVITY_SERVICE_PROXY_PROTOCOL_MODE:-}" ]]; then
+      cat >>$file <<EOF
+KONNECTIVITY_SERVICE_PROXY_PROTOCOL_MODE: $(yaml-quote ${KONNECTIVITY_SERVICE_PROXY_PROTOCOL_MODE})
+EOF
+  fi
 }
 
 
@@ -1522,13 +1547,17 @@ NODE_DIR: $(yaml-quote ${WINDOWS_NODE_DIR})
 LOGS_DIR: $(yaml-quote ${WINDOWS_LOGS_DIR})
 CNI_DIR: $(yaml-quote ${WINDOWS_CNI_DIR})
 CNI_CONFIG_DIR: $(yaml-quote ${WINDOWS_CNI_CONFIG_DIR})
+WINDOWS_CNI_STORAGE_PATH: $(yaml-quote ${WINDOWS_CNI_STORAGE_PATH})
+WINDOWS_CNI_VERSION: $(yaml-quote ${WINDOWS_CNI_VERSION})
 MANIFESTS_DIR: $(yaml-quote ${WINDOWS_MANIFESTS_DIR})
 PKI_DIR: $(yaml-quote ${WINDOWS_PKI_DIR})
+CA_FILE_PATH: $(yaml-quote ${WINDOWS_CA_FILE})
 KUBELET_CONFIG_FILE: $(yaml-quote ${WINDOWS_KUBELET_CONFIG_FILE})
 KUBEPROXY_ARGS: $(yaml-quote ${KUBEPROXY_ARGS})
 KUBECONFIG_FILE: $(yaml-quote ${WINDOWS_KUBECONFIG_FILE})
 BOOTSTRAP_KUBECONFIG_FILE: $(yaml-quote ${WINDOWS_BOOTSTRAP_KUBECONFIG_FILE})
 KUBEPROXY_KUBECONFIG_FILE: $(yaml-quote ${WINDOWS_KUBEPROXY_KUBECONFIG_FILE})
+WINDOWS_INFRA_CONTAINER: $(yaml-quote ${WINDOWS_INFRA_CONTAINER})
 EOF
 }
 
@@ -2201,9 +2230,7 @@ function create-node-template() {
   if [[ "${os}" == 'linux' ]]; then
       node_image_flags="--image-project ${NODE_IMAGE_PROJECT} --image ${NODE_IMAGE}"
   elif [[ "${os}" == 'windows' ]]; then
-      # TODO(pjh): revert back to using WINDOWS_NODE_IMAGE_FAMILY instead of
-      # pinning to the v20190312 image once #76666 is resolved.
-      node_image_flags="--image-project ${WINDOWS_NODE_IMAGE_PROJECT} --image=windows-server-1809-dc-core-for-containers-v20190709"
+      node_image_flags="--image-project ${WINDOWS_NODE_IMAGE_PROJECT} --image ${WINDOWS_NODE_IMAGE}"
   else
       echo "Unknown OS ${os}" >&2
       exit 1
@@ -2288,8 +2315,8 @@ function kube-up() {
     create-loadbalancer
     # If replication of master fails, we need to ensure that the replica is removed from etcd clusters.
     if ! replicate-master; then
-      remove-replica-from-etcd 2379 || true
-      remove-replica-from-etcd 4002 || true
+      remove-replica-from-etcd 2379 true || true
+      remove-replica-from-etcd 4002 false || true
     fi
   else
     check-existing
@@ -2495,6 +2522,10 @@ function detect-subnetworks() {
 #   NETWORK
 function create-cloud-nat-router() {
   if [[ ${GCE_PRIVATE_CLUSTER:-} == "true" ]]; then
+    if gcloud compute routers describe "$NETWORK-nat-router" --project $NETWORK_PROJECT --region $REGION &>/dev/null; then
+      echo "Cloud nat already exists"
+      return 0
+    fi
     gcloud compute routers create "$NETWORK-nat-router" \
       --project $NETWORK_PROJECT \
       --region $REGION \
@@ -2503,8 +2534,9 @@ function create-cloud-nat-router() {
       --project $NETWORK_PROJECT \
       --router-region $REGION \
       --router "$NETWORK-nat-router" \
-      --nat-all-subnet-ip-ranges \
-      --auto-allocate-nat-external-ips
+      --nat-primary-subnet-ip-ranges \
+      --auto-allocate-nat-external-ips \
+      ${GCE_PRIVATE_CLUSTER_PORTS_PER_VM:+--min-ports-per-vm ${GCE_PRIVATE_CLUSTER_PORTS_PER_VM}}
   fi
 }
 
@@ -2751,17 +2783,21 @@ function create-master() {
 #
 # $1: etcd client port
 # $2: etcd internal port
+# $3: whether etcd communication should use mtls
 # returns the result of ssh command which adds replica
-#### WARNING: THIS DOESN'T WORK IN CLUSTERS WITH MTLS ENABLED.
-# TODO(mborsz): Fix this
 function add-replica-to-etcd() {
   local -r client_port="${1}"
   local -r internal_port="${2}"
-  gcloud compute ssh "${EXISTING_MASTER_NAME}" \
-    --project "${PROJECT}" \
-    --zone "${EXISTING_MASTER_ZONE}" \
-    --command \
-      "curl localhost:${client_port}/v2/members -XPOST -H \"Content-Type: application/json\" -d '{\"peerURLs\":[\"https://${REPLICA_NAME}:${internal_port}\"]}' -s"
+  local -r use_mtls="${3}"
+
+  TLSARG=""
+  PROTO="http://"
+  if [[ "${use_mtls}" == "true" ]]; then
+    # Keep in sync with ETCD_APISERVER_CA_CERT_PATH, ETCD_APISERVER_CLIENT_CERT_PATH and ETCD_APISERVER_CLIENT_KEY_PATH in configure-helper.sh.
+    TLSARG="--cacert /etc/srv/kubernetes/pki/etcd-apiserver-ca.crt --cert /etc/srv/kubernetes/pki/etcd-apiserver-client.crt --key /etc/srv/kubernetes/pki/etcd-apiserver-client.key"
+    PROTO="https://"
+  fi
+  run-gcloud-command "${EXISTING_MASTER_NAME}" "${EXISTING_MASTER_ZONE}" "curl ${TLSARG} ${PROTO}127.0.0.1:${client_port}/v2/members -XPOST -H \"Content-Type: application/json\" -d '{\"peerURLs\":[\"https://${REPLICA_NAME}:${internal_port}\"]}' -s"
   return $?
 }
 
@@ -2787,11 +2823,11 @@ function replicate-master() {
   echo "Experimental: replicating existing master ${EXISTING_MASTER_ZONE}/${EXISTING_MASTER_NAME} as ${ZONE}/${REPLICA_NAME}"
 
   # Before we do anything else, we should configure etcd to expect more replicas.
-  if ! add-replica-to-etcd 2379 2380; then
+  if ! add-replica-to-etcd 2379 2380 true; then
     echo "Failed to add master replica to etcd cluster."
     return 1
   fi
-  if ! add-replica-to-etcd 4002 2381; then
+  if ! add-replica-to-etcd 4002 2381 false; then
     echo "Failed to add master replica to etcd events cluster."
     return 1
   fi
@@ -2911,7 +2947,7 @@ function attach-internal-master-ip() {
   echo "Setting ${name}'s aliases to '${aliases}' (added ${ip})"
   # Attach ${ip} to ${name}
   gcloud compute instances network-interfaces update "${name}" --project "${PROJECT}" --zone "${zone}" --aliases="${aliases}"
-  run-gcloud-command "${name}" "${zone}" "sudo ip route add to local ${ip}/32 dev eth0"
+  run-gcloud-command "${name}" "${zone}" 'sudo ip route add to local '${ip}'/32 dev $(ip route | grep default | awk '\''{print $5}'\'')' || true
   return $?
 }
 
@@ -2929,7 +2965,7 @@ function detach-internal-master-ip() {
   echo "Setting ${name}'s aliases to '${aliases}' (removed ${ip})"
   # Detach ${MASTER_NAME}-internal-ip from ${name}
   gcloud compute instances network-interfaces update "${name}" --project "${PROJECT}" --zone "${zone}" --aliases="${aliases}"
-  run-gcloud-command "${name}" "${zone}" "sudo ip route del to local ${ip}/32 dev eth0"
+  run-gcloud-command "${name}" "${zone}" 'sudo ip route del to local '${ip}'/32 dev $(ip route | grep default | awk '\''{print $5}'\'')' || true
   return $?
 }
 
@@ -3247,7 +3283,7 @@ function create-heapster-node() {
       --tags "${NODE_TAG}" \
       ${network} \
       $(get-scope-flags) \
-      --metadata-from-file "$(get-node-instance-metadata-from-file)"
+      --metadata-from-file "$(get-node-instance-metadata-from-file "heapster-kube-env")"
 }
 
 # Assumes:
@@ -3401,17 +3437,21 @@ function check-cluster() {
 #   EXISTING_MASTER_ZONE
 #
 # $1: etcd client port
+# $2: whether etcd communication should use mtls
 # returns the result of ssh command which removes replica
-#### WARNING: THIS DOESN'T WORK IN CLUSTERS WITH MTLS ENABLED.
-# TODO(mborsz): Fix this
 function remove-replica-from-etcd() {
   local -r port="${1}"
+  local -r use_mtls="${2}"
+
+  TLSARG=""
+  PROTO="http://"
+  if [[ "${use_mtls}" == "true" ]]; then
+    # Keep in sync with ETCD_APISERVER_CA_CERT_PATH, ETCD_APISERVER_CLIENT_CERT_PATH and ETCD_APISERVER_CLIENT_KEY_PATH in configure-helper.sh.
+    TLSARG="--cacert /etc/srv/kubernetes/pki/etcd-apiserver-ca.crt --cert /etc/srv/kubernetes/pki/etcd-apiserver-client.crt --key /etc/srv/kubernetes/pki/etcd-apiserver-client.key"
+    PROTO="https://"
+  fi
   [[ -n "${EXISTING_MASTER_NAME}" ]] || return
-  gcloud compute ssh "${EXISTING_MASTER_NAME}" \
-    --project "${PROJECT}" \
-    --zone "${EXISTING_MASTER_ZONE}" \
-    --command \
-    "curl -s localhost:${port}/v2/members/\$(curl -s localhost:${port}/v2/members -XGET | sed 's/{\\\"id/\n/g' | grep ${REPLICA_NAME}\\\" | cut -f 3 -d \\\") -XDELETE -L 2>/dev/null"
+  run-gcloud-command "${EXISTING_MASTER_NAME}" "${EXISTING_MASTER_ZONE}" "curl -s ${TLSARG} ${PROTO}127.0.0.1:${port}/v2/members/\$(curl -s ${TLSARG} ${PROTO}127.0.0.1:${port}/v2/members -XGET | sed 's/{\\\"id/\n/g' | grep ${REPLICA_NAME}\\\" | cut -f 3 -d \\\") -XDELETE -L 2>/dev/null"
   local -r res=$?
   echo "Removing etcd replica, name: ${REPLICA_NAME}, port: ${port}, result: ${res}"
   return "${res}"
@@ -3496,8 +3536,8 @@ function kube-down() {
   set-existing-master
 
   # Un-register the master replica from etcd and events etcd.
-  remove-replica-from-etcd 2379
-  remove-replica-from-etcd 4002
+  remove-replica-from-etcd 2379 true
+  remove-replica-from-etcd 4002 false
 
   # Delete the master replica (if it exists).
   if gcloud compute instances describe "${REPLICA_NAME}" --zone "${ZONE}" --project "${PROJECT}" &>/dev/null; then
@@ -3540,11 +3580,11 @@ function kube-down() {
 
   # In the replicated scenario, if there's only a single master left, we should also delete load balancer in front of it.
   if [[ "${REMAINING_MASTER_COUNT}" -eq 1 ]]; then
+    detect-master
+    local REMAINING_REPLICA_NAME="$(get-all-replica-names)"
+    local REMAINING_REPLICA_ZONE=$(gcloud compute instances list "${REMAINING_REPLICA_NAME}" \
+      --project "${PROJECT}" --format="value(zone)")
     if gcloud compute forwarding-rules describe "${MASTER_NAME}" --region "${REGION}" --project "${PROJECT}" &>/dev/null; then
-      detect-master
-      local REMAINING_REPLICA_NAME="$(get-all-replica-names)"
-      local REMAINING_REPLICA_ZONE=$(gcloud compute instances list "${REMAINING_REPLICA_NAME}" \
-        --project "${PROJECT}" --format="value(zone)")
       gcloud compute forwarding-rules delete \
         --project "${PROJECT}" \
         --region "${REGION}" \
@@ -3843,19 +3883,12 @@ function check-resources() {
     return 1
   fi
 
-  if [[ ${GCE_PRIVATE_CLUSTER:-} == "true" ]]; then
-    if gcloud compute routers describe --project "${NETWORK_PROJECT}" --region "${REGION}" "${NETWORK}-nat-router" &>/dev/null; then
-      KUBE_RESOURCE_FOUND="Cloud NAT router"
-      return 1
-    fi
-  fi
-
   # No resources found.
   return 0
 }
 
 # -----------------------------------------------------------------------------
-# Cluster specific test helpers used from hack/e2e.go
+# Cluster specific test helpers
 
 # Execute prior to running tests to build a release if required for env.
 #
@@ -3866,8 +3899,7 @@ function test-build-release() {
   "${KUBE_ROOT}/build/release.sh"
 }
 
-# Execute prior to running tests to initialize required structure. This is
-# called from hack/e2e.go only when running -up.
+# Execute prior to running tests to initialize required structure.
 #
 # Assumed vars:
 #   Variables from config.sh
@@ -3923,8 +3955,7 @@ function test-setup() {
   done
 }
 
-# Execute after running tests to perform any required clean-up. This is called
-# from hack/e2e.go
+# Execute after running tests to perform any required clean-up.
 function test-teardown() {
   detect-project
   echo "Shutting down test cluster in background."

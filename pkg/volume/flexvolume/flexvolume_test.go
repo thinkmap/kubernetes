@@ -123,12 +123,12 @@ func TestCanSupport(t *testing.T) {
 	plugMgr := volume.VolumePluginMgr{}
 	runner := exec.New()
 	installPluginUnderTest(t, "kubernetes.io", "fakeAttacher", tmpDir, execScriptTempl1, nil)
-	plugMgr.InitPlugins(nil, GetDynamicPluginProber(tmpDir, runner), volumetest.NewFakeVolumeHost("fake", nil, nil))
-	plugin, err := plugMgr.FindPluginByName("flexvolume-kubernetes.io/fakeAttacher")
+	plugMgr.InitPlugins(nil, GetDynamicPluginProber(tmpDir, runner), volumetest.NewFakeVolumeHost(t, "fake", nil, nil))
+	plugin, err := plugMgr.FindPluginByName("kubernetes.io/fakeAttacher")
 	if err != nil {
 		t.Fatalf("Can't find the plugin by name")
 	}
-	if plugin.GetPluginName() != "flexvolume-kubernetes.io/fakeAttacher" {
+	if plugin.GetPluginName() != "kubernetes.io/fakeAttacher" {
 		t.Errorf("Wrong name: %s", plugin.GetPluginName())
 	}
 	if !plugin.CanSupport(&volume.Spec{Volume: &v1.Volume{VolumeSource: v1.VolumeSource{FlexVolume: &v1.FlexVolumeSource{Driver: "kubernetes.io/fakeAttacher"}}}}) {
@@ -152,9 +152,9 @@ func TestGetAccessModes(t *testing.T) {
 	plugMgr := volume.VolumePluginMgr{}
 	runner := exec.New()
 	installPluginUnderTest(t, "kubernetes.io", "fakeAttacher", tmpDir, execScriptTempl1, nil)
-	plugMgr.InitPlugins(nil, GetDynamicPluginProber(tmpDir, runner), volumetest.NewFakeVolumeHost(tmpDir, nil, nil))
+	plugMgr.InitPlugins(nil, GetDynamicPluginProber(tmpDir, runner), volumetest.NewFakeVolumeHost(t, tmpDir, nil, nil))
 
-	plugin, err := plugMgr.FindPersistentPluginByName("flexvolume-kubernetes.io/fakeAttacher")
+	plugin, err := plugMgr.FindPersistentPluginByName("kubernetes.io/fakeAttacher")
 	if err != nil {
 		t.Fatalf("Can't find the plugin by name")
 	}

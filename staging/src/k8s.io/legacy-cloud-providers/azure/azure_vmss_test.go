@@ -20,11 +20,13 @@ package azure
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2019-07-01/compute"
+	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2019-12-01/compute"
 	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2019-06-01/network"
 	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -33,9 +35,13 @@ const (
 	fakePublicIP  = "10.10.10.10"
 )
 
-func newTestScaleSet(scaleSetName, zone string, faultDomain int32, vmList []string) (*scaleSet, error) {
-	cloud := getTestCloud()
-	setTestVirtualMachineCloud(cloud, scaleSetName, zone, faultDomain, vmList)
+func newTestScaleSet(ctrl *gomock.Controller, scaleSetName, zone string, faultDomain int32, vmList []string) (*scaleSet, error) {
+	return newTestScaleSetWithState(ctrl, scaleSetName, zone, faultDomain, vmList, "Running")
+}
+
+func newTestScaleSetWithState(ctrl *gomock.Controller, scaleSetName, zone string, faultDomain int32, vmList []string, state string) (*scaleSet, error) {
+	cloud := GetTestCloud(ctrl)
+	setTestVirtualMachineCloud(cloud, scaleSetName, zone, faultDomain, vmList, state)
 	ss, err := newScaleSet(cloud)
 	if err != nil {
 		return nil, err
@@ -44,7 +50,7 @@ func newTestScaleSet(scaleSetName, zone string, faultDomain int32, vmList []stri
 	return ss.(*scaleSet), nil
 }
 
-func setTestVirtualMachineCloud(ss *Cloud, scaleSetName, zone string, faultDomain int32, vmList []string) {
+func setTestVirtualMachineCloud(ss *Cloud, scaleSetName, zone string, faultDomain int32, vmList []string, state string) {
 	virtualMachineScaleSetsClient := newFakeVirtualMachineScaleSetsClient()
 	virtualMachineScaleSetVMsClient := newFakeVirtualMachineScaleSetVMsClient()
 	publicIPAddressesClient := newFakeAzurePIPClient("rg")
@@ -99,6 +105,7 @@ func setTestVirtualMachineCloud(ss *Cloud, scaleSetName, zone string, faultDomai
 		}
 		vmssVM := compute.VirtualMachineScaleSetVM{
 			VirtualMachineScaleSetVMProperties: &compute.VirtualMachineScaleSetVMProperties{
+				ProvisioningState: to.StringPtr(state),
 				OsProfile: &compute.OSProfile{
 					ComputerName: &nodeName,
 				},
@@ -189,6 +196,9 @@ func TestGetScaleSetVMInstanceID(t *testing.T) {
 }
 
 func TestGetInstanceIDByNodeName(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
 	testCases := []struct {
 		description string
 		scaleSet    string
@@ -221,7 +231,7 @@ func TestGetInstanceIDByNodeName(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		ss, err := newTestScaleSet(test.scaleSet, "", 0, test.vmList)
+		ss, err := newTestScaleSet(ctrl, test.scaleSet, "", 0, test.vmList)
 		assert.NoError(t, err, test.description)
 
 		real, err := ss.GetInstanceIDByNodeName(test.nodeName)
@@ -236,11 +246,15 @@ func TestGetInstanceIDByNodeName(t *testing.T) {
 }
 
 func TestGetZoneByNodeName(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
 	testCases := []struct {
 		description string
 		scaleSet    string
 		vmList      []string
 		nodeName    string
+		location    string
 		zone        string
 		faultDomain int32
 		expected    string
@@ -264,6 +278,16 @@ func TestGetZoneByNodeName(t *testing.T) {
 			expected:    "westus-2",
 		},
 		{
+			description: "scaleSet should get availability zone in lower cases",
+			scaleSet:    "ss",
+			vmList:      []string{"vmssee6c2000000", "vmssee6c2000001"},
+			nodeName:    "vmssee6c2000000",
+			location:    "WestUS",
+			zone:        "2",
+			faultDomain: 3,
+			expected:    "westus-2",
+		},
+		{
 			description: "scaleSet should return error for non-exist nodes",
 			scaleSet:    "ss",
 			faultDomain: 3,
@@ -274,8 +298,14 @@ func TestGetZoneByNodeName(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		ss, err := newTestScaleSet(test.scaleSet, test.zone, test.faultDomain, test.vmList)
+		cloud := GetTestCloud(ctrl)
+		if test.location != "" {
+			cloud.Location = test.location
+		}
+		setTestVirtualMachineCloud(cloud, test.scaleSet, test.zone, test.faultDomain, test.vmList, "Running")
+		scaleset, err := newScaleSet(cloud)
 		assert.NoError(t, err, test.description)
+		ss := scaleset.(*scaleSet)
 
 		real, err := ss.GetZoneByNodeName(test.nodeName)
 		if test.expectError {
@@ -285,10 +315,14 @@ func TestGetZoneByNodeName(t *testing.T) {
 
 		assert.NoError(t, err, test.description)
 		assert.Equal(t, test.expected, real.FailureDomain, test.description)
+		assert.Equal(t, strings.ToLower(cloud.Location), real.Region, test.description)
 	}
 }
 
 func TestGetIPByNodeName(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
 	testCases := []struct {
 		description string
 		scaleSet    string
@@ -314,7 +348,7 @@ func TestGetIPByNodeName(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		ss, err := newTestScaleSet(test.scaleSet, "", 0, test.vmList)
+		ss, err := newTestScaleSet(ctrl, test.scaleSet, "", 0, test.vmList)
 		assert.NoError(t, err, test.description)
 
 		privateIP, publicIP, err := ss.GetIPByNodeName(test.nodeName)
@@ -329,6 +363,9 @@ func TestGetIPByNodeName(t *testing.T) {
 }
 
 func TestGetNodeNameByIPConfigurationID(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
 	ipConfigurationIDTemplate := "/subscriptions/script/resourceGroups/rg/providers/Microsoft.Compute/virtualMachineScaleSets/%s/virtualMachines/%s/networkInterfaces/%s/ipConfigurations/ipconfig1"
 
 	testCases := []struct {
@@ -363,7 +400,7 @@ func TestGetNodeNameByIPConfigurationID(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		ss, err := newTestScaleSet(test.scaleSet, "", 0, test.vmList)
+		ss, err := newTestScaleSet(ctrl, test.scaleSet, "", 0, test.vmList)
 		assert.NoError(t, err, test.description)
 
 		nodeName, err := ss.getNodeNameByIPConfigurationID(test.ipConfigurationID)
