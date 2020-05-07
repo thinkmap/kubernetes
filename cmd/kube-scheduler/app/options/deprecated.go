@@ -23,7 +23,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/kubernetes/pkg/scheduler/algorithmprovider"
 	kubeschedulerconfig "k8s.io/kubernetes/pkg/scheduler/apis/config"
-	"k8s.io/kubernetes/pkg/scheduler/framework/plugins"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/interpodaffinity"
 )
 
@@ -128,11 +127,13 @@ func (o *DeprecatedOptions) ApplyTo(cfg *kubeschedulerconfig.KubeSchedulerConfig
 		profile.SchedulerName = o.SchedulerName
 	}
 	if o.HardPodAffinitySymmetricWeight != interpodaffinity.DefaultHardPodAffinityWeight {
-		args := interpodaffinity.Args{
-			HardPodAffinityWeight: &o.HardPodAffinitySymmetricWeight,
+		plCfg := kubeschedulerconfig.PluginConfig{
+			Name: interpodaffinity.Name,
+			Args: &kubeschedulerconfig.InterPodAffinityArgs{
+				HardPodAffinityWeight: o.HardPodAffinitySymmetricWeight,
+			},
 		}
-		profile.PluginConfig = append(profile.PluginConfig, plugins.NewPluginConfig(interpodaffinity.Name, args))
+		profile.PluginConfig = append(profile.PluginConfig, plCfg)
 	}
-
 	return nil
 }

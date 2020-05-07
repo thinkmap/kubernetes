@@ -48,7 +48,6 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/core"
 	frameworkplugins "k8s.io/kubernetes/pkg/scheduler/framework/plugins"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultbinder"
-	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/interpodaffinity"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/noderesources"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/queuesort"
 	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
@@ -162,12 +161,13 @@ func (c *Configurator) create() (*Scheduler, error) {
 	if len(ignoredExtendedResources) > 0 {
 		for i := range c.profiles {
 			prof := &c.profiles[i]
-			prof.PluginConfig = append(prof.PluginConfig,
-				frameworkplugins.NewPluginConfig(
-					noderesources.FitName,
-					noderesources.FitArgs{IgnoredResources: ignoredExtendedResources},
-				),
-			)
+			pc := schedulerapi.PluginConfig{
+				Name: noderesources.FitName,
+				Args: &schedulerapi.NodeResourcesFitArgs{
+					IgnoredResources: ignoredExtendedResources,
+				},
+			}
+			prof.PluginConfig = append(prof.PluginConfig, pc)
 		}
 	}
 
@@ -280,9 +280,8 @@ func (c *Configurator) createFromConfig(policy schedulerapi.Policy) (*Scheduler,
 	// HardPodAffinitySymmetricWeight in the policy config takes precedence over
 	// CLI configuration.
 	if policy.HardPodAffinitySymmetricWeight != 0 {
-		v := policy.HardPodAffinitySymmetricWeight
-		args.InterPodAffinityArgs = &interpodaffinity.Args{
-			HardPodAffinityWeight: &v,
+		args.InterPodAffinityArgs = &schedulerapi.InterPodAffinityArgs{
+			HardPodAffinityWeight: policy.HardPodAffinitySymmetricWeight,
 		}
 	}
 
@@ -342,7 +341,7 @@ func (c *Configurator) createFromConfig(policy schedulerapi.Policy) (*Scheduler,
 // mergePluginConfigsFromPolicy merges the giving plugin configs ensuring that,
 // if a plugin name is repeated, the arguments are the same.
 func mergePluginConfigsFromPolicy(pc1, pc2 []schedulerapi.PluginConfig) ([]schedulerapi.PluginConfig, error) {
-	args := make(map[string]runtime.Unknown)
+	args := make(map[string]runtime.Object)
 	for _, c := range pc1 {
 		args[c.Name] = c.Args
 	}
@@ -456,8 +455,8 @@ func NewPodInformer(client clientset.Interface, resyncPeriod time.Duration) core
 }
 
 // MakeDefaultErrorFunc construct a function to handle pod scheduler error
-func MakeDefaultErrorFunc(client clientset.Interface, podQueue internalqueue.SchedulingQueue, schedulerCache internalcache.Cache) func(*framework.PodInfo, error) {
-	return func(podInfo *framework.PodInfo, err error) {
+func MakeDefaultErrorFunc(client clientset.Interface, podQueue internalqueue.SchedulingQueue, schedulerCache internalcache.Cache) func(*framework.QueuedPodInfo, error) {
+	return func(podInfo *framework.QueuedPodInfo, err error) {
 		pod := podInfo.Pod
 		if err == core.ErrNoNodesAvailable {
 			klog.V(2).Infof("Unable to schedule %v/%v: no nodes are registered to the cluster; waiting", pod.Namespace, pod.Name)
@@ -491,9 +490,6 @@ func MakeDefaultErrorFunc(client clientset.Interface, podQueue internalqueue.Sch
 				Name:      pod.Name,
 			}
 
-			// An unschedulable pod will be placed in the unschedulable queue.
-			// This ensures that if the pod is nominated to run on a node,
-			// scheduler takes the pod into account when running predicates for the node.
 			// Get the pod again; it may have changed/been scheduled already.
 			getBackoff := initialGetBackoff
 			for {

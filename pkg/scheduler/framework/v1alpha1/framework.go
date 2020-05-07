@@ -32,9 +32,7 @@ import (
 	"k8s.io/kubernetes/pkg/controller/volume/scheduling"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/internal/parallelize"
-	schedulerlisters "k8s.io/kubernetes/pkg/scheduler/listers"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
-	schedulertypes "k8s.io/kubernetes/pkg/scheduler/types"
 )
 
 const (
@@ -60,7 +58,7 @@ const (
 // plugins.
 type framework struct {
 	registry              Registry
-	snapshotSharedLister  schedulerlisters.SharedLister
+	snapshotSharedLister  SharedLister
 	waitingPods           *waitingPodsMap
 	pluginNameToWeightMap map[string]int
 	queueSortPlugins      []QueueSortPlugin
@@ -116,7 +114,7 @@ func (f *framework) getExtensionPoints(plugins *config.Plugins) []extensionPoint
 type frameworkOptions struct {
 	clientSet            clientset.Interface
 	informerFactory      informers.SharedInformerFactory
-	snapshotSharedLister schedulerlisters.SharedLister
+	snapshotSharedLister SharedLister
 	metricsRecorder      *metricsRecorder
 	volumeBinder         scheduling.SchedulerVolumeBinder
 	runAllFilters        bool
@@ -140,7 +138,7 @@ func WithInformerFactory(informerFactory informers.SharedInformerFactory) Option
 }
 
 // WithSnapshotSharedLister sets the SharedLister of the snapshot.
-func WithSnapshotSharedLister(snapshotSharedLister schedulerlisters.SharedLister) Option {
+func WithSnapshotSharedLister(snapshotSharedLister SharedLister) Option {
 	return func(o *frameworkOptions) {
 		o.snapshotSharedLister = snapshotSharedLister
 	}
@@ -199,13 +197,13 @@ func NewFramework(r Registry, plugins *config.Plugins, args []config.PluginConfi
 	// get needed plugins from config
 	pg := f.pluginsNeeded(plugins)
 
-	pluginConfig := make(map[string]*runtime.Unknown, 0)
+	pluginConfig := make(map[string]runtime.Object, 0)
 	for i := range args {
 		name := args[i].Name
 		if _, ok := pluginConfig[name]; ok {
 			return nil, fmt.Errorf("repeated config for plugin %s", name)
 		}
-		pluginConfig[name] = &args[i].Args
+		pluginConfig[name] = args[i].Args
 	}
 
 	pluginsMap := make(map[string]Plugin)
@@ -297,7 +295,7 @@ func (f *framework) QueueSortFunc() LessFunc {
 	if f == nil {
 		// If framework is nil, simply keep their order unchanged.
 		// NOTE: this is primarily for tests.
-		return func(_, _ *PodInfo) bool { return false }
+		return func(_, _ *QueuedPodInfo) bool { return false }
 	}
 
 	if len(f.queueSortPlugins) == 0 {
@@ -352,7 +350,7 @@ func (f *framework) RunPreFilterExtensionAddPod(
 	state *CycleState,
 	podToSchedule *v1.Pod,
 	podToAdd *v1.Pod,
-	nodeInfo *schedulertypes.NodeInfo,
+	nodeInfo *NodeInfo,
 ) (status *Status) {
 	for _, pl := range f.preFilterPlugins {
 		if pl.PreFilterExtensions() == nil {
@@ -370,7 +368,7 @@ func (f *framework) RunPreFilterExtensionAddPod(
 	return nil
 }
 
-func (f *framework) runPreFilterExtensionAddPod(ctx context.Context, pl PreFilterPlugin, state *CycleState, podToSchedule *v1.Pod, podToAdd *v1.Pod, nodeInfo *schedulertypes.NodeInfo) *Status {
+func (f *framework) runPreFilterExtensionAddPod(ctx context.Context, pl PreFilterPlugin, state *CycleState, podToSchedule *v1.Pod, podToAdd *v1.Pod, nodeInfo *NodeInfo) *Status {
 	if !state.ShouldRecordPluginMetrics() {
 		return pl.PreFilterExtensions().AddPod(ctx, state, podToSchedule, podToAdd, nodeInfo)
 	}
@@ -388,7 +386,7 @@ func (f *framework) RunPreFilterExtensionRemovePod(
 	state *CycleState,
 	podToSchedule *v1.Pod,
 	podToRemove *v1.Pod,
-	nodeInfo *schedulertypes.NodeInfo,
+	nodeInfo *NodeInfo,
 ) (status *Status) {
 	for _, pl := range f.preFilterPlugins {
 		if pl.PreFilterExtensions() == nil {
@@ -406,7 +404,7 @@ func (f *framework) RunPreFilterExtensionRemovePod(
 	return nil
 }
 
-func (f *framework) runPreFilterExtensionRemovePod(ctx context.Context, pl PreFilterPlugin, state *CycleState, podToSchedule *v1.Pod, podToAdd *v1.Pod, nodeInfo *schedulertypes.NodeInfo) *Status {
+func (f *framework) runPreFilterExtensionRemovePod(ctx context.Context, pl PreFilterPlugin, state *CycleState, podToSchedule *v1.Pod, podToAdd *v1.Pod, nodeInfo *NodeInfo) *Status {
 	if !state.ShouldRecordPluginMetrics() {
 		return pl.PreFilterExtensions().RemovePod(ctx, state, podToSchedule, podToAdd, nodeInfo)
 	}
@@ -424,21 +422,17 @@ func (f *framework) RunFilterPlugins(
 	ctx context.Context,
 	state *CycleState,
 	pod *v1.Pod,
-	nodeInfo *schedulertypes.NodeInfo,
+	nodeInfo *NodeInfo,
 ) PluginToStatus {
-	var firstFailedStatus *Status
 	statuses := make(PluginToStatus)
 	for _, pl := range f.filterPlugins {
 		pluginStatus := f.runFilterPlugin(ctx, pl, state, pod, nodeInfo)
-		if len(statuses) == 0 {
-			firstFailedStatus = pluginStatus
-		}
 		if !pluginStatus.IsSuccess() {
 			if !pluginStatus.IsUnschedulable() {
 				// Filter plugins are not supposed to return any status other than
 				// Success or Unschedulable.
-				firstFailedStatus = NewStatus(Error, fmt.Sprintf("running %q filter plugin for pod %q: %v", pl.Name(), pod.Name, pluginStatus.Message()))
-				return map[string]*Status{pl.Name(): firstFailedStatus}
+				errStatus := NewStatus(Error, fmt.Sprintf("running %q filter plugin for pod %q: %v", pl.Name(), pod.Name, pluginStatus.Message()))
+				return map[string]*Status{pl.Name(): errStatus}
 			}
 			statuses[pl.Name()] = pluginStatus
 			if !f.runAllFilters {
@@ -451,7 +445,7 @@ func (f *framework) RunFilterPlugins(
 	return statuses
 }
 
-func (f *framework) runFilterPlugin(ctx context.Context, pl FilterPlugin, state *CycleState, pod *v1.Pod, nodeInfo *schedulertypes.NodeInfo) *Status {
+func (f *framework) runFilterPlugin(ctx context.Context, pl FilterPlugin, state *CycleState, pod *v1.Pod, nodeInfo *NodeInfo) *Status {
 	if !state.ShouldRecordPluginMetrics() {
 		return pl.Filter(ctx, state, pod, nodeInfo)
 	}
@@ -817,7 +811,7 @@ func (f *framework) WaitOnPermit(ctx context.Context, pod *v1.Pod) (status *Stat
 // snapshot. The snapshot is taken at the beginning of a scheduling cycle and remains
 // unchanged until a pod finishes "Reserve". There is no guarantee that the information
 // remains unchanged after "Reserve".
-func (f *framework) SnapshotSharedLister() schedulerlisters.SharedLister {
+func (f *framework) SnapshotSharedLister() SharedLister {
 	return f.snapshotSharedLister
 }
 

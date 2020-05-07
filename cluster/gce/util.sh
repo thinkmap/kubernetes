@@ -20,7 +20,7 @@
 # config-default.sh.
 readonly GCE_MAX_LOCAL_SSD=8
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/../..
+KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/../..
 source "${KUBE_ROOT}/cluster/gce/${KUBE_CONFIG_FILE-"config-default.sh"}"
 source "${KUBE_ROOT}/cluster/common.sh"
 source "${KUBE_ROOT}/hack/lib/util.sh"
@@ -2947,7 +2947,8 @@ function attach-internal-master-ip() {
   echo "Setting ${name}'s aliases to '${aliases}' (added ${ip})"
   # Attach ${ip} to ${name}
   gcloud compute instances network-interfaces update "${name}" --project "${PROJECT}" --zone "${zone}" --aliases="${aliases}"
-  run-gcloud-command "${name}" "${zone}" 'sudo ip route add to local '${ip}'/32 dev $(ip route | grep default | awk '\''{print $5}'\'')' || true
+  gcloud compute instances add-metadata "${name}" --zone "${zone}" --metadata=kube-master-internal-ip="${ip}"
+  run-gcloud-command "${name}" "${zone}" 'sudo /bin/bash /home/kubernetes/bin/kube-master-internal-route.sh' || true
   return $?
 }
 
@@ -2965,6 +2966,7 @@ function detach-internal-master-ip() {
   echo "Setting ${name}'s aliases to '${aliases}' (removed ${ip})"
   # Detach ${MASTER_NAME}-internal-ip from ${name}
   gcloud compute instances network-interfaces update "${name}" --project "${PROJECT}" --zone "${zone}" --aliases="${aliases}"
+  gcloud compute instances remove-metadata "${name}" --zone "${zone}" --keys=kube-master-internal-ip
   run-gcloud-command "${name}" "${zone}" 'sudo ip route del to local '${ip}'/32 dev $(ip route | grep default | awk '\''{print $5}'\'')' || true
   return $?
 }
