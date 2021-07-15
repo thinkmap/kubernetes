@@ -117,8 +117,37 @@ try {
   FetchAndImport-ModuleFromMetadata 'k8s-node-setup-psm1' 'k8s-node-setup.psm1'
 
   Dump-DebugInfoToConsole
-  Set-PrerequisiteOptions
+
+  if (-not (Test-ContainersFeatureInstalled)) {
+    Install-ContainersFeature
+    Log-Output 'Restarting computer after enabling Windows Containers feature'
+    Restart-Computer -Force
+    # Restart-Computer does not stop the rest of the script from executing.
+    exit 0
+  }
+
   $kube_env = Fetch-KubeEnv
+  Set-EnvironmentVars
+
+  # Set the TCP/IP Parameters to keep idle connections alive.
+  Set-WindowsTCPParameters
+
+  # Install Docker if the select CRI is not containerd and docker is not already
+  # installed.
+  if (${env:CONTAINER_RUNTIME} -ne "containerd") {
+    if (-not (Test-DockerIsInstalled)) {
+      Install-Docker
+    }
+    # For some reason the docker service may not be started automatically on the
+    # first reboot, although it seems to work fine on subsequent reboots.
+    Restart-Service docker
+    Start-Sleep 5
+    if (-not (Test-DockerIsRunning)) {
+        throw "docker service failed to start or stay running"
+    }
+  }
+
+  Set-PrerequisiteOptions
 
   if (Test-IsTestCluster $kube_env) {
     Log-Output 'Test cluster detected, installing OpenSSH.'
@@ -127,7 +156,6 @@ try {
     StartProcess-WriteSshKeys
   }
 
-  Set-EnvironmentVars
   Create-Directories
   Download-HelperScripts
 
@@ -136,22 +164,30 @@ try {
   Setup-ContainerRuntime
   DownloadAndInstall-AuthPlugin
   DownloadAndInstall-KubernetesBinaries
+  DownloadAndInstall-NodeProblemDetector
+  DownloadAndInstall-CSIProxyBinaries
+  Start-CSIProxy
   Create-NodePki
   Create-KubeletKubeconfig
   Create-KubeproxyKubeconfig
+  Create-NodeProblemDetectorKubeConfig
   Set-PodCidr
   Configure-HostNetworkingService
   Prepare-CniNetworking
   Configure-HostDnsConf
   Configure-GcePdTools
   Configure-Kubelet
+  Configure-NodeProblemDetector
 
-  # Even if Stackdriver is already installed, the function will still [re]start the service.
+  # Even if Logging agent is already installed, the function will still [re]start the service.
   if (IsLoggingEnabled $kube_env) {
     Install-LoggingAgent
     Configure-LoggingAgent
     Restart-LoggingAgent
   }
+  # Flush cache to disk before starting kubelet & kube-proxy services
+  # to make metadata server route and stackdriver service more persistent.
+  Write-Volumecache C -PassThru
   Start-WorkerServices
   Log-Output 'Waiting 15 seconds for node to join cluster.'
   Start-Sleep 15
@@ -162,6 +198,8 @@ try {
   Schedule-LogRotation -Pattern '.*\.log$' -Path ${env:LOGS_DIR} -RepetitionInterval $(New-Timespan -Hour 1) -Config $config
 
   Pull-InfraContainer
+  # Flush cache to disk to persist the setup status
+  Write-Volumecache C -PassThru
 }
 catch {
   Write-Host 'Exception caught in script:'

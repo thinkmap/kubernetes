@@ -24,6 +24,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/onsi/gomega"
@@ -36,7 +37,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
 	e2elog "k8s.io/kubernetes/test/e2e/framework/log"
-	testutils "k8s.io/kubernetes/test/utils"
 )
 
 const (
@@ -112,8 +112,8 @@ func makePrivateKeySignerFromFile(key string) (ssh.Signer, error) {
 	return signer, err
 }
 
-// NodeSSHHosts returns SSH-able host names for all schedulable nodes - this
-// excludes master node. If it can't find any external IPs, it falls back to
+// NodeSSHHosts returns SSH-able host names for all schedulable nodes.
+// If it can't find any external IPs, it falls back to
 // looking for internal IPs. If it can't find an internal IP for every node it
 // returns an error, though it still returns all hosts that it found in that
 // case.
@@ -134,11 +134,39 @@ func NodeSSHHosts(c clientset.Interface) ([]string, error) {
 			len(hosts), len(nodelist.Items), nodelist)
 	}
 
-	sshHosts := make([]string, 0, len(hosts))
-	for _, h := range hosts {
-		sshHosts = append(sshHosts, net.JoinHostPort(h, SSHPort))
+	lenHosts := len(hosts)
+	wg := &sync.WaitGroup{}
+	wg.Add(lenHosts)
+	sshHosts := make([]string, 0, lenHosts)
+	var sshHostsLock sync.Mutex
+
+	for _, host := range hosts {
+		go func(host string) {
+			defer wg.Done()
+			if canConnect(host) {
+				e2elog.Logf("Assuming SSH on host %s", host)
+				sshHostsLock.Lock()
+				sshHosts = append(sshHosts, net.JoinHostPort(host, SSHPort))
+				sshHostsLock.Unlock()
+			} else {
+				e2elog.Logf("Skipping host %s because it does not run anything on port %s", host, SSHPort)
+			}
+		}(host)
 	}
+	wg.Wait()
+
 	return sshHosts, nil
+}
+
+// canConnect returns true if a network connection is possible to the SSHPort.
+func canConnect(host string) bool {
+	hostPort := net.JoinHostPort(host, SSHPort)
+	conn, err := net.DialTimeout("tcp", hostPort, 3*time.Second)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }
 
 // Result holds the execution result of SSH command
@@ -393,9 +421,6 @@ func waitListSchedulableNodes(c clientset.Interface) (*v1.NodeList, error) {
 			"spec.unschedulable": "false",
 		}.AsSelector().String()})
 		if err != nil {
-			if testutils.IsRetryableAPIError(err) {
-				return false, nil
-			}
 			return false, err
 		}
 		return true, nil

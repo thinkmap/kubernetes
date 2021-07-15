@@ -30,6 +30,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/util/waitgroup"
 	auditinternal "k8s.io/apiserver/pkg/apis/audit"
 	"k8s.io/apiserver/pkg/audit"
@@ -155,6 +156,7 @@ func TestNewWithDelegate(t *testing.T) {
 		"/healthz/ping",
 		"/healthz/poststarthook/delegate-post-start-hook",
 		"/healthz/poststarthook/generic-apiserver-start-informers",
+		"/healthz/poststarthook/max-in-flight-filter",
 		"/healthz/poststarthook/wrapping-post-start-hook",
 		"/healthz/wrapping-health",
 		"/livez",
@@ -163,23 +165,45 @@ func TestNewWithDelegate(t *testing.T) {
 		"/livez/ping",
 		"/livez/poststarthook/delegate-post-start-hook",
 		"/livez/poststarthook/generic-apiserver-start-informers",
+		"/livez/poststarthook/max-in-flight-filter",
 		"/livez/poststarthook/wrapping-post-start-hook",
 		"/metrics",
 		"/readyz",
 		"/readyz/delegate-health",
+		"/readyz/informer-sync",
 		"/readyz/log",
 		"/readyz/ping",
 		"/readyz/poststarthook/delegate-post-start-hook",
 		"/readyz/poststarthook/generic-apiserver-start-informers",
+		"/readyz/poststarthook/max-in-flight-filter",
 		"/readyz/poststarthook/wrapping-post-start-hook",
 		"/readyz/shutdown",
 	}
 	checkExpectedPathsAtRoot(server.URL, expectedPaths, t)
+
+	// wait for health (max-in-flight-filter is initialized asynchronously, can take a few milliseconds to initialize)
+	if err := wait.PollImmediate(100*time.Millisecond, wait.ForeverTestTimeout, func() (bool, error) {
+		// healthz checks are installed in PrepareRun
+		resp, err := http.Get(server.URL + "/healthz?exclude=wrapping-health&exclude=delegate-health")
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := ioutil.ReadAll(resp.Body)
+		if http.StatusOK != resp.StatusCode {
+			t.Logf("got %d", resp.StatusCode)
+			t.Log(string(data))
+			return false, nil
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	checkPath(server.URL+"/healthz", http.StatusInternalServerError, `[+]ping ok
 [+]log ok
 [-]wrapping-health failed: reason withheld
 [-]delegate-health failed: reason withheld
 [+]poststarthook/generic-apiserver-start-informers ok
+[+]poststarthook/max-in-flight-filter ok
 [+]poststarthook/delegate-post-start-hook ok
 [+]poststarthook/wrapping-post-start-hook ok
 healthz check failed
@@ -242,10 +266,10 @@ func checkExpectedPathsAtRoot(url string, expectedPaths []string, t *testing.T) 
 			pathset.Insert(p.(string))
 		}
 		expectedset := sets.NewString(expectedPaths...)
-		for _, p := range pathset.Difference(expectedset) {
+		for p := range pathset.Difference(expectedset) {
 			t.Errorf("Got %v path, which we did not expect", p)
 		}
-		for _, p := range expectedset.Difference(pathset) {
+		for p := range expectedset.Difference(pathset) {
 			t.Errorf(" Expected %v path which we did not get", p)
 		}
 	})

@@ -20,31 +20,27 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
-	"path/filepath"
 	"regexp"
-	"strconv"
-	"strings"
-
 	// s390/s390x changes
 	"runtime"
+	"strconv"
+	"strings"
 
 	info "github.com/google/cadvisor/info/v1"
 	"github.com/google/cadvisor/utils"
 	"github.com/google/cadvisor/utils/sysfs"
 	"github.com/google/cadvisor/utils/sysinfo"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	"golang.org/x/sys/unix"
 )
 
 var (
-	cpuRegExp     = regexp.MustCompile(`^processor\s*:\s*([0-9]+)$`)
-	coreRegExp    = regexp.MustCompile(`(?m)^core id\s*:\s*([0-9]+)$`)
-	nodeRegExp    = regexp.MustCompile(`(?m)^physical id\s*:\s*([0-9]+)$`)
-	nodeBusRegExp = regexp.MustCompile(`^node([0-9]+)$`)
+	coreRegExp = regexp.MustCompile(`(?m)^core id\s*:\s*([0-9]+)$`)
+	nodeRegExp = regexp.MustCompile(`(?m)^physical id\s*:\s*([0-9]+)$`)
 	// Power systems have a different format so cater for both
-	cpuClockSpeedMHz     = regexp.MustCompile(`(?:cpu MHz|clock)\s*:\s*([0-9]+\.[0-9]+)(?:MHz)?`)
+	cpuClockSpeedMHz     = regexp.MustCompile(`(?:cpu MHz|CPU MHz|clock)\s*:\s*([0-9]+\.[0-9]+)(?:MHz)?`)
 	memoryCapacityRegexp = regexp.MustCompile(`MemTotal:\s*([0-9]+) kB`)
 	swapCapacityRegexp   = regexp.MustCompile(`SwapTotal:\s*([0-9]+) kB`)
 
@@ -52,13 +48,9 @@ var (
 	isMemoryController = regexp.MustCompile("mc[0-9]+")
 	isDimm             = regexp.MustCompile("dimm[0-9]+")
 	machineArch        = getMachineArch()
+	maxFreqFile        = "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"
 )
 
-const maxFreqFile = "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"
-const nodePath = "/sys/devices/system/node"
-const sysFsCPUCoreID = "core_id"
-const sysFsCPUPhysicalPackageID = "physical_package_id"
-const sysFsCPUTopology = "topology"
 const memTypeFileName = "dimm_mem_type"
 const sizeFileName = "size"
 
@@ -68,7 +60,7 @@ func GetPhysicalCores(procInfo []byte) int {
 	if numCores == 0 {
 		// read number of cores from /sys/bus/cpu/devices/cpu*/topology/core_id to deal with processors
 		// for which 'core id' is not available in /proc/cpuinfo
-		numCores = getUniqueCPUPropertyCount(cpuBusPath, sysFsCPUCoreID)
+		numCores = sysfs.GetUniqueCPUPropertyCount(cpuBusPath, sysfs.CPUCoreID)
 	}
 	if numCores == 0 {
 		klog.Errorf("Cannot read number of physical cores correctly, number of cores set to %d", numCores)
@@ -82,7 +74,7 @@ func GetSockets(procInfo []byte) int {
 	if numSocket == 0 {
 		// read number of sockets from /sys/bus/cpu/devices/cpu*/topology/physical_package_id to deal with processors
 		// for which 'physical id' is not available in /proc/cpuinfo
-		numSocket = getUniqueCPUPropertyCount(cpuBusPath, sysFsCPUPhysicalPackageID)
+		numSocket = sysfs.GetUniqueCPUPropertyCount(cpuBusPath, sysfs.CPUPhysicalPackageID)
 	}
 	if numSocket == 0 {
 		klog.Errorf("Cannot read number of sockets correctly, number of sockets set to %d", numSocket)
@@ -92,11 +84,6 @@ func GetSockets(procInfo []byte) int {
 
 // GetClockSpeed returns the CPU clock speed, given a []byte formatted as the /proc/cpuinfo file.
 func GetClockSpeed(procInfo []byte) (uint64, error) {
-	// s390/s390x, mips64, riscv64, aarch64 and arm32 changes
-	if isMips64() || isSystemZ() || isAArch64() || isArm32() || isRiscv64() {
-		return 0, nil
-	}
-
 	// First look through sys to find a max supported cpu frequency.
 	if utils.FileExists(maxFreqFile) {
 		val, err := ioutil.ReadFile(maxFreqFile)
@@ -110,6 +97,11 @@ func GetClockSpeed(procInfo []byte) (uint64, error) {
 		}
 		return maxFreq, nil
 	}
+	// s390/s390x, mips64, riscv64, aarch64 and arm32 changes
+	if isMips64() || isSystemZ() || isAArch64() || isArm32() || isRiscv64() {
+		return 0, nil
+	}
+
 	// Fall back to /proc/cpuinfo
 	matches := cpuClockSpeedMHz.FindSubmatch(procInfo)
 	if len(matches) != 2 {
@@ -171,10 +163,10 @@ func GetMachineMemoryByType(edacPath string) (map[string]*info.MemoryInfo, error
 				continue
 			}
 			memType, err := ioutil.ReadFile(path.Join(edacPath, controller, dimm, memTypeFileName))
-			readableMemType := strings.TrimSpace(string(memType))
 			if err != nil {
 				return map[string]*info.MemoryInfo{}, err
 			}
+			readableMemType := strings.TrimSpace(string(memType))
 			if _, exists := memory[readableMemType]; !exists {
 				memory[readableMemType] = &info.MemoryInfo{}
 			}
@@ -236,40 +228,6 @@ func parseCapacity(b []byte, r *regexp.Regexp) (uint64, error) {
 
 	// Convert to bytes.
 	return m * 1024, err
-}
-
-// Looks for sysfs cpu path containing given CPU property, e.g. core_id or physical_package_id
-// and returns number of unique values of given property, exemplary usage: getting number of CPU physical cores
-func getUniqueCPUPropertyCount(cpuBusPath string, propertyName string) int {
-	pathPattern := cpuBusPath + "cpu*[0-9]"
-	sysCPUPaths, err := filepath.Glob(pathPattern)
-	if err != nil {
-		klog.Errorf("Cannot find files matching pattern (pathPattern: %s),  number of unique %s set to 0", pathPattern, propertyName)
-		return 0
-	}
-	uniques := make(map[string]bool)
-	for _, sysCPUPath := range sysCPUPaths {
-		propertyPath := filepath.Join(sysCPUPath, sysFsCPUTopology, propertyName)
-		propertyVal, err := ioutil.ReadFile(propertyPath)
-		if err != nil {
-			klog.Errorf("Cannot open %s, number of unique %s  set to 0", propertyPath, propertyName)
-			return 0
-		}
-		uniques[string(propertyVal)] = true
-	}
-	return len(uniques)
-}
-
-func extractValue(s string, r *regexp.Regexp) (bool, int, error) {
-	matches := r.FindSubmatch([]byte(s))
-	if len(matches) == 2 {
-		val, err := strconv.ParseInt(string(matches[1]), 10, 32)
-		if err != nil {
-			return false, -1, err
-		}
-		return true, int(val), nil
-	}
-	return false, -1, nil
 }
 
 // getUniqueMatchesCount returns number of unique matches in given argument using provided regular expression

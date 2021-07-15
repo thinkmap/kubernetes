@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
 	extenderv1 "k8s.io/kube-scheduler/extender/v1"
+	"k8s.io/kubernetes/pkg/scheduler"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	testutils "k8s.io/kubernetes/test/integration/util"
 	imageutils "k8s.io/kubernetes/test/utils/image"
@@ -280,7 +281,7 @@ func machine3Prioritizer(pod *v1.Pod, nodes *v1.NodeList) (*extenderv1.HostPrior
 }
 
 func TestSchedulerExtender(t *testing.T) {
-	testCtx := testutils.InitTestMaster(t, "scheduler-extender", nil)
+	testCtx := testutils.InitTestAPIServer(t, "scheduler-extender", nil)
 	clientSet := testCtx.ClientSet
 
 	extender1 := &Extender{
@@ -350,7 +351,10 @@ func TestSchedulerExtender(t *testing.T) {
 	}
 	policy.APIVersion = "v1"
 
-	testCtx = testutils.InitTestScheduler(t, testCtx, false, &policy)
+	testCtx = testutils.InitTestSchedulerWithOptions(t, testCtx, &policy,
+		scheduler.WithProfiles([]schedulerapi.KubeSchedulerProfile(nil)...))
+	testutils.SyncInformerFactory(testCtx)
+	go testCtx.Scheduler.Run(testCtx.Ctx)
 	defer testutils.CleanupTest(t, testCtx)
 
 	DoTestPodScheduling(testCtx.NS, t, clientSet)
@@ -379,7 +383,7 @@ func DoTestPodScheduling(ns *v1.Namespace, t *testing.T, cs clientset.Interface)
 
 	for ii := 0; ii < 5; ii++ {
 		node.Name = fmt.Sprintf("machine%d", ii+1)
-		if _, err := cs.CoreV1().Nodes().Create(context.TODO(), node, metav1.CreateOptions{}); err != nil {
+		if _, err := createNode(cs, node); err != nil {
 			t.Fatalf("Failed to create nodes: %v", err)
 		}
 	}

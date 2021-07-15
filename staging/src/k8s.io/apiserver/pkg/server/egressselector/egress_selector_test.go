@@ -90,7 +90,7 @@ func TestEgressSelector(t *testing.T) {
 					nil,
 				},
 				{
-					Master,
+					ControlPlane,
 					validateDirectDialer,
 					nil,
 					nil,
@@ -187,7 +187,7 @@ type fakeProxier struct {
 	err bool
 }
 
-func (f *fakeProxier) proxy(_ string) (net.Conn, error) {
+func (f *fakeProxier) proxy(_ context.Context, _ string) (net.Conn, error) {
 	if f.err {
 		return nil, fmt.Errorf("fake error")
 	}

@@ -19,19 +19,17 @@ package componentconfigs
 import (
 	"path/filepath"
 
-	"k8s.io/apimachinery/pkg/util/version"
-	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/klog"
-	kubeletconfig "k8s.io/kubelet/config/v1beta1"
-	"k8s.io/kubernetes/cmd/kubeadm/app/util/initsystem"
-	utilsexec "k8s.io/utils/exec"
-	utilpointer "k8s.io/utils/pointer"
-
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
-	kubeadmapiv1beta2 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta2"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"k8s.io/kubernetes/cmd/kubeadm/app/features"
-	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/initsystem"
+
+	"k8s.io/apimachinery/pkg/util/version"
+	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
+	kubeletconfig "k8s.io/kubelet/config/v1beta1"
+	utilpointer "k8s.io/utils/pointer"
 )
 
 const (
@@ -63,7 +61,11 @@ var kubeletHandler = handler{
 	GroupVersion: kubeletconfig.SchemeGroupVersion,
 	AddToScheme:  kubeletconfig.AddToScheme,
 	CreateEmpty: func() kubeadmapi.ComponentConfig {
-		return &kubeletConfig{}
+		return &kubeletConfig{
+			configBase: configBase{
+				GroupVersion: kubeletconfig.SchemeGroupVersion,
+			},
+		}
 	},
 	fromCluster: kubeletConfigFromCluster,
 }
@@ -81,21 +83,31 @@ func kubeletConfigFromCluster(h *handler, clientset clientset.Interface, cluster
 
 // kubeletConfig implements the kubeadmapi.ComponentConfig interface for kubelet
 type kubeletConfig struct {
+	configBase
 	config kubeletconfig.KubeletConfiguration
 }
 
 func (kc *kubeletConfig) DeepCopy() kubeadmapi.ComponentConfig {
 	result := &kubeletConfig{}
+	kc.configBase.DeepCopyInto(&result.configBase)
 	kc.config.DeepCopyInto(&result.config)
 	return result
 }
 
 func (kc *kubeletConfig) Marshal() ([]byte, error) {
-	return kubeletHandler.Marshal(&kc.config)
+	return kc.configBase.Marshal(&kc.config)
 }
 
 func (kc *kubeletConfig) Unmarshal(docmap kubeadmapi.DocumentMap) error {
-	return kubeletHandler.Unmarshal(docmap, &kc.config)
+	return kc.configBase.Unmarshal(docmap, &kc.config)
+}
+
+func (kc *kubeletConfig) Get() interface{} {
+	return &kc.config
+}
+
+func (kc *kubeletConfig) Set(cfg interface{}) {
+	kc.config = *cfg.(*kubeletconfig.KubeletConfiguration)
 }
 
 func (kc *kubeletConfig) Default(cfg *kubeadmapi.ClusterConfiguration, _ *kubeadmapi.APIEndpoint, nodeRegOpts *kubeadmapi.NodeRegistrationOptions) {
@@ -105,16 +117,22 @@ func (kc *kubeletConfig) Default(cfg *kubeadmapi.ClusterConfiguration, _ *kubead
 		kc.config.FeatureGates = map[string]bool{}
 	}
 
+	// TODO: The following code should be removed after dual-stack is GA.
+	// Note: The user still retains the ability to explicitly set feature-gates and that value will overwrite this base value.
+	if enabled, present := cfg.FeatureGates[features.IPv6DualStack]; present {
+		kc.config.FeatureGates[features.IPv6DualStack] = enabled
+	}
+
 	if kc.config.StaticPodPath == "" {
-		kc.config.StaticPodPath = kubeadmapiv1beta2.DefaultManifestsDir
-	} else if kc.config.StaticPodPath != kubeadmapiv1beta2.DefaultManifestsDir {
-		warnDefaultComponentConfigValue(kind, "staticPodPath", kubeadmapiv1beta2.DefaultManifestsDir, kc.config.StaticPodPath)
+		kc.config.StaticPodPath = kubeadmapiv1.DefaultManifestsDir
+	} else if kc.config.StaticPodPath != kubeadmapiv1.DefaultManifestsDir {
+		warnDefaultComponentConfigValue(kind, "staticPodPath", kubeadmapiv1.DefaultManifestsDir, kc.config.StaticPodPath)
 	}
 
 	clusterDNS := ""
 	dnsIP, err := constants.GetDNSIP(cfg.Networking.ServiceSubnet, features.Enabled(cfg.FeatureGates, features.IPv6DualStack))
 	if err != nil {
-		clusterDNS = kubeadmapiv1beta2.DefaultClusterDNSIP
+		clusterDNS = kubeadmapiv1.DefaultClusterDNSIP
 	} else {
 		clusterDNS = dnsIP.String()
 	}
@@ -141,7 +159,7 @@ func (kc *kubeletConfig) Default(cfg *kubeadmapi.ClusterConfiguration, _ *kubead
 
 	if kc.config.Authentication.Anonymous.Enabled == nil {
 		kc.config.Authentication.Anonymous.Enabled = utilpointer.BoolPtr(kubeletAuthenticationAnonymousEnabled)
-	} else if *kc.config.Authentication.Anonymous.Enabled != kubeletAuthenticationAnonymousEnabled {
+	} else if *kc.config.Authentication.Anonymous.Enabled {
 		warnDefaultComponentConfigValue(kind, "authentication.anonymous.enabled", kubeletAuthenticationAnonymousEnabled, *kc.config.Authentication.Anonymous.Enabled)
 	}
 
@@ -156,7 +174,7 @@ func (kc *kubeletConfig) Default(cfg *kubeadmapi.ClusterConfiguration, _ *kubead
 	// Let clients using other authentication methods like ServiceAccount tokens also access the kubelet API
 	if kc.config.Authentication.Webhook.Enabled == nil {
 		kc.config.Authentication.Webhook.Enabled = utilpointer.BoolPtr(kubeletAuthenticationWebhookEnabled)
-	} else if *kc.config.Authentication.Webhook.Enabled != kubeletAuthenticationWebhookEnabled {
+	} else if !*kc.config.Authentication.Webhook.Enabled {
 		warnDefaultComponentConfigValue(kind, "authentication.webhook.enabled", kubeletAuthenticationWebhookEnabled, *kc.config.Authentication.Webhook.Enabled)
 	}
 
@@ -181,19 +199,9 @@ func (kc *kubeletConfig) Default(cfg *kubeadmapi.ClusterConfiguration, _ *kubead
 	// There is no way to determine if the user has set this or not, given the field is a non-pointer.
 	kc.config.RotateCertificates = kubeletRotateCertificates
 
-	// TODO: Conditionally set CgroupDriver to either `systemd` or `cgroupfs` for CRI other than Docker
-	if nodeRegOpts.CRISocket == constants.DefaultDockerCRISocket {
-		driver, err := kubeadmutil.GetCgroupDriverDocker(utilsexec.New())
-		if err != nil {
-			klog.Warningf("cannot automatically set CgroupDriver when starting the Kubelet: %v", err)
-		} else {
-			// if we can parse the right cgroup driver from docker info,
-			// we should always override CgroupDriver here no matter user specifies this value explicitly or not
-			if kc.config.CgroupDriver != "" && kc.config.CgroupDriver != driver {
-				klog.Warningf("detected %q as the Docker cgroup driver, the provided value %q in %q will be overrided", driver, kc.config.CgroupDriver, kind)
-			}
-			kc.config.CgroupDriver = driver
-		}
+	if len(kc.config.CgroupDriver) == 0 {
+		klog.V(1).Infof("the value of KubeletConfiguration.cgroupDriver is empty; setting it to %q", constants.CgroupDriverSystemd)
+		kc.config.CgroupDriver = constants.CgroupDriverSystemd
 	}
 
 	ok, err := isServiceActive("systemd-resolved")

@@ -19,15 +19,14 @@ package kubelet
 import (
 	"testing"
 
+	configutil "k8s.io/kubernetes/cmd/kubeadm/app/util/config"
+
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/client-go/kubernetes/fake"
 	core "k8s.io/client-go/testing"
-	kubeadmapiv1beta2 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta2"
-	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
-	configutil "k8s.io/kubernetes/cmd/kubeadm/app/util/config"
 )
 
 func TestCreateConfigMap(t *testing.T) {
@@ -51,12 +50,9 @@ func TestCreateConfigMap(t *testing.T) {
 		return true, nil, nil
 	})
 
-	clusterCfg := &kubeadmapiv1beta2.ClusterConfiguration{
-		KubernetesVersion: constants.CurrentKubernetesVersion.String(),
-	}
-	internalcfg, err := configutil.DefaultedInitConfiguration(&kubeadmapiv1beta2.InitConfiguration{}, clusterCfg)
+	internalcfg, err := configutil.DefaultedStaticInitConfiguration()
 	if err != nil {
-		t.Fatalf("unexpected failure by DefaultedInitConfiguration: %v", err)
+		t.Fatalf("unexpected failure when defaulting InitConfiguration: %v", err)
 	}
 
 	if err := CreateConfigMap(&internalcfg.ClusterConfiguration, client); err != nil {

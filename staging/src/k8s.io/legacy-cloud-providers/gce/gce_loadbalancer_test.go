@@ -40,7 +40,7 @@ func TestGetLoadBalancer(t *testing.T) {
 	status, found, err := gce.GetLoadBalancer(context.Background(), vals.ClusterName, apiService)
 	assert.Nil(t, status)
 	assert.False(t, found)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	nodeNames := []string{"test-node-1"}
 	nodes, err := createAndInsertNodes(gce, nodeNames, vals.ZoneName)
@@ -51,7 +51,7 @@ func TestGetLoadBalancer(t *testing.T) {
 	status, found, err = gce.GetLoadBalancer(context.Background(), vals.ClusterName, apiService)
 	assert.Equal(t, expectedStatus, status)
 	assert.True(t, found)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 }
 
 func TestEnsureLoadBalancerCreatesExternalLb(t *testing.T) {
@@ -177,4 +177,18 @@ func TestEnsureLoadBalancerDeletedDeletesInternalLb(t *testing.T) {
 	err = gce.EnsureLoadBalancerDeleted(context.Background(), vals.ClusterName, apiService)
 	assert.NoError(t, err)
 	assertInternalLbResourcesDeleted(t, gce, apiService, vals, true)
+}
+
+func TestBasePath(t *testing.T) {
+	t.Parallel()
+	vals := DefaultTestClusterValues()
+	gce, err := fakeGCECloud(vals)
+	// Loadbalancer controller code expects basepath to contain the projects string.
+	expectBasePath := "https://compute.googleapis.com/compute/v1/projects/"
+	// See https://github.com/kubernetes/kubernetes/issues/102757, the endpoint can have mtls in some cases.
+	expectMtlsBasePath := "https://compute.mtls.googleapis.com/compute/v1/projects/"
+	require.NoError(t, err)
+	if gce.service.BasePath != expectBasePath && gce.service.BasePath != expectMtlsBasePath {
+		t.Errorf("Compute basePath has changed. Got %q, want %q or %q", gce.service.BasePath, expectBasePath, expectMtlsBasePath)
+	}
 }

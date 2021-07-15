@@ -33,8 +33,19 @@ import (
 	"k8s.io/apiserver/pkg/admission/plugin/webhook/generic"
 	webhookrequest "k8s.io/apiserver/pkg/admission/plugin/webhook/request"
 	webhookutil "k8s.io/apiserver/pkg/util/webhook"
-	"k8s.io/klog"
+	"k8s.io/apiserver/pkg/warning"
+	"k8s.io/klog/v2"
 	utiltrace "k8s.io/utils/trace"
+)
+
+const (
+	// ValidatingAuditAnnotationPrefix is a prefix for keeping noteworthy
+	// validating audit annotations.
+	ValidatingAuditAnnotationPrefix = "validating.webhook.admission.k8s.io/"
+	// ValidatingAuditAnnotationFailedOpenKeyPrefix in an annotation indicates
+	// the validating webhook failed open when the webhook backend connection
+	// failed or returned an internal server error.
+	ValidatingAuditAnnotationFailedOpenKeyPrefix = "failed-open." + ValidatingAuditAnnotationPrefix
 )
 
 type validatingDispatcher struct {
@@ -91,7 +102,7 @@ func (d *validatingDispatcher) Dispatch(ctx context.Context, attr admission.Attr
 	errCh := make(chan error, len(relevantHooks))
 	wg.Add(len(relevantHooks))
 	for i := range relevantHooks {
-		go func(invocation *generic.WebhookInvocation) {
+		go func(invocation *generic.WebhookInvocation, idx int) {
 			defer wg.Done()
 			hook, ok := invocation.Webhook.GetValidatingWebhook()
 			if !ok {
@@ -108,17 +119,17 @@ func (d *validatingDispatcher) Dispatch(ctx context.Context, attr admission.Attr
 				case *webhookutil.ErrCallingWebhook:
 					if !ignoreClientCallFailures {
 						rejected = true
-						admissionmetrics.Metrics.ObserveWebhookRejection(hook.Name, "validating", string(versionedAttr.Attributes.GetOperation()), admissionmetrics.WebhookRejectionCallingWebhookError, 0)
+						admissionmetrics.Metrics.ObserveWebhookRejection(ctx, hook.Name, "validating", versionedAttr.Attributes, admissionmetrics.WebhookRejectionCallingWebhookError, 0)
 					}
 				case *webhookutil.ErrWebhookRejection:
 					rejected = true
-					admissionmetrics.Metrics.ObserveWebhookRejection(hook.Name, "validating", string(versionedAttr.Attributes.GetOperation()), admissionmetrics.WebhookRejectionNoError, int(err.Status.ErrStatus.Code))
+					admissionmetrics.Metrics.ObserveWebhookRejection(ctx, hook.Name, "validating", versionedAttr.Attributes, admissionmetrics.WebhookRejectionNoError, int(err.Status.ErrStatus.Code))
 				default:
 					rejected = true
-					admissionmetrics.Metrics.ObserveWebhookRejection(hook.Name, "validating", string(versionedAttr.Attributes.GetOperation()), admissionmetrics.WebhookRejectionAPIServerInternalError, 0)
+					admissionmetrics.Metrics.ObserveWebhookRejection(ctx, hook.Name, "validating", versionedAttr.Attributes, admissionmetrics.WebhookRejectionAPIServerInternalError, 0)
 				}
 			}
-			admissionmetrics.Metrics.ObserveWebhook(time.Since(t), rejected, versionedAttr.Attributes, "validating", hook.Name)
+			admissionmetrics.Metrics.ObserveWebhook(ctx, time.Since(t), rejected, versionedAttr.Attributes, "validating", hook.Name)
 			if err == nil {
 				return
 			}
@@ -126,6 +137,12 @@ func (d *validatingDispatcher) Dispatch(ctx context.Context, attr admission.Attr
 			if callErr, ok := err.(*webhookutil.ErrCallingWebhook); ok {
 				if ignoreClientCallFailures {
 					klog.Warningf("Failed calling webhook, failing open %v: %v", hook.Name, callErr)
+
+					key := fmt.Sprintf("%sround_0_index_%d", ValidatingAuditAnnotationFailedOpenKeyPrefix, idx)
+					value := hook.Name
+					if err := versionedAttr.Attributes.AddAnnotation(key, value); err != nil {
+						klog.Warningf("Failed to set admission audit annotation %s to %s for validating webhook %s: %v", key, value, hook.Name, err)
+					}
 					utilruntime.HandleError(callErr)
 					return
 				}
@@ -140,7 +157,7 @@ func (d *validatingDispatcher) Dispatch(ctx context.Context, attr admission.Attr
 			}
 			klog.Warningf("rejected by webhook %q: %#v", hook.Name, err)
 			errCh <- err
-		}(relevantHooks[i])
+		}(relevantHooks[i], i)
 	}
 	wg.Wait()
 	close(errCh)
@@ -226,6 +243,9 @@ func (d *validatingDispatcher) callHook(ctx context.Context, h *v1.ValidatingWeb
 		if err := attr.Attributes.AddAnnotation(key, v); err != nil {
 			klog.Warningf("Failed to set admission audit annotation %s to %s for validating webhook %s: %v", key, v, h.Name, err)
 		}
+	}
+	for _, w := range result.Warnings {
+		warning.AddWarning(ctx, "", w)
 	}
 	if result.Allowed {
 		return nil

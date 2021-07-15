@@ -23,18 +23,9 @@ import (
 	"strings"
 	"text/template"
 
-	"github.com/lithammer/dedent"
-	"github.com/pkg/errors"
-	"github.com/spf13/cobra"
-	flag "github.com/spf13/pflag"
-	"k8s.io/apimachinery/pkg/util/sets"
-	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
-	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
-	"k8s.io/klog"
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmscheme "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/scheme"
-	kubeadmapiv1beta2 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta2"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
 	"k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/validation"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	phases "k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/join"
@@ -44,6 +35,17 @@ import (
 	"k8s.io/kubernetes/cmd/kubeadm/app/discovery"
 	configutil "k8s.io/kubernetes/cmd/kubeadm/app/util/config"
 	kubeconfigutil "k8s.io/kubernetes/cmd/kubeadm/app/util/kubeconfig"
+
+	"k8s.io/apimachinery/pkg/util/sets"
+	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	"k8s.io/klog/v2"
+
+	"github.com/lithammer/dedent"
+	"github.com/pkg/errors"
+	"github.com/spf13/cobra"
+	flag "github.com/spf13/pflag"
 )
 
 var (
@@ -124,12 +126,12 @@ var (
 // supported by this api will be exposed as a flag.
 type joinOptions struct {
 	cfgPath               string
-	token                 string
+	token                 string `datapolicy:"token"`
 	controlPlane          bool
 	ignorePreflightErrors []string
-	externalcfg           *kubeadmapiv1beta2.JoinConfiguration
-	joinControlPlane      *kubeadmapiv1beta2.JoinControlPlane
-	kustomizeDir          string
+	externalcfg           *kubeadmapiv1.JoinConfiguration
+	joinControlPlane      *kubeadmapiv1.JoinControlPlane
+	patchesDir            string
 }
 
 // compile-time assert that the local data object satisfies the phases data interface.
@@ -144,13 +146,13 @@ type joinData struct {
 	clientSet             *clientset.Clientset
 	ignorePreflightErrors sets.String
 	outputWriter          io.Writer
-	kustomizeDir          string
+	patchesDir            string
 }
 
-// NewCmdJoin returns "kubeadm join" command.
+// newCmdJoin returns "kubeadm join" command.
 // NB. joinOptions is exposed as parameter for allowing unit testing of
 //     the newJoinData method, that implements all the command options validation logic
-func NewCmdJoin(out io.Writer, joinOptions *joinOptions) *cobra.Command {
+func newCmdJoin(out io.Writer, joinOptions *joinOptions) *cobra.Command {
 	if joinOptions == nil {
 		joinOptions = newJoinOptions()
 	}
@@ -213,7 +215,15 @@ func NewCmdJoin(out io.Writer, joinOptions *joinOptions) *cobra.Command {
 	// sets the data builder function, that will be used by the runner
 	// both when running the entire workflow or single phases
 	joinRunner.SetDataInitializer(func(cmd *cobra.Command, args []string) (workflow.RunData, error) {
-		return newJoinData(cmd, args, joinOptions, out, kubeadmconstants.GetAdminKubeConfigPath())
+		data, err := newJoinData(cmd, args, joinOptions, out, kubeadmconstants.GetAdminKubeConfigPath())
+		if err != nil {
+			return nil, err
+		}
+		// If the flag for skipping phases was empty, use the values from config
+		if len(joinRunner.Options.SkipPhases) == 0 {
+			joinRunner.Options.SkipPhases = data.cfg.SkipPhases
+		}
+		return data, nil
 	})
 
 	// binds the Runner to kubeadm join command by altering
@@ -224,7 +234,7 @@ func NewCmdJoin(out io.Writer, joinOptions *joinOptions) *cobra.Command {
 }
 
 // addJoinConfigFlags adds join flags bound to the config to the specified flagset
-func addJoinConfigFlags(flagSet *flag.FlagSet, cfg *kubeadmapiv1beta2.JoinConfiguration, jcp *kubeadmapiv1beta2.JoinControlPlane) {
+func addJoinConfigFlags(flagSet *flag.FlagSet, cfg *kubeadmapiv1.JoinConfiguration, jcp *kubeadmapiv1.JoinControlPlane) {
 	flagSet.StringVar(
 		&cfg.NodeRegistration.Name, options.NodeName, cfg.NodeRegistration.Name,
 		`Specify the node name.`,
@@ -285,26 +295,26 @@ func addJoinOtherFlags(flagSet *flag.FlagSet, joinOptions *joinOptions) {
 		&joinOptions.controlPlane, options.ControlPlane, joinOptions.controlPlane,
 		"Create a new control plane instance on this node",
 	)
-	options.AddKustomizePodsFlag(flagSet, &joinOptions.kustomizeDir)
+	options.AddPatchesFlag(flagSet, &joinOptions.patchesDir)
 }
 
 // newJoinOptions returns a struct ready for being used for creating cmd join flags.
 func newJoinOptions() *joinOptions {
 	// initialize the public kubeadm config API by applying defaults
-	externalcfg := &kubeadmapiv1beta2.JoinConfiguration{}
+	externalcfg := &kubeadmapiv1.JoinConfiguration{}
 
 	// Add optional config objects to host flags.
 	// un-set objects will be cleaned up afterwards (into newJoinData func)
-	externalcfg.Discovery.File = &kubeadmapiv1beta2.FileDiscovery{}
-	externalcfg.Discovery.BootstrapToken = &kubeadmapiv1beta2.BootstrapTokenDiscovery{}
-	externalcfg.ControlPlane = &kubeadmapiv1beta2.JoinControlPlane{}
+	externalcfg.Discovery.File = &kubeadmapiv1.FileDiscovery{}
+	externalcfg.Discovery.BootstrapToken = &kubeadmapiv1.BootstrapTokenDiscovery{}
+	externalcfg.ControlPlane = &kubeadmapiv1.JoinControlPlane{}
 
 	// This object is used for storage of control-plane flags.
-	joinControlPlane := &kubeadmapiv1beta2.JoinControlPlane{}
+	joinControlPlane := &kubeadmapiv1.JoinControlPlane{}
 
 	// Apply defaults
 	kubeadmscheme.Scheme.Default(externalcfg)
-	kubeadmapiv1beta2.SetDefaults_JoinControlPlane(joinControlPlane)
+	kubeadmapiv1.SetDefaults_JoinControlPlane(joinControlPlane)
 
 	return &joinOptions{
 		externalcfg:      externalcfg,
@@ -360,8 +370,8 @@ func newJoinData(cmd *cobra.Command, args []string, opt *joinOptions, out io.Wri
 	if !opt.controlPlane {
 		// Use a defaulted JoinControlPlane object to detect if the user has passed
 		// other control-plane related flags.
-		defaultJCP := &kubeadmapiv1beta2.JoinControlPlane{}
-		kubeadmapiv1beta2.SetDefaults_JoinControlPlane(defaultJCP)
+		defaultJCP := &kubeadmapiv1.JoinControlPlane{}
+		kubeadmapiv1.SetDefaults_JoinControlPlane(defaultJCP)
 
 		// This list must match the JCP flags in addJoinConfigFlags()
 		joinControlPlaneFlags := []string{
@@ -405,7 +415,7 @@ func newJoinData(cmd *cobra.Command, args []string, opt *joinOptions, out io.Wri
 			return nil, errors.Errorf("File %s does not exists. Please use 'kubeadm join phase control-plane-prepare' subcommands to generate it.", adminKubeConfigPath)
 		}
 		klog.V(1).Infof("[preflight] found discovery flags missing for this command. using FileDiscovery: %s", adminKubeConfigPath)
-		opt.externalcfg.Discovery.File = &kubeadmapiv1beta2.FileDiscovery{KubeConfigPath: adminKubeConfigPath}
+		opt.externalcfg.Discovery.File = &kubeadmapiv1.FileDiscovery{KubeConfigPath: adminKubeConfigPath}
 		opt.externalcfg.Discovery.BootstrapToken = nil //NB. this could be removed when we get better control on args (e.g. phases without discovery should have NoArgs )
 	}
 
@@ -440,7 +450,7 @@ func newJoinData(cmd *cobra.Command, args []string, opt *joinOptions, out io.Wri
 		tlsBootstrapCfg:       tlsBootstrapCfg,
 		ignorePreflightErrors: ignorePreflightErrorsSet,
 		outputWriter:          out,
-		kustomizeDir:          opt.kustomizeDir,
+		patchesDir:            opt.patchesDir,
 	}, nil
 }
 
@@ -506,9 +516,16 @@ func (j *joinData) OutputWriter() io.Writer {
 	return j.outputWriter
 }
 
-// KustomizeDir returns the folder where kustomize patches for static pod manifest are stored
-func (j *joinData) KustomizeDir() string {
-	return j.kustomizeDir
+// PatchesDir returns the folder where patches for components are stored
+func (j *joinData) PatchesDir() string {
+	// If provided, make the flag value override the one in config.
+	if len(j.patchesDir) > 0 {
+		return j.patchesDir
+	}
+	if j.cfg.Patches != nil {
+		return j.cfg.Patches.Directory
+	}
+	return ""
 }
 
 // fetchInitConfigurationFromJoinConfiguration retrieves the init configuration from a join configuration, performing the discovery
@@ -545,7 +562,7 @@ func fetchInitConfiguration(tlsBootstrapCfg *clientcmdapi.Config) (*kubeadmapi.I
 	}
 
 	// Fetches the init configuration
-	initConfiguration, err := configutil.FetchInitConfigurationFromCluster(tlsClient, os.Stdout, "preflight", true)
+	initConfiguration, err := configutil.FetchInitConfigurationFromCluster(tlsClient, os.Stdout, "preflight", true, false)
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to fetch the kubeadm-config ConfigMap")
 	}

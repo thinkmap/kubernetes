@@ -20,7 +20,7 @@ import (
 	"fmt"
 
 	"github.com/pkg/errors"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	// ensure the core apis are installed
 	_ "k8s.io/kubernetes/pkg/apis/core/install"
@@ -115,7 +115,7 @@ func DecodeKubeletConfiguration(kubeletCodecs *serializer.CodecFactory, data []b
 			return nil, fmt.Errorf("failed lenient decoding: %v", err)
 		}
 		// Continue with the v1beta1 object that was decoded leniently, but emit a warning.
-		klog.Warningf("using lenient decoding as strict decoding failed: %v", err)
+		klog.InfoS("Using lenient decoding as strict decoding failed", "err", err)
 	}
 
 	internalKC, ok := obj.(*kubeletconfig.KubeletConfiguration)

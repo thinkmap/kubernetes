@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -38,6 +39,7 @@ const (
 
 type kubeAPIServerEnv struct {
 	KubeHome                     string
+	KubeAPIServerRunAsUser       string
 	EncryptionProviderConfigPath string
 	EncryptionProviderConfig     string
 	CloudKMSIntegration          bool
@@ -45,11 +47,6 @@ type kubeAPIServerEnv struct {
 
 func TestEncryptionProviderFlag(t *testing.T) {
 	var (
-		//	command": [
-		//   "/bin/sh", - Index 0
-		//   "-c",      - Index 1
-		//   "exec /usr/local/bin/kube-apiserver " - Index 2
-		execArgsIndex        = 2
 		encryptionConfigFlag = "--encryption-provider-config"
 	)
 
@@ -77,19 +74,20 @@ func TestEncryptionProviderFlag(t *testing.T) {
 
 			e := kubeAPIServerEnv{
 				KubeHome:                     c.kubeHome,
+				KubeAPIServerRunAsUser:       strconv.Itoa(os.Getuid()),
 				EncryptionProviderConfigPath: filepath.Join(c.kubeHome, "encryption-provider-config.yaml"),
 				EncryptionProviderConfig:     tc.encryptionProviderConfig,
 			}
 
 			c.mustInvokeFunc(
 				e,
-				kubeAPIServerConfigScriptName,
+				[]string{"configure-helper.sh", kubeAPIServerConfigScriptName},
 				"kms.template",
 				"testdata/kube-apiserver/base.template",
 				"testdata/kube-apiserver/kms.template")
 			c.mustLoadPodFromManifest()
 
-			execArgs := c.pod.Spec.Containers[0].Command[execArgsIndex]
+			execArgs := strings.Join(c.pod.Spec.Containers[0].Command, " ")
 			flagIsInArg := strings.Contains(execArgs, encryptionConfigFlag)
 			flag := fmt.Sprintf("%s=%s", encryptionConfigFlag, e.EncryptionProviderConfigPath)
 
@@ -112,13 +110,14 @@ func TestEncryptionProviderConfig(t *testing.T) {
 	p := filepath.Join(c.kubeHome, "encryption-provider-config.yaml")
 	e := kubeAPIServerEnv{
 		KubeHome:                     c.kubeHome,
+		KubeAPIServerRunAsUser:       strconv.Itoa(os.Getuid()),
 		EncryptionProviderConfigPath: p,
 		EncryptionProviderConfig:     base64.StdEncoding.EncodeToString([]byte("foo")),
 	}
 
 	c.mustInvokeFunc(
 		e,
-		kubeAPIServerConfigScriptName,
+		[]string{"configure-helper.sh", kubeAPIServerConfigScriptName},
 		"kms.template",
 
 		"testdata/kube-apiserver/base.template",
@@ -182,6 +181,7 @@ func TestKMSIntegration(t *testing.T) {
 
 			var e = kubeAPIServerEnv{
 				KubeHome:                     c.kubeHome,
+				KubeAPIServerRunAsUser:       strconv.Itoa(os.Getuid()),
 				EncryptionProviderConfigPath: filepath.Join(c.kubeHome, "encryption-provider-config.yaml"),
 				EncryptionProviderConfig:     base64.StdEncoding.EncodeToString([]byte("foo")),
 				CloudKMSIntegration:          tc.cloudKMSIntegration,
@@ -189,7 +189,7 @@ func TestKMSIntegration(t *testing.T) {
 
 			c.mustInvokeFunc(
 				e,
-				kubeAPIServerConfigScriptName,
+				[]string{"configure-helper.sh", kubeAPIServerConfigScriptName},
 				"kms.template",
 
 				"testdata/kube-apiserver/base.template",

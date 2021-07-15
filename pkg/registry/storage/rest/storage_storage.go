@@ -24,12 +24,11 @@ import (
 	"k8s.io/apiserver/pkg/registry/rest"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	serverstorage "k8s.io/apiserver/pkg/server/storage"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	storageapi "k8s.io/kubernetes/pkg/apis/storage"
-	"k8s.io/kubernetes/pkg/features"
 	csidriverstore "k8s.io/kubernetes/pkg/registry/storage/csidriver/storage"
 	csinodestore "k8s.io/kubernetes/pkg/registry/storage/csinode/storage"
+	csistoragecapacitystore "k8s.io/kubernetes/pkg/registry/storage/csistoragecapacity/storage"
 	storageclassstore "k8s.io/kubernetes/pkg/registry/storage/storageclass/storage"
 	volumeattachmentstore "k8s.io/kubernetes/pkg/registry/storage/volumeattachment/storage"
 )
@@ -76,6 +75,13 @@ func (p RESTStorageProvider) v1alpha1Storage(apiResourceConfigSource serverstora
 	}
 	storage["volumeattachments"] = volumeAttachmentStorage.VolumeAttachment
 
+	// register csistoragecapacities
+	csiStorageStorage, err := csistoragecapacitystore.NewStorage(restOptionsGetter)
+	if err != nil {
+		return storage, err
+	}
+	storage["csistoragecapacities"] = csiStorageStorage.CSIStorageCapacity
+
 	return storage, nil
 }
 
@@ -95,14 +101,12 @@ func (p RESTStorageProvider) v1beta1Storage(apiResourceConfigSource serverstorag
 	}
 	storage["volumeattachments"] = volumeAttachmentStorage.VolumeAttachment
 
-	// register csinodes if CSINodeInfo feature gate is enabled
-	if utilfeature.DefaultFeatureGate.Enabled(features.CSINodeInfo) {
-		csiNodeStorage, err := csinodestore.NewStorage(restOptionsGetter)
-		if err != nil {
-			return storage, err
-		}
-		storage["csinodes"] = csiNodeStorage.CSINode
+	// register csinodes
+	csiNodeStorage, err := csinodestore.NewStorage(restOptionsGetter)
+	if err != nil {
+		return storage, err
 	}
+	storage["csinodes"] = csiNodeStorage.CSINode
 
 	// register csidrivers
 	csiDriverStorage, err := csidriverstore.NewStorage(restOptionsGetter)
@@ -110,6 +114,13 @@ func (p RESTStorageProvider) v1beta1Storage(apiResourceConfigSource serverstorag
 		return storage, err
 	}
 	storage["csidrivers"] = csiDriverStorage.CSIDriver
+
+	// register csistoragecapacities
+	csiStorageStorage, err := csistoragecapacitystore.NewStorage(restOptionsGetter)
+	if err != nil {
+		return storage, err
+	}
+	storage["csistoragecapacities"] = csiStorageStorage.CSIStorageCapacity
 
 	return storage, nil
 }
@@ -133,14 +144,12 @@ func (p RESTStorageProvider) v1Storage(apiResourceConfigSource serverstorage.API
 		"volumeattachments/status": volumeAttachmentStorage.Status,
 	}
 
-	// register csinodes if CSINodeInfo feature gate is enabled
-	if utilfeature.DefaultFeatureGate.Enabled(features.CSINodeInfo) {
-		csiNodeStorage, err := csinodestore.NewStorage(restOptionsGetter)
-		if err != nil {
-			return nil, err
-		}
-		storage["csinodes"] = csiNodeStorage.CSINode
+	// register csinodes
+	csiNodeStorage, err := csinodestore.NewStorage(restOptionsGetter)
+	if err != nil {
+		return nil, err
 	}
+	storage["csinodes"] = csiNodeStorage.CSINode
 
 	// register csidrivers
 	csiDriverStorage, err := csidriverstore.NewStorage(restOptionsGetter)

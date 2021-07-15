@@ -24,7 +24,7 @@ import (
 	"fmt"
 	"strings"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -75,6 +75,9 @@ const (
 
 	kubeNodePortLocalSetSCTPComment = "Kubernetes nodeport SCTP port with externalTrafficPolicy=local with type 'hash ip:port'"
 	kubeNodePortLocalSetSCTP        = "KUBE-NODE-PORT-LOCAL-SCTP-HASH"
+
+	kubeHealthCheckNodePortSetComment = "Kubernetes health check node port"
+	kubeHealthCheckNodePortSet        = "KUBE-HEALTH-CHECK-NODE-PORT"
 )
 
 // IPSetVersioner can query the current ipset version.

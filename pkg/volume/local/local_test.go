@@ -33,7 +33,7 @@ import (
 	"k8s.io/kubernetes/pkg/volume"
 	volumetest "k8s.io/kubernetes/pkg/volume/testing"
 	"k8s.io/kubernetes/pkg/volume/util/hostutil"
-	"k8s.io/utils/mount"
+	"k8s.io/mount-utils"
 )
 
 const (
@@ -51,7 +51,7 @@ func getPlugin(t *testing.T) (string, volume.VolumePlugin) {
 	}
 
 	plugMgr := volume.VolumePluginMgr{}
-	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeVolumeHost(t, tmpDir, nil, nil))
+	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeKubeletVolumeHost(t, tmpDir, nil, nil))
 
 	plug, err := plugMgr.FindPluginByName(localVolumePluginName)
 	if err != nil {
@@ -71,7 +71,7 @@ func getBlockPlugin(t *testing.T) (string, volume.BlockVolumePlugin) {
 	}
 
 	plugMgr := volume.VolumePluginMgr{}
-	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeVolumeHost(t, tmpDir, nil, nil))
+	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeKubeletVolumeHost(t, tmpDir, nil, nil))
 	plug, err := plugMgr.FindMapperPluginByName(localVolumePluginName)
 	if err != nil {
 		os.RemoveAll(tmpDir)
@@ -90,7 +90,7 @@ func getPersistentPlugin(t *testing.T) (string, volume.PersistentVolumePlugin) {
 	}
 
 	plugMgr := volume.VolumePluginMgr{}
-	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeVolumeHost(t, tmpDir, nil, nil))
+	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeKubeletVolumeHost(t, tmpDir, nil, nil))
 
 	plug, err := plugMgr.FindPersistentPluginByName(localVolumePluginName)
 	if err != nil {
@@ -117,7 +117,7 @@ func getDeviceMountablePluginWithBlockPath(t *testing.T, isBlockDevice bool) (st
 		}
 	}
 
-	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeVolumeHostWithMounterFSType(t, tmpDir, nil, nil, pathToFSType))
+	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeKubeletVolumeHostWithMounterFSType(t, tmpDir, nil, nil, pathToFSType))
 
 	plug, err := plugMgr.FindDeviceMountablePluginByName(localVolumePluginName)
 	if err != nil {
@@ -231,7 +231,7 @@ func TestBlockDeviceGlobalPathAndMountDevice(t *testing.T) {
 
 	fmt.Println("expected global path is:", expectedGlobalPath)
 
-	err = dm.MountDevice(pvSpec, tmpBlockDir, expectedGlobalPath)
+	err = dm.MountDevice(pvSpec, tmpBlockDir, expectedGlobalPath, volume.DeviceMounterArgs{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +276,7 @@ func TestFSGlobalPathAndMountDevice(t *testing.T) {
 	}
 
 	// Actually, we will do nothing if the local path is FS type
-	err = dm.MountDevice(pvSpec, tmpFSDir, expectedGlobalPath)
+	err = dm.MountDevice(pvSpec, tmpFSDir, expectedGlobalPath, volume.DeviceMounterArgs{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -375,7 +375,7 @@ func TestMapUnmap(t *testing.T) {
 	var devPath string
 
 	if customMapper, ok := mapper.(volume.CustomBlockVolumeMapper); ok {
-		err = customMapper.SetUpDevice()
+		_, err = customMapper.SetUpDevice()
 		if err != nil {
 			t.Errorf("Failed to SetUpDevice, err: %v", err)
 		}
@@ -418,13 +418,13 @@ func testFSGroupMount(plug volume.VolumePlugin, pod *v1.Pod, tmpDir string, fsGr
 		return err
 	}
 	if mounter == nil {
-		return fmt.Errorf("Got a nil Mounter")
+		return fmt.Errorf("got a nil Mounter")
 	}
 
 	volPath := filepath.Join(tmpDir, testMountPath)
 	path := mounter.GetPath()
 	if path != volPath {
-		return fmt.Errorf("Got unexpected path: %s", path)
+		return fmt.Errorf("got unexpected path: %s", path)
 	}
 
 	var mounterArgs volume.MounterArgs
@@ -475,7 +475,7 @@ func TestConstructVolumeSpec(t *testing.T) {
 			}
 			defer os.RemoveAll(tmpDir)
 			plug := &localVolumePlugin{
-				host: volumetest.NewFakeVolumeHost(t, tmpDir, nil, nil),
+				host: volumetest.NewFakeKubeletVolumeHost(t, tmpDir, nil, nil),
 			}
 			mounter := plug.host.GetMounter(plug.GetPluginName())
 			fakeMountPoints := []mount.MountPoint{}
@@ -635,7 +635,7 @@ func TestUnsupportedPlugins(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	plugMgr := volume.VolumePluginMgr{}
-	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeVolumeHost(t, tmpDir, nil, nil))
+	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeKubeletVolumeHost(t, tmpDir, nil, nil))
 	spec := getTestVolume(false, tmpDir, false, nil)
 
 	recyclePlug, err := plugMgr.FindRecyclablePluginBySpec(spec)
@@ -678,7 +678,7 @@ func TestFilterPodMounts(t *testing.T) {
 		t.Fatal("mounter is not localVolumeMounter")
 	}
 
-	host := volumetest.NewFakeVolumeHost(t, tmpDir, nil, nil)
+	host := volumetest.NewFakeKubeletVolumeHost(t, tmpDir, nil, nil)
 	podsDir := host.GetPodsDir()
 
 	cases := map[string]struct {

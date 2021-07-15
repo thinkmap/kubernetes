@@ -30,7 +30,7 @@ import (
 	imageutils "k8s.io/kubernetes/test/utils/image"
 
 	"github.com/onsi/ginkgo"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 // getResourceList returns a ResourceList with the
@@ -163,7 +163,7 @@ func makePodToVerifyCgroupRemoved(baseName string) *v1.Pod {
 	return pod
 }
 
-var _ = framework.KubeDescribe("Kubelet Cgroup Manager", func() {
+var _ = SIGDescribe("Kubelet Cgroup Manager", func() {
 	f := framework.NewDefaultFramework("kubelet-cgroup-manager")
 	ginkgo.Describe("QOS containers", func() {
 		ginkgo.Context("On enabling QOS cgroup hierarchy", func() {

@@ -31,11 +31,18 @@ E2E_GO_RUNNER_BIN?=$(shell test -f $(LOCAL_OUTPUT_PATH)/go-runner && echo $(LOCA
 
 CLUSTER_DIR?=$(shell pwd)/../../../cluster/
 
-BASEIMAGE=debian:stretch-slim
-TEMP_DIR:=$(shell mktemp -d -t conformanceXXXXXX)
+# This is defined in root Makefile, but some build contexts do not refer to them
+KUBE_BASE_IMAGE_REGISTRY?=k8s.gcr.io
 
-#output format for docker buildx build [push, load]
-OUTPUT=--load
+ifeq ($(ARCH),amd64)
+    BASEIMAGE?=${KUBE_BASE_IMAGE_REGISTRY}/build-image/debian-base:v2.1.3
+else
+    BASEIMAGE?=${KUBE_BASE_IMAGE_REGISTRY}/build-image/debian-base-${ARCH}:v2.1.3
+endif
+
+RUNNERIMAGE?=gcr.io/distroless/base:latest
+
+TEMP_DIR:=$(shell mktemp -d -t conformance-XXXXXX)
 
 all: build
 
@@ -57,16 +64,22 @@ endif
 	chmod a+rx ${TEMP_DIR}/e2e.test
 	chmod a+rx ${TEMP_DIR}/gorunner
 
-	cd ${TEMP_DIR} && sed -i.back "s|BASEIMAGE|${BASEIMAGE}|g" Dockerfile
-
-	DOCKER_CLI_EXPERIMENTAL=enabled docker buildx build --pull --platform linux/$(ARCH) $(OUTPUT) -t ${REGISTRY}/conformance-${ARCH}:${VERSION} ${TEMP_DIR}
-ifeq ($(ARCH),amd64)
-	docker rmi ${REGISTRY}/conformance:${VERSION} 2>/dev/null || true
-	DOCKER_CLI_EXPERIMENTAL=enabled docker buildx build --pull --platform linux/$(ARCH) $(OUTPUT) -t ${REGISTRY}/conformance:${VERSION} ${TEMP_DIR}
-endif
+	DOCKER_CLI_EXPERIMENTAL=enabled docker buildx build \
+		--platform linux/${ARCH} \
+		--load \
+		--pull \
+		-t ${REGISTRY}/conformance-${ARCH}:${VERSION} \
+		--build-arg BASEIMAGE=$(BASEIMAGE) \
+		--build-arg RUNNERIMAGE=$(RUNNERIMAGE) \
+		${TEMP_DIR}
 	rm -rf "${TEMP_DIR}"
 
-push: OUTPUT=--push
 push: build
+	docker push ${REGISTRY}/conformance-${ARCH}:${VERSION}
+ifeq ($(ARCH),amd64)
+	docker rmi ${REGISTRY}/conformance:${VERSION} 2>/dev/null || true
+	docker tag ${REGISTRY}/conformance-${ARCH}:${VERSION} ${REGISTRY}/conformance:${VERSION}
+	docker push ${REGISTRY}/conformance:${VERSION}
+endif
 
 .PHONY: build push all

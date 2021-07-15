@@ -22,19 +22,23 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
+	"k8s.io/kubernetes/pkg/scheduler/apis/config"
+	"k8s.io/kubernetes/pkg/scheduler/apis/config/validation"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 )
 
 // LeastAllocated is a score plugin that favors nodes with fewer allocation requested resources based on requested resources.
 type LeastAllocated struct {
-	handle framework.FrameworkHandle
+	handle framework.Handle
 	resourceAllocationScorer
 }
 
 var _ = framework.ScorePlugin(&LeastAllocated{})
 
 // LeastAllocatedName is the name of the plugin used in the plugin registry and configurations.
-const LeastAllocatedName = "NodeResourcesLeastAllocated"
+const LeastAllocatedName = names.NodeResourcesLeastAllocated
 
 // Name returns name of the plugin. It is used in logs, etc.
 func (la *LeastAllocated) Name() string {
@@ -45,7 +49,7 @@ func (la *LeastAllocated) Name() string {
 func (la *LeastAllocated) Score(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
 	nodeInfo, err := la.handle.SnapshotSharedLister().NodeInfos().Get(nodeName)
 	if err != nil {
-		return 0, framework.NewStatus(framework.Error, fmt.Sprintf("getting node %q from Snapshot: %v", nodeName, err))
+		return 0, framework.AsStatus(fmt.Errorf("getting node %q from Snapshot: %w", nodeName, err))
 	}
 
 	// la.score favors nodes with fewer requested resources.
@@ -63,25 +67,45 @@ func (la *LeastAllocated) ScoreExtensions() framework.ScoreExtensions {
 }
 
 // NewLeastAllocated initializes a new plugin and returns it.
-func NewLeastAllocated(_ runtime.Object, h framework.FrameworkHandle) (framework.Plugin, error) {
+func NewLeastAllocated(laArgs runtime.Object, h framework.Handle, fts feature.Features) (framework.Plugin, error) {
+	args, ok := laArgs.(*config.NodeResourcesLeastAllocatedArgs)
+	if !ok {
+		return nil, fmt.Errorf("want args to be of type NodeResourcesLeastAllocatedArgs, got %T", laArgs)
+	}
+	if err := validation.ValidateNodeResourcesLeastAllocatedArgs(nil, args); err != nil {
+		return nil, err
+	}
+
+	resToWeightMap := make(resourceToWeightMap)
+	for _, resource := range (*args).Resources {
+		resToWeightMap[v1.ResourceName(resource.Name)] = resource.Weight
+	}
+
 	return &LeastAllocated{
 		handle: h,
 		resourceAllocationScorer: resourceAllocationScorer{
-			LeastAllocatedName,
-			leastResourceScorer,
-			defaultRequestedRatioResources,
+			Name:                LeastAllocatedName,
+			scorer:              leastResourceScorer(resToWeightMap),
+			resourceToWeightMap: resToWeightMap,
+			enablePodOverhead:   fts.EnablePodOverhead,
 		},
 	}, nil
 }
 
-func leastResourceScorer(requested, allocable resourceToValueMap, includeVolumes bool, requestedVolumes int, allocatableVolumes int) int64 {
-	var nodeScore, weightSum int64
-	for resource, weight := range defaultRequestedRatioResources {
-		resourceScore := leastRequestedScore(requested[resource], allocable[resource])
-		nodeScore += resourceScore * weight
-		weightSum += weight
+func leastResourceScorer(resToWeightMap resourceToWeightMap) func(resourceToValueMap, resourceToValueMap) int64 {
+	return func(requested, allocable resourceToValueMap) int64 {
+		var nodeScore, weightSum int64
+		for resource := range requested {
+			weight := resToWeightMap[resource]
+			resourceScore := leastRequestedScore(requested[resource], allocable[resource])
+			nodeScore += resourceScore * weight
+			weightSum += weight
+		}
+		if weightSum == 0 {
+			return 0
+		}
+		return nodeScore / weightSum
 	}
-	return nodeScore / weightSum
 }
 
 // The unused capacity is calculated on a scale of 0-MaxNodeScore

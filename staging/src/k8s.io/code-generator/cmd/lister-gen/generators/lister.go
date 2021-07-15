@@ -30,7 +30,7 @@ import (
 	"k8s.io/code-generator/cmd/client-gen/generators/util"
 	clientgentypes "k8s.io/code-generator/cmd/client-gen/types"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 // NameSystems returns the name system used by the generators in this package.
@@ -162,7 +162,7 @@ func Packages(context *generator.Context, arguments *args.GeneratorArgs) generat
 func objectMetaForPackage(p *types.Package) (*types.Type, bool, error) {
 	generatingForPackage := false
 	for _, t := range p.Types {
-		// filter out types which dont have genclient.
+		// filter out types which don't have genclient.
 		if !util.MustParseClientGenTags(append(t.SecondClosestCommentLines, t.CommentLines...)).GenerateClient {
 			continue
 		}

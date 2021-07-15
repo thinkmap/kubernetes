@@ -19,11 +19,6 @@ package phases
 import (
 	"fmt"
 
-	"github.com/pkg/errors"
-	"github.com/spf13/cobra"
-
-	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/klog"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	cmdutil "k8s.io/kubernetes/cmd/kubeadm/app/cmd/util"
@@ -33,6 +28,12 @@ import (
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/copycerts"
 	kubeconfigphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/kubeconfig"
 	kubeconfigutil "k8s.io/kubernetes/cmd/kubeadm/app/util/kubeconfig"
+
+	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
+
+	"github.com/pkg/errors"
+	"github.com/spf13/cobra"
 )
 
 var controlPlanePrepareExample = cmdutil.Examples(`
@@ -78,7 +79,9 @@ func getControlPlanePreparePhaseFlags(name string) []string {
 			options.TLSBootstrapToken,
 			options.TokenStr,
 			options.CertificateKey,
-			options.Kustomize,
+			options.Patches,
+			// TODO: https://github.com/kubernetes/kubeadm/issues/2046 remove in 1.23
+			options.ExperimentalPatches,
 		}
 	case "download-certs":
 		flags = []string{
@@ -123,7 +126,9 @@ func getControlPlanePreparePhaseFlags(name string) []string {
 			options.APIServerBindPort,
 			options.CfgPath,
 			options.ControlPlane,
-			options.Kustomize,
+			options.Patches,
+			// TODO: https://github.com/kubernetes/kubeadm/issues/2046 remove in 1.23
+			options.ExperimentalPatches,
 		}
 	default:
 		flags = []string{}
@@ -189,9 +194,12 @@ func runControlPlanePrepareControlPlaneSubphase(c workflow.RunData) error {
 		fmt.Printf("[control-plane] Creating static Pod manifest for %q\n", component)
 		err := controlplane.CreateStaticPodFiles(
 			kubeadmconstants.GetStaticPodDirectory(),
-			data.KustomizeDir(),
+			data.PatchesDir(),
 			&cfg.ClusterConfiguration,
 			&cfg.LocalAPIEndpoint,
+			// TODO: add support for join dry-run:
+			// https://github.com/kubernetes/kubeadm/issues/2505
+			false,
 			component,
 		)
 		if err != nil {

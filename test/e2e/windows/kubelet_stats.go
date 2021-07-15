@@ -18,6 +18,7 @@ package windows
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -78,6 +79,11 @@ var _ = SIGDescribe("[Feature:Windows] Kubelet-Stats [Serial]", func() {
 
 						framework.ExpectEqual(*podStats.CPU.UsageCoreNanoSeconds > 0, true, "Pod stats should not report 0 cpu usage")
 						framework.ExpectEqual(*podStats.Memory.WorkingSetBytes > 0, true, "Pod stats should not report 0 bytes for memory working set ")
+
+						for _, containerStats := range podStats.Containers {
+							framework.ExpectEqual(containerStats.Logs != nil, true, "Pod stats should have container log stats")
+							framework.ExpectEqual(*containerStats.Logs.AvailableBytes > 0, true, "container log stats should not report 0 bytes for AvailableBytes")
+						}
 					}
 					framework.ExpectEqual(statsChecked, 10, "Should find stats for 10 pods in kubelet stats")
 
@@ -128,7 +134,7 @@ func newKubeletStatsTestPods(numPods int, image imageutils.Config, nodeName stri
 		podName := "statscollectiontest-" + string(uuid.NewUUID())
 		pod := v1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: podName,
+				Name: fmt.Sprintf("%s-%d", podName, i),
 				Labels: map[string]string{
 					"name":    podName,
 					"testapp": "stats-collection",
@@ -138,7 +144,7 @@ func newKubeletStatsTestPods(numPods int, image imageutils.Config, nodeName stri
 				Containers: []v1.Container{
 					{
 						Image: image.GetE2EImage(),
-						Name:  podName,
+						Name:  "stat-container",
 						Command: []string{
 							"powershell.exe",
 							"-Command",
@@ -146,7 +152,17 @@ func newKubeletStatsTestPods(numPods int, image imageutils.Config, nodeName stri
 						},
 					},
 				},
-
+				InitContainers: []v1.Container{
+					{
+						Image: image.GetE2EImage(),
+						Name:  "init-container",
+						Command: []string{
+							"powershell.exe",
+							"-Command",
+							"sleep -Seconds 1",
+						},
+					},
+				},
 				NodeName: nodeName,
 			},
 		}

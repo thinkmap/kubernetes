@@ -24,16 +24,20 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	goruntime "runtime"
 
 	// Enable pprof HTTP handlers.
 	_ "net/http/pprof"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
-	"k8s.io/client-go/tools/record"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/component-base/configz"
 	"k8s.io/component-base/metrics"
+	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/proxy"
 	proxyconfigapi "k8s.io/kubernetes/pkg/proxy/apis/config"
 	proxyconfigscheme "k8s.io/kubernetes/pkg/proxy/apis/config/scheme"
@@ -43,8 +47,7 @@ import (
 	utilnetsh "k8s.io/kubernetes/pkg/util/netsh"
 	utilnode "k8s.io/kubernetes/pkg/util/node"
 	"k8s.io/utils/exec"
-
-	"k8s.io/klog"
+	utilsnet "k8s.io/utils/net"
 )
 
 // NewProxyServer returns a new ProxyServer.
@@ -82,8 +85,8 @@ func newProxyServer(config *proxyconfigapi.KubeProxyConfiguration, cleanupAndExi
 	if err != nil {
 		return nil, err
 	}
-	eventBroadcaster := record.NewBroadcaster()
-	recorder := eventBroadcaster.NewRecorder(proxyconfigscheme.Scheme, v1.EventSource{Component: "kube-proxy", Host: hostname})
+	eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1()})
+	recorder := eventBroadcaster.NewRecorder(proxyconfigscheme.Scheme, "kube-proxy")
 
 	nodeRef := &v1.ObjectReference{
 		Kind:      "Node",
@@ -101,24 +104,45 @@ func newProxyServer(config *proxyconfigapi.KubeProxyConfiguration, cleanupAndExi
 
 	proxyMode := getProxyMode(string(config.Mode), winkernel.WindowsKernelCompatTester{})
 	if proxyMode == proxyModeKernelspace {
-		klog.V(0).Info("Using Kernelspace Proxier.")
-		proxier, err = winkernel.NewProxier(
-			config.IPTables.SyncPeriod.Duration,
-			config.IPTables.MinSyncPeriod.Duration,
-			config.IPTables.MasqueradeAll,
-			int(*config.IPTables.MasqueradeBit),
-			config.ClusterCIDR,
-			hostname,
-			utilnode.GetNodeIP(client, hostname),
-			recorder,
-			healthzServer,
-			config.Winkernel,
-		)
+		klog.V(0).InfoS("Using Kernelspace Proxier.")
+		isIPv6DualStackEnabled := utilfeature.DefaultFeatureGate.Enabled(features.IPv6DualStack)
+		if isIPv6DualStackEnabled {
+			klog.V(0).InfoS("Creating dualStackProxier for Windows kernel.")
+
+			proxier, err = winkernel.NewDualStackProxier(
+				config.IPTables.SyncPeriod.Duration,
+				config.IPTables.MinSyncPeriod.Duration,
+				config.IPTables.MasqueradeAll,
+				int(*config.IPTables.MasqueradeBit),
+				config.ClusterCIDR,
+				hostname,
+				nodeIPTuple(config.BindAddress),
+				recorder,
+				healthzServer,
+				config.Winkernel,
+			)
+		} else {
+
+			proxier, err = winkernel.NewProxier(
+				config.IPTables.SyncPeriod.Duration,
+				config.IPTables.MinSyncPeriod.Duration,
+				config.IPTables.MasqueradeAll,
+				int(*config.IPTables.MasqueradeBit),
+				config.ClusterCIDR,
+				hostname,
+				utilnode.GetNodeIP(client, hostname),
+				recorder,
+				healthzServer,
+				config.Winkernel,
+			)
+
+		}
+
 		if err != nil {
 			return nil, fmt.Errorf("unable to create proxier: %v", err)
 		}
 	} else {
-		klog.V(0).Info("Using userspace Proxier.")
+		klog.V(0).InfoS("Using userspace Proxier.")
 		execer := exec.New()
 		var netshInterface utilnetsh.Interface
 		netshInterface = utilnetsh.New(execer)
@@ -136,7 +160,11 @@ func newProxyServer(config *proxyconfigapi.KubeProxyConfiguration, cleanupAndExi
 			return nil, fmt.Errorf("unable to create proxier: %v", err)
 		}
 	}
-
+	useEndpointSlices := true
+	if proxyMode == proxyModeUserspace {
+		// userspace mode doesn't support endpointslice.
+		useEndpointSlices = false
+	}
 	return &ProxyServer{
 		Client:              client,
 		EventClient:         eventClient,
@@ -151,17 +179,19 @@ func newProxyServer(config *proxyconfigapi.KubeProxyConfiguration, cleanupAndExi
 		OOMScoreAdj:         config.OOMScoreAdj,
 		ConfigSyncPeriod:    config.ConfigSyncPeriod.Duration,
 		HealthzServer:       healthzServer,
-		UseEndpointSlices:   false,
+		UseEndpointSlices:   useEndpointSlices,
 	}, nil
 }
 
 func getProxyMode(proxyMode string, kcompat winkernel.KernelCompatTester) string {
-	if proxyMode == proxyModeUserspace {
-		return proxyModeUserspace
-	} else if proxyMode == proxyModeKernelspace {
+	if proxyMode == proxyModeKernelspace {
 		return tryWinKernelSpaceProxy(kcompat)
 	}
 	return proxyModeUserspace
+}
+
+func detectNumCPU() int {
+	return goruntime.NumCPU()
 }
 
 func tryWinKernelSpaceProxy(kcompat winkernel.KernelCompatTester) string {
@@ -171,13 +201,29 @@ func tryWinKernelSpaceProxy(kcompat winkernel.KernelCompatTester) string {
 	// guaranteed false on error, error only necessary for debugging
 	useWinKernelProxy, err := winkernel.CanUseWinKernelProxier(kcompat)
 	if err != nil {
-		klog.Errorf("Can't determine whether to use windows kernel proxy, using userspace proxier: %v", err)
+		klog.ErrorS(err, "Can't determine whether to use windows kernel proxy, using userspace proxier")
 		return proxyModeUserspace
 	}
 	if useWinKernelProxy {
 		return proxyModeKernelspace
 	}
 	// Fallback.
-	klog.V(1).Infof("Can't use winkernel proxy, using userspace proxier")
+	klog.V(1).InfoS("Can't use winkernel proxy, using userspace proxier")
 	return proxyModeUserspace
+}
+
+// nodeIPTuple takes an addresses and return a tuple (ipv4,ipv6)
+// The returned tuple is guaranteed to have the order (ipv4,ipv6). The address NOT of the passed address
+// will have "any" address (0.0.0.0 or ::) inserted.
+func nodeIPTuple(bindAddress string) [2]net.IP {
+	nodes := [2]net.IP{net.IPv4zero, net.IPv6zero}
+
+	adr := net.ParseIP(bindAddress)
+	if utilsnet.IsIPv6(adr) {
+		nodes[1] = adr
+	} else {
+		nodes[0] = adr
+	}
+
+	return nodes
 }

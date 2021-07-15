@@ -144,7 +144,7 @@ var defaultTimerConfig = attachdetach.TimerConfig{
 // event is somehow missed by AttachDetach controller - it still
 // gets cleaned up by Desired State of World populator.
 func TestPodDeletionWithDswp(t *testing.T) {
-	_, server, closeFn := framework.RunAMaster(framework.NewIntegrationTestMasterConfig())
+	_, server, closeFn := framework.RunAnAPIServer(framework.NewIntegrationTestControlPlaneConfig())
 	defer closeFn()
 	namespaceName := "test-pod-deletion"
 	node := &v1.Node{
@@ -180,6 +180,7 @@ func TestPodDeletionWithDswp(t *testing.T) {
 	// start controller loop
 	go informers.Core().V1().PersistentVolumeClaims().Informer().Run(stopCh)
 	go informers.Core().V1().PersistentVolumes().Informer().Run(stopCh)
+	go informers.Storage().V1().VolumeAttachments().Informer().Run(stopCh)
 	initCSIObjects(stopCh, informers)
 	go ctrl.Run(stopCh)
 	defer close(stopCh)
@@ -210,15 +211,14 @@ func TestPodDeletionWithDswp(t *testing.T) {
 }
 
 func initCSIObjects(stopCh chan struct{}, informers clientgoinformers.SharedInformerFactory) {
-	if utilfeature.DefaultFeatureGate.Enabled(features.CSIMigration) &&
-		utilfeature.DefaultFeatureGate.Enabled(features.CSINodeInfo) {
+	if utilfeature.DefaultFeatureGate.Enabled(features.CSIMigration) {
 		go informers.Storage().V1().CSINodes().Informer().Run(stopCh)
 	}
 	go informers.Storage().V1().CSIDrivers().Informer().Run(stopCh)
 }
 
 func TestPodUpdateWithWithADC(t *testing.T) {
-	_, server, closeFn := framework.RunAMaster(framework.NewIntegrationTestMasterConfig())
+	_, server, closeFn := framework.RunAnAPIServer(framework.NewIntegrationTestControlPlaneConfig())
 	defer closeFn()
 	namespaceName := "test-pod-update"
 
@@ -256,6 +256,7 @@ func TestPodUpdateWithWithADC(t *testing.T) {
 	stopCh := make(chan struct{})
 	go informers.Core().V1().PersistentVolumeClaims().Informer().Run(stopCh)
 	go informers.Core().V1().PersistentVolumes().Informer().Run(stopCh)
+	go informers.Storage().V1().VolumeAttachments().Informer().Run(stopCh)
 	initCSIObjects(stopCh, informers)
 	go ctrl.Run(stopCh)
 
@@ -286,7 +287,7 @@ func TestPodUpdateWithWithADC(t *testing.T) {
 }
 
 func TestPodUpdateWithKeepTerminatedPodVolumes(t *testing.T) {
-	_, server, closeFn := framework.RunAMaster(framework.NewIntegrationTestMasterConfig())
+	_, server, closeFn := framework.RunAnAPIServer(framework.NewIntegrationTestControlPlaneConfig())
 	defer closeFn()
 	namespaceName := "test-pod-update"
 
@@ -325,6 +326,7 @@ func TestPodUpdateWithKeepTerminatedPodVolumes(t *testing.T) {
 	stopCh := make(chan struct{})
 	go informers.Core().V1().PersistentVolumeClaims().Informer().Run(stopCh)
 	go informers.Core().V1().PersistentVolumes().Informer().Run(stopCh)
+	go informers.Storage().V1().VolumeAttachments().Informer().Run(stopCh)
 	initCSIObjects(stopCh, informers)
 	go ctrl.Run(stopCh)
 
@@ -429,12 +431,15 @@ func createAdClients(ns *v1.Namespace, t *testing.T, server *httptest.Server, sy
 		informers.Core().V1().PersistentVolumes(),
 		informers.Storage().V1().CSINodes(),
 		informers.Storage().V1().CSIDrivers(),
+		informers.Storage().V1().VolumeAttachments(),
 		cloud,
 		plugins,
 		nil, /* prober */
 		false,
 		5*time.Second,
-		timers)
+		timers,
+		nil, /* filteredDialOptions */
+	)
 
 	if err != nil {
 		t.Fatalf("Error creating AttachDetach : %v", err)
@@ -466,7 +471,7 @@ func createAdClients(ns *v1.Namespace, t *testing.T, server *httptest.Server, sy
 // event is somehow missed by AttachDetach controller - it still
 // gets added by Desired State of World populator.
 func TestPodAddedByDswp(t *testing.T) {
-	_, server, closeFn := framework.RunAMaster(framework.NewIntegrationTestMasterConfig())
+	_, server, closeFn := framework.RunAnAPIServer(framework.NewIntegrationTestControlPlaneConfig())
 	defer closeFn()
 	namespaceName := "test-pod-deletion"
 
@@ -504,6 +509,7 @@ func TestPodAddedByDswp(t *testing.T) {
 	stopCh := make(chan struct{})
 	go informers.Core().V1().PersistentVolumeClaims().Informer().Run(stopCh)
 	go informers.Core().V1().PersistentVolumes().Informer().Run(stopCh)
+	go informers.Storage().V1().VolumeAttachments().Informer().Run(stopCh)
 	initCSIObjects(stopCh, informers)
 	go ctrl.Run(stopCh)
 
@@ -540,7 +546,7 @@ func TestPodAddedByDswp(t *testing.T) {
 }
 
 func TestPVCBoundWithADC(t *testing.T) {
-	_, server, closeFn := framework.RunAMaster(framework.NewIntegrationTestMasterConfig())
+	_, server, closeFn := framework.RunAnAPIServer(framework.NewIntegrationTestControlPlaneConfig())
 	defer closeFn()
 	namespaceName := "test-pod-deletion"
 

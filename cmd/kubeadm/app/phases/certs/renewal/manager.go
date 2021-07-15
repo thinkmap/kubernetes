@@ -20,13 +20,14 @@ import (
 	"crypto/x509"
 	"sort"
 
-	"github.com/pkg/errors"
-	clientset "k8s.io/client-go/kubernetes"
-	certutil "k8s.io/client-go/util/cert"
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	certsphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/certs"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/pkiutil"
+
+	certutil "k8s.io/client-go/util/cert"
+
+	"github.com/pkg/errors"
 )
 
 // Manager can be used to coordinate certificate renewal and related processes,
@@ -248,43 +249,6 @@ func (rm *Manager) RenewUsingLocalCA(name string) (bool, error) {
 	}
 
 	return true, nil
-}
-
-// RenewUsingCSRAPI executes certificate renewal uses the K8s certificate API.
-// For PKI certificates, use the name defined in the certsphase package, while for certificates
-// embedded in the kubeConfig files, use the kubeConfig file name defined in the kubeadm constants package.
-// If you use the CertificateRenewHandler returned by Certificates func, handler.Name already contains the right value.
-func (rm *Manager) RenewUsingCSRAPI(name string, client clientset.Interface) error {
-	handler, ok := rm.certificates[name]
-	if !ok {
-		return errors.Errorf("%s is not a valid certificate for this cluster", name)
-	}
-
-	// reads the current certificate
-	cert, err := handler.readwriter.Read()
-	if err != nil {
-		return err
-	}
-
-	// extract the certificate config
-	cfg := &pkiutil.CertConfig{
-		Config:             certToConfig(cert),
-		PublicKeyAlgorithm: rm.cfg.PublicKeyAlgorithm(),
-	}
-
-	// create a new certificate with the same config
-	newCert, newKey, err := NewAPIRenewer(client).Renew(cfg)
-	if err != nil {
-		return errors.Wrapf(err, "failed to renew certificate %s", name)
-	}
-
-	// writes the new certificate to disk
-	err = handler.readwriter.Write(newCert, newKey)
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
 
 // CreateRenewCSR generates CSR request for certificate renewal.

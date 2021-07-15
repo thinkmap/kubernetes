@@ -20,12 +20,12 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/pkg/errors"
-
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/upgrade"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
+
+	"github.com/pkg/errors"
 )
 
 // NewControlPlane creates a kubeadm workflow phase that implements handling of control-plane upgrade.
@@ -39,7 +39,9 @@ func NewControlPlane() workflow.Phase {
 			options.KubeconfigPath,
 			options.CertificateRenewal,
 			options.EtcdUpgrade,
-			options.Kustomize,
+			options.Patches,
+			// TODO: https://github.com/kubernetes/kubeadm/issues/2046 remove in 1.23
+			options.ExperimentalPatches,
 		},
 	}
 	return phase
@@ -64,17 +66,17 @@ func runControlPlane() func(c workflow.RunData) error {
 		dryRun := data.DryRun()
 		etcdUpgrade := data.EtcdUpgrade()
 		renewCerts := data.RenewCerts()
-		kustomizeDir := data.KustomizeDir()
+		patchesDir := data.PatchesDir()
 
 		// Upgrade the control plane and etcd if installed on this node
 		fmt.Printf("[upgrade] Upgrading your Static Pod-hosted control plane instance to version %q...\n", cfg.KubernetesVersion)
 		if dryRun {
-			return upgrade.DryRunStaticPodUpgrade(kustomizeDir, cfg)
+			return upgrade.DryRunStaticPodUpgrade(patchesDir, cfg)
 		}
 
 		waiter := apiclient.NewKubeWaiter(data.Client(), upgrade.UpgradeManifestTimeout, os.Stdout)
 
-		if err := upgrade.PerformStaticPodUpgrade(client, waiter, cfg, etcdUpgrade, renewCerts, kustomizeDir); err != nil {
+		if err := upgrade.PerformStaticPodUpgrade(client, waiter, cfg, etcdUpgrade, renewCerts, patchesDir); err != nil {
 			return errors.Wrap(err, "couldn't complete the static pod upgrade")
 		}
 

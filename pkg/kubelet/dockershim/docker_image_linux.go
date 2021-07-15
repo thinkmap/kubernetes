@@ -1,4 +1,4 @@
-// +build linux
+// +build linux,!dockerless
 
 /*
 Copyright 2017 The Kubernetes Authors.
@@ -24,7 +24,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
@@ -33,7 +33,7 @@ import (
 func (ds *dockerService) ImageFsInfo(_ context.Context, _ *runtimeapi.ImageFsInfoRequest) (*runtimeapi.ImageFsInfoResponse, error) {
 	info, err := ds.client.Info()
 	if err != nil {
-		klog.Errorf("Failed to get docker info: %v", err)
+		klog.ErrorS(err, "Failed to get docker info")
 		return nil, err
 	}
 
@@ -67,7 +67,7 @@ func dirSize(path string) (int64, int64, error) {
 		if err != nil {
 			return err
 		}
-		inodes += 1
+		inodes++
 		if !info.IsDir() {
 			bytes += info.Size()
 		}

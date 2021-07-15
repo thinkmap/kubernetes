@@ -25,7 +25,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 // BuildNamedCertificates returns a map of *tls.Certificate by name. It's
@@ -50,7 +50,7 @@ func (c *DynamicServingCertificateController) BuildNamedCertificates(sniCerts []
 			byNameExplicit[name] = &cert
 		}
 
-		klog.V(2).Infof("loaded SNI cert [%d/%q]: %s", i, c.sniCerts[i].Name(), GetHumanCertDetail(x509Cert))
+		klog.V(2).InfoS("Loaded SNI cert", "index", i, "certName", c.sniCerts[i].Name(), "certDetail", GetHumanCertDetail(x509Cert))
 		if c.eventRecorder != nil {
 			c.eventRecorder.Eventf(&corev1.ObjectReference{Name: c.sniCerts[i].Name()}, nil, corev1.EventTypeWarning, "TLSConfigChanged", "SNICertificateReload", "loaded SNI cert [%d/%q]: %s with explicit names %v", i, c.sniCerts[i].Name(), GetHumanCertDetail(x509Cert), names)
 		}

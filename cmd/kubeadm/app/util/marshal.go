@@ -21,7 +21,8 @@ import (
 	"bytes"
 	"io"
 
-	"github.com/pkg/errors"
+	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -30,8 +31,8 @@ import (
 	errorsutil "k8s.io/apimachinery/pkg/util/errors"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	clientsetscheme "k8s.io/client-go/kubernetes/scheme"
-	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
-	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
+
+	"github.com/pkg/errors"
 )
 
 // MarshalToYaml marshals an object into yaml.
@@ -97,7 +98,7 @@ func SplitYAMLDocuments(yamlBytes []byte) (kubeadmapi.DocumentMap, error) {
 			return nil, err
 		}
 		if len(gvk.Group) == 0 || len(gvk.Version) == 0 || len(gvk.Kind) == 0 {
-			return nil, errors.New("invalid configuration: kind and apiVersion is mandatory information that needs to be specified")
+			return nil, errors.Errorf("invalid configuration for GroupVersionKind %+v: kind and apiVersion is mandatory information that must be specified", gvk)
 		}
 
 		// Check whether the kind has been registered before. If it has, throw an error

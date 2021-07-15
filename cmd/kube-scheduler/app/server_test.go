@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -29,7 +30,8 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/spf13/pflag"
 	"k8s.io/kubernetes/cmd/kube-scheduler/app/options"
-	kubeschedulerconfig "k8s.io/kubernetes/pkg/scheduler/apis/config"
+	"k8s.io/kubernetes/pkg/scheduler/apis/config"
+	"k8s.io/kubernetes/pkg/scheduler/apis/config/testing/defaults"
 )
 
 func TestSetup(t *testing.T) {
@@ -73,7 +75,7 @@ users:
 	// plugin config
 	pluginConfigFile := filepath.Join(tmpDir, "plugin.yaml")
 	if err := ioutil.WriteFile(pluginConfigFile, []byte(fmt.Sprintf(`
-apiVersion: kubescheduler.config.k8s.io/v1alpha2
+apiVersion: kubescheduler.config.k8s.io/v1beta1
 kind: KubeSchedulerConfiguration
 clientConnection:
   kubeconfig: "%s"
@@ -110,7 +112,7 @@ profiles:
 	// multiple profiles config
 	multiProfilesConfig := filepath.Join(tmpDir, "multi-profiles.yaml")
 	if err := ioutil.WriteFile(multiProfilesConfig, []byte(fmt.Sprintf(`
-apiVersion: kubescheduler.config.k8s.io/v1alpha2
+apiVersion: kubescheduler.config.k8s.io/v1beta1
 kind: KubeSchedulerConfiguration
 clientConnection:
   kubeconfig: "%s"
@@ -122,6 +124,9 @@ profiles:
       disabled:
       - name: "*"
     filter:
+      disabled:
+      - name: "*"
+    postFilter:
       disabled:
       - name: "*"
     preScore:
@@ -147,170 +152,57 @@ profiles:
 		t.Fatal(err)
 	}
 
-	defaultPlugins := map[string][]kubeschedulerconfig.Plugin{
-		"QueueSortPlugin": {
-			{Name: "PrioritySort"},
-		},
-		"PreFilterPlugin": {
-			{Name: "NodeResourcesFit"},
-			{Name: "NodePorts"},
-			{Name: "InterPodAffinity"},
-			{Name: "PodTopologySpread"},
-		},
-		"FilterPlugin": {
-			{Name: "NodeUnschedulable"},
-			{Name: "NodeResourcesFit"},
-			{Name: "NodeName"},
-			{Name: "NodePorts"},
-			{Name: "NodeAffinity"},
-			{Name: "VolumeRestrictions"},
-			{Name: "TaintToleration"},
-			{Name: "EBSLimits"},
-			{Name: "GCEPDLimits"},
-			{Name: "NodeVolumeLimits"},
-			{Name: "AzureDiskLimits"},
-			{Name: "VolumeBinding"},
-			{Name: "VolumeZone"},
-			{Name: "InterPodAffinity"},
-			{Name: "PodTopologySpread"},
-		},
-		"PreScorePlugin": {
-			{Name: "InterPodAffinity"},
-			{Name: "DefaultPodTopologySpread"},
-			{Name: "TaintToleration"},
-			{Name: "PodTopologySpread"},
-		},
-		"ScorePlugin": {
-			{Name: "NodeResourcesBalancedAllocation", Weight: 1},
-			{Name: "ImageLocality", Weight: 1},
-			{Name: "InterPodAffinity", Weight: 1},
-			{Name: "NodeResourcesLeastAllocated", Weight: 1},
-			{Name: "NodeAffinity", Weight: 1},
-			{Name: "NodePreferAvoidPods", Weight: 10000},
-			{Name: "DefaultPodTopologySpread", Weight: 1},
-			{Name: "TaintToleration", Weight: 1},
-			{Name: "PodTopologySpread", Weight: 1},
-		},
-		"BindPlugin": {{Name: "DefaultBinder"}},
-	}
-
 	testcases := []struct {
 		name        string
 		flags       []string
-		wantPlugins map[string]map[string][]kubeschedulerconfig.Plugin
+		wantPlugins map[string]*config.Plugins
 	}{
 		{
 			name: "default config",
 			flags: []string{
 				"--kubeconfig", configKubeconfig,
 			},
-			wantPlugins: map[string]map[string][]kubeschedulerconfig.Plugin{
-				"default-scheduler": defaultPlugins,
+			wantPlugins: map[string]*config.Plugins{
+				"default-scheduler": defaults.PluginsV1beta2,
 			},
 		},
 		{
-			name: "plugin config with single profile",
+			name: "component configuration",
 			flags: []string{
 				"--config", pluginConfigFile,
 				"--kubeconfig", configKubeconfig,
 			},
-			wantPlugins: map[string]map[string][]kubeschedulerconfig.Plugin{
+			wantPlugins: map[string]*config.Plugins{
 				"default-scheduler": {
-					"BindPlugin":      {{Name: "DefaultBinder"}},
-					"FilterPlugin":    {{Name: "NodeResourcesFit"}, {Name: "NodePorts"}},
-					"PreFilterPlugin": {{Name: "NodeResourcesFit"}, {Name: "NodePorts"}},
-					"PreScorePlugin":  {{Name: "InterPodAffinity"}, {Name: "TaintToleration"}},
-					"QueueSortPlugin": {{Name: "PrioritySort"}},
-					"ScorePlugin":     {{Name: "InterPodAffinity", Weight: 1}, {Name: "TaintToleration", Weight: 1}},
-				},
-			},
-		},
-		{
-			name: "plugin config with multiple profiles",
-			flags: []string{
-				"--config", multiProfilesConfig,
-				"--kubeconfig", configKubeconfig,
-			},
-			wantPlugins: map[string]map[string][]kubeschedulerconfig.Plugin{
-				"profile-default-plugins": defaultPlugins,
-				"profile-disable-all-filter-and-score-plugins": {
-					"BindPlugin":      {{Name: "DefaultBinder"}},
-					"QueueSortPlugin": {{Name: "PrioritySort"}},
-				},
-			},
-		},
-		{
-			name: "Deprecated SchedulerName flag",
-			flags: []string{
-				"--kubeconfig", configKubeconfig,
-				"--scheduler-name", "my-scheduler",
-			},
-			wantPlugins: map[string]map[string][]kubeschedulerconfig.Plugin{
-				"my-scheduler": defaultPlugins,
-			},
-		},
-		{
-			name: "default algorithm provider",
-			flags: []string{
-				"--kubeconfig", configKubeconfig,
-				"--algorithm-provider", "DefaultProvider",
-			},
-			wantPlugins: map[string]map[string][]kubeschedulerconfig.Plugin{
-				"default-scheduler": defaultPlugins,
-			},
-		},
-		{
-			name: "cluster autoscaler provider",
-			flags: []string{
-				"--kubeconfig", configKubeconfig,
-				"--algorithm-provider", "ClusterAutoscalerProvider",
-			},
-			wantPlugins: map[string]map[string][]kubeschedulerconfig.Plugin{
-				"default-scheduler": {
-					"QueueSortPlugin": {
-						{Name: "PrioritySort"},
+					Bind: config.PluginSet{Enabled: []config.Plugin{{Name: "DefaultBinder"}}},
+					Filter: config.PluginSet{
+						Enabled: []config.Plugin{
+							{Name: "NodeResourcesFit"},
+							{Name: "NodePorts"},
+						},
 					},
-					"PreFilterPlugin": {
-						{Name: "NodeResourcesFit"},
-						{Name: "NodePorts"},
-						{Name: "InterPodAffinity"},
-						{Name: "PodTopologySpread"},
+					PreFilter: config.PluginSet{
+						Enabled: []config.Plugin{
+							{Name: "NodeResourcesFit"},
+							{Name: "NodePorts"},
+						},
 					},
-					"FilterPlugin": {
-						{Name: "NodeUnschedulable"},
-						{Name: "NodeResourcesFit"},
-						{Name: "NodeName"},
-						{Name: "NodePorts"},
-						{Name: "NodeAffinity"},
-						{Name: "VolumeRestrictions"},
-						{Name: "TaintToleration"},
-						{Name: "EBSLimits"},
-						{Name: "GCEPDLimits"},
-						{Name: "NodeVolumeLimits"},
-						{Name: "AzureDiskLimits"},
-						{Name: "VolumeBinding"},
-						{Name: "VolumeZone"},
-						{Name: "InterPodAffinity"},
-						{Name: "PodTopologySpread"},
+					PostFilter: config.PluginSet{Enabled: []config.Plugin{{Name: "DefaultPreemption"}}},
+					PreScore: config.PluginSet{
+						Enabled: []config.Plugin{
+							{Name: "InterPodAffinity"},
+							{Name: "TaintToleration"},
+						},
 					},
-					"PreScorePlugin": {
-						{Name: "InterPodAffinity"},
-						{Name: "DefaultPodTopologySpread"},
-						{Name: "TaintToleration"},
-						{Name: "PodTopologySpread"},
+					QueueSort: config.PluginSet{Enabled: []config.Plugin{{Name: "PrioritySort"}}},
+					Score: config.PluginSet{
+						Enabled: []config.Plugin{
+							{Name: "InterPodAffinity", Weight: 1},
+							{Name: "TaintToleration", Weight: 1},
+						},
 					},
-					"ScorePlugin": {
-						{Name: "NodeResourcesBalancedAllocation", Weight: 1},
-						{Name: "ImageLocality", Weight: 1},
-						{Name: "InterPodAffinity", Weight: 1},
-						{Name: "NodeResourcesMostAllocated", Weight: 1},
-						{Name: "NodeAffinity", Weight: 1},
-						{Name: "NodePreferAvoidPods", Weight: 10000},
-						{Name: "DefaultPodTopologySpread", Weight: 1},
-						{Name: "TaintToleration", Weight: 1},
-						{Name: "PodTopologySpread", Weight: 1},
-					},
-					"BindPlugin": {{Name: "DefaultBinder"}},
+					Reserve: config.PluginSet{Enabled: []config.Plugin{{Name: "VolumeBinding"}}},
+					PreBind: config.PluginSet{Enabled: []config.Plugin{{Name: "VolumeBinding"}}},
 				},
 			},
 		},
@@ -320,27 +212,33 @@ profiles:
 				"--kubeconfig", configKubeconfig,
 				"--policy-config-file", policyConfigFile,
 			},
-			wantPlugins: map[string]map[string][]kubeschedulerconfig.Plugin{
+			wantPlugins: map[string]*config.Plugins{
 				"default-scheduler": {
-					"QueueSortPlugin": {{Name: "PrioritySort"}},
-					"PreFilterPlugin": {
-						{Name: "InterPodAffinity"},
+					QueueSort: config.PluginSet{Enabled: []config.Plugin{{Name: "PrioritySort"}}},
+					PreFilter: config.PluginSet{Enabled: []config.Plugin{{Name: "InterPodAffinity"}}},
+					Filter: config.PluginSet{
+						Enabled: []config.Plugin{
+							{Name: "NodeUnschedulable"},
+							{Name: "TaintToleration"},
+							{Name: "InterPodAffinity"},
+						},
 					},
-					"FilterPlugin": {
-						{Name: "NodeUnschedulable"},
-						{Name: "TaintToleration"},
-						{Name: "InterPodAffinity"},
-					},
-					"PreScorePlugin": {
-						{Name: "InterPodAffinity"},
-					},
-					"ScorePlugin": {
-						{Name: "InterPodAffinity", Weight: 2},
-					},
-					"BindPlugin": {{Name: "DefaultBinder"}},
+					PostFilter: config.PluginSet{Enabled: []config.Plugin{{Name: "DefaultPreemption"}}},
+					PreScore:   config.PluginSet{Enabled: []config.Plugin{{Name: "InterPodAffinity"}}},
+					Score:      config.PluginSet{Enabled: []config.Plugin{{Name: "InterPodAffinity", Weight: 2}}},
+					Bind:       config.PluginSet{Enabled: []config.Plugin{{Name: "DefaultBinder"}}},
 				},
 			},
 		},
+	}
+
+	makeListener := func(t *testing.T) net.Listener {
+		t.Helper()
+		l, err := net.Listen("tcp", ":0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return l
 	}
 
 	for _, tc := range testcases {
@@ -350,24 +248,35 @@ profiles:
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, f := range opts.Flags().FlagSets {
+
+			nfs := opts.Flags()
+			for _, f := range nfs.FlagSets {
 				fs.AddFlagSet(f)
 			}
 			if err := fs.Parse(tc.flags); err != nil {
 				t.Fatal(err)
 			}
 
-			var args []string
+			if err := opts.Complete(&nfs); err != nil {
+				t.Fatal(err)
+			}
+
+			// use listeners instead of static ports so parallel test runs don't conflict
+			opts.SecureServing.Listener = makeListener(t)
+			defer opts.SecureServing.Listener.Close()
+			opts.CombinedInsecureServing.Metrics.Listener = makeListener(t)
+			defer opts.CombinedInsecureServing.Metrics.Listener.Close()
+			opts.CombinedInsecureServing.Healthz.Listener = makeListener(t)
+			defer opts.CombinedInsecureServing.Healthz.Listener.Close()
+
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			cc, sched, err := Setup(ctx, args, opts)
+			_, sched, err := Setup(ctx, opts)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer cc.SecureServing.Listener.Close()
-			defer cc.InsecureServing.Listener.Close()
 
-			gotPlugins := make(map[string]map[string][]kubeschedulerconfig.Plugin)
+			gotPlugins := make(map[string]*config.Plugins)
 			for n, p := range sched.Profiles {
 				gotPlugins[n] = p.ListPlugins()
 			}

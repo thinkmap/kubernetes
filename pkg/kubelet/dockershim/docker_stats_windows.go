@@ -1,4 +1,4 @@
-// +build windows
+// +build windows,!dockerless
 
 /*
 Copyright 2017 The Kubernetes Authors.
@@ -20,11 +20,12 @@ package dockershim
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/Microsoft/hcsshim"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 func (ds *dockerService) getContainerStats(containerID string) (*runtimeapi.ContainerStats, error) {
@@ -33,19 +34,35 @@ func (ds *dockerService) getContainerStats(containerID string) (*runtimeapi.Cont
 		return nil, err
 	}
 
-	hcsshim_container, err := hcsshim.OpenContainer(containerID)
+	hcsshimContainer, err := hcsshim.OpenContainer(containerID)
 	if err != nil {
-		return nil, err
+		// As we moved from using Docker stats to hcsshim directly, we may query HCS with already exited container IDs.
+		// That will typically happen with init-containers in Exited state. Docker still knows about them but the HCS does not.
+		// As we don't want to block stats retrieval for other containers, we only log errors.
+		if !hcsshim.IsNotExist(err) && !hcsshim.IsAlreadyStopped(err) {
+			klog.V(4).InfoS("Error opening container (stats will be missing)", "containerID", containerID, "err", err)
+		}
+		return nil, nil
 	}
 	defer func() {
-		closeErr := hcsshim_container.Close()
+		closeErr := hcsshimContainer.Close()
 		if closeErr != nil {
-			klog.Errorf("Error closing container '%s': %v", containerID, closeErr)
+			klog.ErrorS(closeErr, "Error closing container", "containerID", containerID)
 		}
 	}()
 
-	stats, err := hcsshim_container.Statistics()
+	stats, err := hcsshimContainer.Statistics()
 	if err != nil {
+		if strings.Contains(err.Error(), "0x5") || strings.Contains(err.Error(), "0xc0370105") {
+			// When the container is just created, querying for stats causes access errors because it hasn't started yet
+			// This is transient; skip container for now
+			//
+			// These hcs errors do not have helpers exposed in public package so need to query for the known codes
+			// https://github.com/microsoft/hcsshim/blob/master/internal/hcs/errors.go
+			// PR to expose helpers in hcsshim: https://github.com/microsoft/hcsshim/pull/933
+			klog.V(4).InfoS("Container is not in a state that stats can be accessed. This occurs when the container is created but not started.", "containerID", containerID, "err", err)
+			return nil, nil
+		}
 		return nil, err
 	}
 
