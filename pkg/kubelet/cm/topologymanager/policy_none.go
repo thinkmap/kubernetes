@@ -16,6 +16,8 @@ limitations under the License.
 
 package topologymanager
 
+import "k8s.io/klog/v2"
+
 type nonePolicy struct{}
 
 var _ Policy = &nonePolicy{}
@@ -32,10 +34,10 @@ func (p *nonePolicy) Name() string {
 	return PolicyNone
 }
 
-func (p *nonePolicy) canAdmitPodResult(hint *TopologyHint) bool {
+func (p *nonePolicy) canAdmitPodResult(_ *TopologyHint) bool {
 	return true
 }
 
-func (p *nonePolicy) Merge(providersHints []map[string][]TopologyHint) (TopologyHint, bool) {
+func (p *nonePolicy) Merge(_ klog.Logger, _ []map[string][]TopologyHint) (TopologyHint, bool) {
 	return TopologyHint{}, p.canAdmitPodResult(nil)
 }

@@ -24,7 +24,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
-	"io/ioutil"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -34,13 +34,18 @@ import (
 	"testing"
 	"time"
 
-	certapi "k8s.io/api/certificates/v1beta1"
+	certapi "k8s.io/api/certificates/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	clientfeatures "k8s.io/client-go/features"
 	restclient "k8s.io/client-go/rest"
 	certutil "k8s.io/client-go/util/cert"
-	capihelper "k8s.io/kubernetes/pkg/apis/certificates/v1beta1"
+	"k8s.io/component-base/featuregate"
+	"k8s.io/ktesting"
+	capihelper "k8s.io/kubernetes/pkg/apis/certificates/v1"
 	"k8s.io/kubernetes/pkg/controller/certificates/authority"
 )
 
@@ -48,7 +53,7 @@ import (
 // manager that will use the bootstrap client until we get a valid cert, then use our
 // provided identity on subsequent requests.
 func Test_buildClientCertificateManager(t *testing.T) {
-	testDir, err := ioutil.TempDir("", "kubeletcert")
+	testDir, err := os.MkdirTemp("", "kubeletcert")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,16 +78,19 @@ func Test_buildClientCertificateManager(t *testing.T) {
 	defer s.Close()
 
 	config1 := &restclient.Config{
-		UserAgent: "FirstClient",
-		Host:      s.URL,
+		UserAgent:     "FirstClient",
+		Host:          s.URL,
+		ContentConfig: restclient.ContentConfig{ContentType: runtime.ContentTypeJSON},
 	}
 	config2 := &restclient.Config{
-		UserAgent: "SecondClient",
-		Host:      s.URL,
+		UserAgent:     "SecondClient",
+		Host:          s.URL,
+		ContentConfig: restclient.ContentConfig{ContentType: runtime.ContentTypeJSON},
 	}
 
 	nodeName := types.NodeName("test")
-	m, err := buildClientCertificateManager(config1, config2, testDir, nodeName)
+	tCtx := ktesting.Init(t)
+	m, err := buildClientCertificateManager(tCtx.Logger(), config1, config2, testDir, nodeName, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +142,7 @@ func Test_buildClientCertificateManager(t *testing.T) {
 }
 
 func Test_buildClientCertificateManager_populateCertDir(t *testing.T) {
-	testDir, err := ioutil.TempDir("", "kubeletcert")
+	testDir, err := os.MkdirTemp("", "kubeletcert")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +158,8 @@ func Test_buildClientCertificateManager_populateCertDir(t *testing.T) {
 		Host:      "http://localhost",
 	}
 	nodeName := types.NodeName("test")
-	if _, err := buildClientCertificateManager(config1, config2, testDir, nodeName); err != nil {
+	tCtx := ktesting.Init(t)
+	if _, err := buildClientCertificateManager(tCtx.Logger(), config1, config2, testDir, nodeName, nil); err != nil {
 		t.Fatal(err)
 	}
 	fi := getFileInfo(testDir)
@@ -161,7 +170,7 @@ func Test_buildClientCertificateManager_populateCertDir(t *testing.T) {
 	// an invalid cert should be ignored
 	config2.CertData = []byte("invalid contents")
 	config2.KeyData = []byte("invalid contents")
-	if _, err := buildClientCertificateManager(config1, config2, testDir, nodeName); err == nil {
+	if _, err := buildClientCertificateManager(tCtx.Logger(), config1, config2, testDir, nodeName, nil); err == nil {
 		t.Fatal("unexpected non error")
 	}
 	fi = getFileInfo(testDir)
@@ -172,7 +181,7 @@ func Test_buildClientCertificateManager_populateCertDir(t *testing.T) {
 	// an expired client certificate should be written to disk, because the cert manager can
 	// use config1 to refresh it and the cert manager won't return it for clients.
 	config2.CertData, config2.KeyData = genClientCert(t, time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour))
-	if _, err := buildClientCertificateManager(config1, config2, testDir, nodeName); err != nil {
+	if _, err := buildClientCertificateManager(tCtx.Logger(), config1, config2, testDir, nodeName, nil); err != nil {
 		t.Fatal(err)
 	}
 	fi = getFileInfo(testDir)
@@ -182,7 +191,7 @@ func Test_buildClientCertificateManager_populateCertDir(t *testing.T) {
 
 	// a valid, non-expired client certificate should be written to disk
 	config2.CertData, config2.KeyData = genClientCert(t, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
-	if _, err := buildClientCertificateManager(config1, config2, testDir, nodeName); err != nil {
+	if _, err := buildClientCertificateManager(tCtx.Logger(), config1, config2, testDir, nodeName, nil); err != nil {
 		t.Fatal(err)
 	}
 	fi = getFileInfo(testDir)
@@ -215,7 +224,7 @@ func getCSR(req *http.Request) (*certapi.CertificateSigningRequest, error) {
 	if req.Body == nil {
 		return nil, nil
 	}
-	body, err := ioutil.ReadAll(req.Body)
+	body, err := io.ReadAll(req.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -278,7 +287,7 @@ func (s *csrSimulator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	switch {
-	case req.Method == "POST" && req.URL.Path == "/apis/certificates.k8s.io/v1beta1/certificatesigningrequests":
+	case req.Method == "POST" && req.URL.Path == "/apis/certificates.k8s.io/v1/certificatesigningrequests":
 		csr, err := getCSR(req)
 		if err != nil {
 			t.Fatal(err)
@@ -298,14 +307,14 @@ func (s *csrSimulator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		ca := &authority.CertificateAuthority{
 			Certificate: s.serverCA,
 			PrivateKey:  s.serverPrivateKey,
-			Backdate:    s.backdate,
 		}
 		cr, err := capihelper.ParseCSR(csr.Spec.Request)
 		if err != nil {
 			t.Fatal(err)
 		}
 		der, err := ca.Sign(cr.Raw, authority.PermissiveSigningPolicy{
-			TTL: time.Hour,
+			TTL:      time.Hour,
+			Backdate: s.backdate,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -316,7 +325,7 @@ func (s *csrSimulator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		s.csr = csr
 
-	case req.Method == "GET" && req.URL.Path == "/apis/certificates.k8s.io/v1beta1/certificatesigningrequests" && req.URL.RawQuery == "fieldSelector=metadata.name%3Dtest-csr&limit=500&resourceVersion=0":
+	case req.Method == "GET" && req.URL.Path == "/apis/certificates.k8s.io/v1/certificatesigningrequests" && (req.URL.RawQuery == "fieldSelector=metadata.name%3Dtest-csr&limit=500&resourceVersion=0" || req.URL.RawQuery == "fieldSelector=metadata.name%3Dtest-csr"):
 		if s.csr == nil {
 			t.Fatalf("no csr")
 		}
@@ -333,7 +342,7 @@ func (s *csrSimulator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(data)
 
-	case req.Method == "GET" && req.URL.Path == "/apis/certificates.k8s.io/v1beta1/certificatesigningrequests" && req.URL.RawQuery == "fieldSelector=metadata.name%3Dtest-csr&resourceVersion=2&watch=true":
+	case req.Method == "GET" && req.URL.Path == "/apis/certificates.k8s.io/v1/certificatesigningrequests" && req.URL.RawQuery == "fieldSelector=metadata.name%3Dtest-csr&resourceVersion=2&watch=true":
 		if s.csr == nil {
 			t.Fatalf("no csr")
 		}
@@ -347,6 +356,49 @@ func (s *csrSimulator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		})
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(data)
+
+	case utilfeature.DefaultFeatureGate.Enabled(featuregate.Feature(clientfeatures.WatchListClient)) && req.Method == http.MethodGet && req.URL.Path == "/apis/certificates.k8s.io/v1/certificatesigningrequests" && req.URL.RawQuery == "fieldSelector=metadata.name%3Dtest-csr&resourceVersionMatch=NotOlderThan&sendInitialEvents=true&watch=true":
+		// TODO(#115478): remove the list & watch cases above when WatchListClient FG is removed
+		if s.csr == nil {
+			t.Fatalf("no csr")
+		}
+		csr := &metav1.WatchEvent{
+			Type: string(watch.Added),
+			Object: runtime.RawExtension{
+				Raw: mustMarshal(s.csr.DeepCopy()),
+			},
+		}
+
+		bookmark := &metav1.WatchEvent{
+			Type: string(watch.Bookmark),
+			Object: runtime.RawExtension{
+				Raw: mustMarshal(&certapi.CertificateSigningRequest{
+					TypeMeta: metav1.TypeMeta{
+						Kind:       "CertificateSigningRequest",
+						APIVersion: "certificates.k8s.io/v1",
+					},
+					ObjectMeta: metav1.ObjectMeta{
+						Annotations: map[string]string{
+							metav1.InitialEventsAnnotationKey: "true",
+						},
+					},
+				}),
+			},
+		}
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("http.ResponseWriter doesn't support http.Flusher")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write(mustMarshal(csr)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write(mustMarshal(bookmark)); err != nil {
+			t.Fatal(err)
+		}
+		flusher.Flush()
 
 	default:
 		t.Fatalf("unexpected request: %s %s", req.Method, req.URL)
@@ -375,7 +427,7 @@ func genClientCert(t *testing.T, from, to time.Time) ([]byte, []byte) {
 		NotBefore:    from,
 		NotAfter:     to,
 
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
 	}

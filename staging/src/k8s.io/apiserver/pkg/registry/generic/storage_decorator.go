@@ -24,12 +24,16 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
+// CacheKeyFunc returns the resource-relative key used by the watch cache.
+type CacheKeyFunc func(obj runtime.Object) (string, error)
+
 // StorageDecorator is a function signature for producing a storage.Interface
 // and an associated DestroyFunc from given parameters.
 type StorageDecorator func(
-	config *storagebackend.Config,
+	config *storagebackend.ConfigForResource,
 	resourcePrefix string,
-	keyFunc func(obj runtime.Object) (string, error),
+	cacheKeyFunc CacheKeyFunc,
+	reverseKeyFunc storage.ReverseKeyFunc,
 	newFunc func() runtime.Object,
 	newListFunc func() runtime.Object,
 	getAttrsFunc storage.AttrFunc,
@@ -39,20 +43,21 @@ type StorageDecorator func(
 // UndecoratedStorage returns the given a new storage from the given config
 // without any decoration.
 func UndecoratedStorage(
-	config *storagebackend.Config,
+	config *storagebackend.ConfigForResource,
 	resourcePrefix string,
-	keyFunc func(obj runtime.Object) (string, error),
+	cacheKeyFunc CacheKeyFunc,
+	reverseKeyFunc storage.ReverseKeyFunc,
 	newFunc func() runtime.Object,
 	newListFunc func() runtime.Object,
 	getAttrsFunc storage.AttrFunc,
 	trigger storage.IndexerFuncs,
 	indexers *cache.Indexers) (storage.Interface, factory.DestroyFunc, error) {
-	return NewRawStorage(config)
+	return NewRawStorage(config, newFunc, newListFunc, reverseKeyFunc, resourcePrefix)
 }
 
 // NewRawStorage creates the low level kv storage. This is a work-around for current
 // two layer of same storage interface.
 // TODO: Once cacher is enabled on all registries (event registry is special), we will remove this method.
-func NewRawStorage(config *storagebackend.Config) (storage.Interface, factory.DestroyFunc, error) {
-	return factory.Create(*config)
+func NewRawStorage(config *storagebackend.ConfigForResource, newFunc, newListFunc func() runtime.Object, reverseKeyFunc storage.ReverseKeyFunc, resourcePrefix string) (storage.Interface, factory.DestroyFunc, error) {
+	return factory.Create(*config, newFunc, newListFunc, reverseKeyFunc, resourcePrefix)
 }

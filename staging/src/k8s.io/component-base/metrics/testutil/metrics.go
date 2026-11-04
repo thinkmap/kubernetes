@@ -38,8 +38,29 @@ var (
 	QuantileLabel model.LabelName = model.QuantileLabel
 )
 
-// Metrics is generic metrics for other specific metrics
-type Metrics map[string]model.Samples
+// Metrics is generic metrics for other specific metrics.
+// This directly exposes Prometheus types. Test code may
+// use those via type aliases provided by this package
+// instead of imorting the Prometheus packages (https://github.com/kubernetes/kubernetes/issues/89267).
+type Metrics map[string]Samples
+type Samples = model.Samples
+type Sample = model.Sample
+type Time = model.Time
+type Metric = model.Metric
+type LabelValue = model.LabelValue
+type LabelValues = model.LabelValues
+type LabelName = model.LabelName
+type SampleHistogram = model.SampleHistogram
+type FloatString = model.FloatString
+type HistogramBuckets = model.HistogramBuckets
+type HistogramBucket = model.HistogramBucket
+
+// GatheredMetrics is a point-in-time snapshot of a Gatherer. Use it to extract
+// multiple metric/label-value combinations without re-gathering the whole
+// registry for every lookup.
+type GatheredMetrics struct {
+	families []*dto.MetricFamily
+}
 
 // Equal returns true if all metrics are the same as the arguments.
 func (m *Metrics) Equal(o Metrics) bool {
@@ -70,7 +91,7 @@ func NewMetrics() Metrics {
 
 // ParseMetrics parses Metrics from data returned from prometheus endpoint
 func ParseMetrics(data string, output *Metrics) error {
-	dec := expfmt.NewDecoder(strings.NewReader(data), expfmt.FmtText)
+	dec := expfmt.NewDecoder(strings.NewReader(data), expfmt.NewFormat(expfmt.TypeTextPlain))
 	decoder := expfmt.SampleDecoder{
 		Dec:  dec,
 		Opts: &expfmt.DecodeOptions{},
@@ -86,7 +107,7 @@ func ParseMetrics(data string, output *Metrics) error {
 			continue
 		}
 		for _, metric := range v {
-			name := string(metric.Metric[model.MetricNameLabel])
+			name := string(metric.Metric[MetricNameLabel])
 			(*output)[name] = append((*output)[name], metric)
 		}
 	}
@@ -97,33 +118,15 @@ func ParseMetrics(data string, output *Metrics) error {
 // proto messages in a map where the metric names are the keys, along with any
 // error encountered.
 func TextToMetricFamilies(in io.Reader) (map[string]*dto.MetricFamily, error) {
-	var textParser expfmt.TextParser
+	textParser := expfmt.NewTextParser(model.UTF8Validation)
 	return textParser.TextToMetricFamilies(in)
 }
 
-// ExtractMetricSamples parses the prometheus metric samples from the input string.
-func ExtractMetricSamples(metricsBlob string) ([]*model.Sample, error) {
-	dec := expfmt.NewDecoder(strings.NewReader(metricsBlob), expfmt.FmtText)
-	decoder := expfmt.SampleDecoder{
-		Dec:  dec,
-		Opts: &expfmt.DecodeOptions{},
-	}
-
-	var samples []*model.Sample
-	for {
-		var v model.Vector
-		if err := decoder.Decode(&v); err != nil {
-			if err == io.EOF {
-				// Expected loop termination condition.
-				return samples, nil
-			}
-			return nil, err
-		}
-		samples = append(samples, v...)
-	}
+func MetricFamilyToText(out io.Writer, in *dto.MetricFamily) (written int, err error) {
+	return expfmt.MetricFamilyToText(out, in)
 }
 
-// PrintSample returns formated representation of metric Sample
+// PrintSample returns formatted representation of metric Sample
 func PrintSample(sample *model.Sample) string {
 	buf := make([]string, 0)
 	// Id is a VERY special label. For 'normal' container it's useless, but it's necessary
@@ -198,47 +201,151 @@ type Histogram struct {
 	*dto.Histogram
 }
 
-// GetHistogramFromGatherer collects a metric from a gatherer implementing k8s.io/component-base/metrics.Gatherer interface.
-// Used only for testing purposes where we need to gather metrics directly from a running binary (without metrics endpoint).
-func GetHistogramFromGatherer(gatherer metrics.Gatherer, metricName string) (Histogram, error) {
-	var metricFamily *dto.MetricFamily
-	m, err := gatherer.Gather()
-	if err != nil {
-		return Histogram{}, err
+// HistogramVec wraps a slice of Histogram.
+// Note that each Histogram must have the same number of buckets.
+type HistogramVec []*Histogram
+
+// GetAggregatedSampleCount aggregates the sample count of each inner Histogram.
+func (vec HistogramVec) GetAggregatedSampleCount() uint64 {
+	var count uint64
+	for _, hist := range vec {
+		count += hist.GetSampleCount()
 	}
-	for _, mFamily := range m {
-		if mFamily.GetName() == metricName {
-			metricFamily = mFamily
-			break
+	return count
+}
+
+// GetAggregatedSampleSum aggregates the sample sum of each inner Histogram.
+func (vec HistogramVec) GetAggregatedSampleSum() float64 {
+	var sum float64
+	for _, hist := range vec {
+		sum += hist.GetSampleSum()
+	}
+	return sum
+}
+
+// Quantile first aggregates inner buckets of each Histogram, and then
+// computes q-th quantile of a cumulative histogram.
+//
+// If any of the wrapped histograms carries native histogram data (sparse,
+// exponentially sized buckets), that data is used in preference to the
+// classic fixed-size buckets because it yields a much more accurate
+// estimate: classic buckets are sized ahead of time and observations tend
+// to pile up in a single bucket, which makes the resulting quantile
+// meaningless.
+func (vec HistogramVec) Quantile(q float64) float64 {
+	var native []bucket
+	hasNative := false
+	for _, hist := range vec {
+		if b := hist.nativeBuckets(); b != nil {
+			hasNative = true
+			native = append(native, b...)
+		}
+	}
+	if hasNative {
+		return nonCumulativeBucketQuantile(q, mergeBuckets(native))
+	}
+
+	var buckets []bucket
+
+	for i, hist := range vec {
+		for j, bckt := range hist.Bucket {
+			if i == 0 {
+				buckets = append(buckets, bucket{
+					count:      float64(bckt.GetCumulativeCount()),
+					upperBound: bckt.GetUpperBound(),
+				})
+			} else {
+				buckets[j].count += float64(bckt.GetCumulativeCount())
+			}
 		}
 	}
 
-	if metricFamily == nil {
-		return Histogram{}, fmt.Errorf("metric %q not found", metricName)
+	if len(buckets) == 0 || buckets[len(buckets)-1].upperBound != math.Inf(+1) {
+		// The list of buckets in dto.Histogram doesn't include the final +Inf bucket, so we
+		// add it here for the rest of the samples.
+		buckets = append(buckets, bucket{
+			count:      float64(vec.GetAggregatedSampleCount()),
+			upperBound: math.Inf(+1),
+		})
 	}
 
-	if metricFamily.GetMetric() == nil {
-		return Histogram{}, fmt.Errorf("metric %q is empty", metricName)
+	return bucketQuantile(q, buckets)
+}
+
+// Average computes wrapped histograms' average value.
+func (vec HistogramVec) Average() float64 {
+	return vec.GetAggregatedSampleSum() / float64(vec.GetAggregatedSampleCount())
+}
+
+// Validate makes sure the wrapped histograms have all necessary fields set and with valid values.
+func (vec HistogramVec) Validate() error {
+	bucketSize := 0
+	for i, hist := range vec {
+		if err := hist.Validate(); err != nil {
+			return err
+		}
+		if i == 0 {
+			bucketSize = len(hist.GetBucket())
+		} else if bucketSize != len(hist.GetBucket()) {
+			return fmt.Errorf("found different bucket size: expect %v, but got %v at index %v", bucketSize, len(hist.GetBucket()), i)
+		}
+	}
+	return nil
+}
+
+// GatherMetrics collects all metric families from the given gatherer.
+func GatherMetrics(gatherer metrics.Gatherer) (*GatheredMetrics, error) {
+	families, err := gatherer.Gather()
+	if err != nil {
+		return nil, err
+	}
+	return &GatheredMetrics{families: families}, nil
+}
+
+// GetHistogramVec returns the histograms for metricName whose labels match lvMap
+// from the snapshot taken by GatherMetrics().
+func (g *GatheredMetrics) GetHistogramVec(metricName string, lvMap map[string]string) (HistogramVec, error) {
+	return histogramVecFromMetricFamilies(g.families, metricName, lvMap)
+}
+
+// GetHistogramVecFromGatherer collects a metric, that matches the input labelValue map,
+// from a gatherer implementing k8s.io/component-base/metrics.Gatherer interface.
+// Used only for testing purposes where we need to gather metrics directly from a running binary (without metrics endpoint).
+func GetHistogramVecFromGatherer(gatherer metrics.Gatherer, metricName string, lvMap map[string]string) (HistogramVec, error) {
+	m, err := gatherer.Gather()
+	if err != nil {
+		return nil, err
+	}
+
+	return histogramVecFromMetricFamilies(m, metricName, lvMap)
+}
+
+func histogramVecFromMetricFamilies(metricFamilies []*dto.MetricFamily, metricName string, lvMap map[string]string) (HistogramVec, error) {
+	metricFamily := findMetricFamily(metricFamilies, metricName)
+
+	if metricFamily == nil {
+		return nil, fmt.Errorf("metric %q not found", metricName)
 	}
 
 	if len(metricFamily.GetMetric()) == 0 {
-		return Histogram{}, fmt.Errorf("metric %q is empty", metricName)
+		return nil, fmt.Errorf("metric %q is empty", metricName)
 	}
 
-	return Histogram{
-		// Histograms are stored under the first index (based on observation).
-		// Given there's only one histogram registered per each metric name, accessing
-		// the first index is sufficient.
-		metricFamily.GetMetric()[0].GetHistogram(),
-	}, nil
-}
-
-func uint64Ptr(u uint64) *uint64 {
-	return &u
+	vec := make(HistogramVec, 0)
+	for _, metric := range metricFamily.GetMetric() {
+		if LabelsMatch(metric, lvMap) {
+			if hist := metric.GetHistogram(); hist != nil {
+				vec = append(vec, &Histogram{hist})
+			}
+		}
+	}
+	return vec, nil
 }
 
 // Bucket of a histogram
 type bucket struct {
+	// lowerBound is only used for non-cumulative (native histogram) buckets.
+	lowerBound float64
 	upperBound float64
 	count      float64
 }
@@ -276,7 +383,15 @@ func bucketQuantile(q float64, buckets []bucket) float64 {
 
 // Quantile computes q-th quantile of a cumulative histogram.
 // It's expected the histogram is valid (by calling Validate)
+//
+// If the histogram carries native histogram data (sparse, exponentially
+// sized buckets), that data is used in preference to the classic fixed-size
+// buckets, see HistogramVec.Quantile for the rationale.
 func (hist *Histogram) Quantile(q float64) float64 {
+	if native := hist.nativeBuckets(); native != nil {
+		return nonCumulativeBucketQuantile(q, native)
+	}
+
 	var buckets []bucket
 
 	for _, bckt := range hist.Bucket {
@@ -286,30 +401,175 @@ func (hist *Histogram) Quantile(q float64) float64 {
 		})
 	}
 
-	// bucketQuantile expects the upper bound of the last bucket to be +inf
-	// buckets[len(buckets)-1].upperBound = math.Inf(+1)
+	if len(buckets) == 0 || buckets[len(buckets)-1].upperBound != math.Inf(+1) {
+		// The list of buckets in dto.Histogram doesn't include the final +Inf bucket, so we
+		// add it here for the rest of the samples.
+		buckets = append(buckets, bucket{
+			count:      float64(hist.GetSampleCount()),
+			upperBound: math.Inf(+1),
+		})
+	}
 
 	return bucketQuantile(q, buckets)
+}
+
+// nativeBuckets decodes the sparse, exponentially sized buckets of a native
+// histogram (https://www.kubernetes.dev/resources/keps/5808/)
+// into a list of non-cumulative buckets covering the real number line,
+// sorted by ascending upper bound. It returns nil if hist doesn't carry any
+// native histogram data (e.g. because native histograms are disabled or the
+// histogram has no observations).
+func (hist *Histogram) nativeBuckets() []bucket {
+	h := hist.Histogram
+	if len(h.GetPositiveSpan()) == 0 && len(h.GetNegativeSpan()) == 0 &&
+		h.GetZeroCount() == 0 && h.GetZeroCountFloat() == 0 {
+		return nil
+	}
+
+	schema := h.GetSchema()
+	var buckets []bucket
+
+	for idx, count := range decodeNativeHistogramSpans(h.GetPositiveSpan(), h.GetPositiveDelta(), h.GetPositiveCount()) {
+		if count <= 0 {
+			continue
+		}
+		lower, upper := nativeHistogramBucketBounds(schema, idx)
+		buckets = append(buckets, bucket{lowerBound: lower, upperBound: upper, count: count})
+	}
+	for idx, count := range decodeNativeHistogramSpans(h.GetNegativeSpan(), h.GetNegativeDelta(), h.GetNegativeCount()) {
+		if count <= 0 {
+			continue
+		}
+		lower, upper := nativeHistogramBucketBounds(schema, idx)
+		buckets = append(buckets, bucket{lowerBound: -upper, upperBound: -lower, count: count})
+	}
+
+	zeroCount := h.GetZeroCountFloat()
+	if zeroCount == 0 {
+		zeroCount = float64(h.GetZeroCount())
+	}
+	if zeroCount > 0 {
+		threshold := h.GetZeroThreshold()
+		buckets = append(buckets, bucket{lowerBound: -threshold, upperBound: threshold, count: zeroCount})
+	}
+
+	sort.Slice(buckets, func(i, j int) bool { return buckets[i].upperBound < buckets[j].upperBound })
+	return buckets
+}
+
+// mergeBuckets sorts buckets by ascending upper bound and sums the counts of
+// buckets sharing the same (lowerBound, upperBound) range. This is necessary
+// when combining native histogram buckets from multiple Histograms (e.g. in
+// HistogramVec.Quantile): without merging, two histograms observing values in
+// the same bucket would be treated as separate buckets covering the same
+// range, which skews nonCumulativeBucketQuantile's within-bucket
+// interpolation.
+func mergeBuckets(buckets []bucket) []bucket {
+	sort.Slice(buckets, func(i, j int) bool { return buckets[i].upperBound < buckets[j].upperBound })
+
+	var merged []bucket
+	for _, b := range buckets {
+		if n := len(merged); n > 0 && merged[n-1].lowerBound == b.lowerBound && merged[n-1].upperBound == b.upperBound {
+			merged[n-1].count += b.count
+			continue
+		}
+		merged = append(merged, b)
+	}
+	return merged
+}
+
+// decodeNativeHistogramSpans decodes the sparse bucket representation used by
+// native histograms (a list of spans of consecutive populated buckets, plus
+// either per-bucket count deltas or absolute counts) into a map from bucket
+// index to the (absolute) count observed in that bucket.
+func decodeNativeHistogramSpans(spans []*dto.BucketSpan, deltas []int64, counts []float64) map[int32]float64 {
+	result := make(map[int32]float64, len(deltas)+len(counts))
+	if len(counts) > 0 {
+		// Buckets store their absolute count directly.
+		i := 0
+		idx := int32(0)
+		for _, span := range spans {
+			idx += span.GetOffset()
+			for range span.GetLength() {
+				if i < len(counts) {
+					result[idx] = counts[i]
+				}
+				idx++
+				i++
+			}
+		}
+		return result
+	}
+
+	// Buckets store deltas relative to the previous populated bucket (or to
+	// zero for the first one).
+	i := 0
+	idx := int32(0)
+	running := 0.0
+	for _, span := range spans {
+		idx += span.GetOffset()
+		for range span.GetLength() {
+			if i < len(deltas) {
+				running += float64(deltas[i])
+			}
+			result[idx] = running
+			idx++
+			i++
+		}
+	}
+	return result
+}
+
+// nativeHistogramBucketBounds returns the (lowerBound, upperBound] range
+// covered by the positive bucket with the given index in a native histogram
+// with the given schema. Buckets grow exponentially with a per-bucket growth
+// factor of 2^(2^-schema).
+func nativeHistogramBucketBounds(schema, idx int32) (lower, upper float64) {
+	base := math.Pow(2, math.Pow(2, -float64(schema)))
+	return math.Pow(base, float64(idx-1)), math.Pow(base, float64(idx))
+}
+
+// nonCumulativeBucketQuantile computes the q-th quantile from a list of
+// non-cumulative buckets (as opposed to bucketQuantile, which expects
+// cumulative bucket counts and assumes the lowest bucket starts at 0).
+// Buckets must be sorted by ascending upper bound.
+func nonCumulativeBucketQuantile(q float64, buckets []bucket) float64 {
+	if q < 0 {
+		return math.Inf(-1)
+	}
+	if q > 1 {
+		return math.Inf(+1)
+	}
+	if len(buckets) == 0 {
+		return math.NaN()
+	}
+
+	var total float64
+	for _, b := range buckets {
+		total += b.count
+	}
+	if total == 0 {
+		return math.NaN()
+	}
+
+	rank := q * total
+	var cumulative float64
+	for _, b := range buckets {
+		if cumulative+b.count >= rank {
+			if b.count == 0 {
+				return b.upperBound
+			}
+			frac := (rank - cumulative) / b.count
+			return b.lowerBound + (b.upperBound-b.lowerBound)*frac
+		}
+		cumulative += b.count
+	}
+	return buckets[len(buckets)-1].upperBound
 }
 
 // Average computes histogram's average value
 func (hist *Histogram) Average() float64 {
 	return hist.GetSampleSum() / float64(hist.GetSampleCount())
-}
-
-// Clear clears all fields of the wrapped histogram
-func (hist *Histogram) Clear() {
-	if hist.SampleCount != nil {
-		*hist.SampleCount = 0
-	}
-	if hist.SampleSum != nil {
-		*hist.SampleSum = 0
-	}
-	for _, b := range hist.Bucket {
-		if b.CumulativeCount != nil {
-			*b.CumulativeCount = 0
-		}
-	}
 }
 
 // Validate makes sure the wrapped histogram has all necessary fields set and with valid values.
@@ -334,7 +594,7 @@ func (hist *Histogram) Validate() error {
 	return nil
 }
 
-// GetGaugeMetricValue extract metric value from GaugeMetric
+// GetGaugeMetricValue extracts metric value from GaugeMetric
 func GetGaugeMetricValue(m metrics.GaugeMetric) (float64, error) {
 	metricProto := &dto.Metric{}
 	if err := m.Write(metricProto); err != nil {
@@ -343,7 +603,7 @@ func GetGaugeMetricValue(m metrics.GaugeMetric) (float64, error) {
 	return metricProto.Gauge.GetValue(), nil
 }
 
-// GetCounterMetricValue extract metric value from CounterMetric
+// GetCounterMetricValue extracts metric value from CounterMetric
 func GetCounterMetricValue(m metrics.CounterMetric) (float64, error) {
 	metricProto := &dto.Metric{}
 	if err := m.(metrics.Metric).Write(metricProto); err != nil {
@@ -352,13 +612,22 @@ func GetCounterMetricValue(m metrics.CounterMetric) (float64, error) {
 	return metricProto.Counter.GetValue(), nil
 }
 
-// GetHistogramMetricValue extract sum of all samples from ObserverMetric
+// GetHistogramMetricValue extracts sum of all samples from ObserverMetric
 func GetHistogramMetricValue(m metrics.ObserverMetric) (float64, error) {
 	metricProto := &dto.Metric{}
 	if err := m.(metrics.Metric).Write(metricProto); err != nil {
 		return 0, fmt.Errorf("error writing m: %v", err)
 	}
 	return metricProto.Histogram.GetSampleSum(), nil
+}
+
+// GetHistogramMetricCount extracts count of all samples from ObserverMetric
+func GetHistogramMetricCount(m metrics.ObserverMetric) (uint64, error) {
+	metricProto := &dto.Metric{}
+	if err := m.(metrics.Metric).Write(metricProto); err != nil {
+		return 0, fmt.Errorf("error writing m: %v", err)
+	}
+	return metricProto.Histogram.GetSampleCount(), nil
 }
 
 // LabelsMatch returns true if metric has all expected labels otherwise false
@@ -381,4 +650,48 @@ func LabelsMatch(metric *dto.Metric, labelFilter map[string]string) bool {
 	}
 
 	return true
+}
+
+// GetCounterVecFromGatherer collects a counter that matches the given name
+// from a gatherer implementing k8s.io/component-base/metrics.Gatherer interface.
+// It returns all counter values that had a label with a certain name in a map
+// that uses the label value as keys.
+//
+// Used only for testing purposes where we need to gather metrics directly from a running binary (without metrics endpoint).
+func GetCounterValuesFromGatherer(gatherer metrics.Gatherer, metricName string, lvMap map[string]string, labelName string) (map[string]float64, error) {
+	m, err := gatherer.Gather()
+	if err != nil {
+		return nil, err
+	}
+
+	metricFamily := findMetricFamily(m, metricName)
+	if metricFamily == nil {
+		return nil, fmt.Errorf("metric %q not found", metricName)
+	}
+	if len(metricFamily.GetMetric()) == 0 {
+		return nil, fmt.Errorf("metric %q is empty", metricName)
+	}
+
+	values := make(map[string]float64)
+	for _, metric := range metricFamily.GetMetric() {
+		if LabelsMatch(metric, lvMap) {
+			if counter := metric.GetCounter(); counter != nil {
+				for _, labelPair := range metric.Label {
+					if labelPair.GetName() == labelName {
+						values[labelPair.GetValue()] = counter.GetValue()
+					}
+				}
+			}
+		}
+	}
+	return values, nil
+}
+
+func findMetricFamily(metricFamilies []*dto.MetricFamily, metricName string) *dto.MetricFamily {
+	for _, mFamily := range metricFamilies {
+		if mFamily.GetName() == metricName {
+			return mFamily
+		}
+	}
+	return nil
 }

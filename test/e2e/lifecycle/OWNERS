@@ -1,8 +1,10 @@
 # See the OWNERS docs at https://go.k8s.io/owners
 
 approvers:
-- sig-cluster-lifecycle-maintainers
+  - sig-node-approvers
+  - atiratree
 reviewers:
-- sig-cluster-lifecycle
+  - atiratree
 labels:
-- sig/cluster-lifecycle
+  - sig/node
+  - wg/node-lifecycle

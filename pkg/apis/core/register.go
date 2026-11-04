@@ -54,7 +54,6 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 	scheme.AddKnownTypes(SchemeGroupVersion,
 		&Pod{},
 		&PodList{},
-		&PodStatusResult{},
 		&PodTemplate{},
 		&PodTemplateList{},
 		&ReplicationControllerList{},
@@ -96,7 +95,6 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&RangeAllocation{},
 		&ConfigMap{},
 		&ConfigMapList{},
-		&EphemeralContainers{},
 	)
 
 	return nil

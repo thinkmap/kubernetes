@@ -25,17 +25,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-openapi/spec"
+	openapi_v2 "github.com/google/gnostic-models/openapiv2"
 	"github.com/google/go-cmp/cmp"
-	fuzz "github.com/google/gofuzz"
-	"github.com/googleapis/gnostic/compiler"
-	openapi_v2 "github.com/googleapis/gnostic/openapiv2"
-	"gopkg.in/yaml.v2"
+	"sigs.k8s.io/randfill"
 
+	yaml "go.yaml.in/yaml/v2"
+	apiextensionsv1beta1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1beta1"
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
-	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	apiextensionsv1beta1conversion "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
 	"k8s.io/kube-openapi/pkg/util/proto"
+	"k8s.io/kube-openapi/pkg/validation/spec"
+	"k8s.io/utils/ptr"
 )
 
 func Test_ConvertJSONSchemaPropsToOpenAPIv2Schema(t *testing.T) {
@@ -92,7 +93,7 @@ properties:
 	}
 
 	specInternal := apiextensions.JSONSchemaProps{}
-	if err := apiextensionsv1beta1.Convert_v1beta1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(&specV1beta1, &specInternal, nil); err != nil {
+	if err := apiextensionsv1beta1conversion.Convert_v1beta1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(&specV1beta1, &specInternal, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -102,7 +103,7 @@ properties:
 	}
 
 	ssV2 := ToStructuralOpenAPIV2(ss)
-	schema := ssV2.ToGoOpenAPI()
+	schema := ssV2.ToKubeOpenAPI()
 
 	if _, found := schema.Properties["spec"]; !found {
 		t.Errorf("spec not found")
@@ -632,7 +633,6 @@ func Test_ConvertJSONSchemaPropsToOpenAPIv2SchemaByType(t *testing.T) {
 			},
 			expected: new(spec.Schema).
 				WithExternalDocs(testStr, testStr2),
-			expectDiff: true,
 		},
 		{
 			name: "example",
@@ -641,7 +641,30 @@ func Test_ConvertJSONSchemaPropsToOpenAPIv2SchemaByType(t *testing.T) {
 			},
 			expected: new(spec.Schema).
 				WithExample(testStr),
-			expectDiff: true,
+		},
+		{
+			name: "preserve-unknown-fields in arrays",
+			in: &apiextensions.JSONSchemaProps{
+				XPreserveUnknownFields: ptr.To(true),
+				Type:                   "array",
+				Items: &apiextensions.JSONSchemaPropsOrArray{Schema: &apiextensions.JSONSchemaProps{
+					Type: "string",
+				}},
+			},
+			expected: withVendorExtensions(new(spec.Schema), "x-kubernetes-preserve-unknown-fields", true),
+		},
+		{
+			name: "preserve-unknown-fields in objects",
+			in: &apiextensions.JSONSchemaProps{
+				XPreserveUnknownFields: ptr.To(true),
+				Type:                   "object",
+				Properties: map[string]apiextensions.JSONSchemaProps{
+					"foo": {
+						Type: "string",
+					},
+				},
+			},
+			expected: withVendorExtensions(new(spec.Schema), "x-kubernetes-preserve-unknown-fields", true),
 		},
 	}
 
@@ -655,7 +678,7 @@ func Test_ConvertJSONSchemaPropsToOpenAPIv2SchemaByType(t *testing.T) {
 			}
 
 			if !test.expectError {
-				out := ToStructuralOpenAPIV2(ss).ToGoOpenAPI()
+				out := ToStructuralOpenAPIV2(ss).ToKubeOpenAPI()
 				if equal := reflect.DeepEqual(*out, *test.expected); !equal && !test.expectDiff {
 					t.Errorf("unexpected result:\n  want=%v\n   got=%v\n\n%s", *test.expected, *out, cmp.Diff(*test.expected, *out, cmp.Comparer(refEqual)))
 				} else if equal && test.expectDiff {
@@ -666,6 +689,11 @@ func Test_ConvertJSONSchemaPropsToOpenAPIv2SchemaByType(t *testing.T) {
 	}
 }
 
+func withVendorExtensions(s *spec.Schema, key string, value interface{}) *spec.Schema {
+	s.VendorExtensible.AddExtension(key, value)
+	return s
+}
+
 func refEqual(x spec.Ref, y spec.Ref) bool {
 	return x.String() == y.String()
 }
@@ -673,16 +701,17 @@ func refEqual(x spec.Ref, y spec.Ref) bool {
 // TestKubeOpenapiRejectionFiltering tests that the CRD openapi schema filtering leads to a spec that the
 // kube-openapi/pkg/util/proto model code support in version used in Kubernetes 1.13.
 func TestKubeOpenapiRejectionFiltering(t *testing.T) {
-	for i := 0; i < 10000; i++ {
-		f := fuzz.New()
+	// 1000 iterations runs for ~2 seconds with race detection enabled
+	for i := 0; i < 1000; i++ {
+		f := randfill.New()
 		seed := time.Now().UnixNano()
 		randSource := rand.New(rand.NewSource(seed))
 		f.RandSource(randSource)
 		t.Logf("iteration %d with seed %d", i, seed)
 
-		fuzzFuncs(f, func(ref *spec.Ref, c fuzz.Continue, visible bool) {
+		fuzzFuncs(f, func(ref *spec.Ref, c randfill.Continue, visible bool) {
 			var url string
-			if c.RandBool() {
+			if c.Bool() {
 				url = fmt.Sprintf("http://%d", c.Intn(100000))
 			} else {
 				url = "#/definitions/test"
@@ -696,7 +725,7 @@ func TestKubeOpenapiRejectionFiltering(t *testing.T) {
 
 		// create go-openapi object and fuzz it (we start here because we have the powerful fuzzer already
 		s := &spec.Schema{}
-		f.Fuzz(s)
+		f.Fill(s)
 
 		// convert to apiextensions v1beta1
 		bs, err := json.Marshal(s)
@@ -712,7 +741,7 @@ func TestKubeOpenapiRejectionFiltering(t *testing.T) {
 
 		// convert to internal
 		internalSchema := &apiextensions.JSONSchemaProps{}
-		if err := apiextensionsv1beta1.Convert_v1beta1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(schema, internalSchema, nil); err != nil {
+		if err := apiextensionsv1beta1conversion.Convert_v1beta1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(schema, internalSchema, nil); err != nil {
 			t.Fatalf("failed to convert from apiextensions/v1beta1 to internal: %v", err)
 		}
 
@@ -721,7 +750,7 @@ func TestKubeOpenapiRejectionFiltering(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		filtered := ToStructuralOpenAPIV2(ss).ToGoOpenAPI()
+		filtered := ToStructuralOpenAPIV2(ss).ToKubeOpenAPI()
 
 		// create a doc out of it
 		filteredSwagger := &spec.Swagger{
@@ -746,14 +775,8 @@ func TestKubeOpenapiRejectionFiltering(t *testing.T) {
 			t.Fatalf("failed to encode filtered to JSON: %v", err)
 		}
 
-		// unmarshal as yaml
-		var yml yaml.MapSlice
-		if err := yaml.Unmarshal(bs, &yml); err != nil {
-			t.Fatalf("failed to decode filtered JSON by into memory: %v", err)
-		}
-
 		// create gnostic doc
-		doc, err := openapi_v2.NewDocument(yml, compiler.NewContext("$root", nil))
+		doc, err := openapi_v2.ParseDocument(bs)
 		if err != nil {
 			t.Fatalf("failed to create gnostic doc: %v", err)
 		}
@@ -766,7 +789,7 @@ func TestKubeOpenapiRejectionFiltering(t *testing.T) {
 }
 
 // fuzzFuncs is copied from kube-openapi/pkg/aggregator. It fuzzes go-openapi/spec schemata.
-func fuzzFuncs(f *fuzz.Fuzzer, refFunc func(ref *spec.Ref, c fuzz.Continue, visible bool)) {
+func fuzzFuncs(f *randfill.Filler, refFunc func(ref *spec.Ref, c randfill.Continue, visible bool)) {
 	invisible := 0 // == 0 means visible, > 0 means invisible
 	depth := 0
 	maxDepth := 3
@@ -778,14 +801,14 @@ func fuzzFuncs(f *fuzz.Fuzzer, refFunc func(ref *spec.Ref, c fuzz.Continue, visi
 		f.NumElements(0, max(0, maxDepth-depth))
 	}
 	updateFuzzer(depth)
-	enter := func(o interface{}, recursive bool, c fuzz.Continue) {
+	enter := func(o interface{}, recursive bool, c randfill.Continue) {
 		if recursive {
 			depth++
 			updateFuzzer(depth)
 		}
 
 		invisible++
-		c.FuzzNoCustom(o)
+		c.FillNoCustom(o)
 		invisible--
 	}
 	leave := func(recursive bool) {
@@ -795,31 +818,31 @@ func fuzzFuncs(f *fuzz.Fuzzer, refFunc func(ref *spec.Ref, c fuzz.Continue, visi
 		}
 	}
 	f.Funcs(
-		func(ref *spec.Ref, c fuzz.Continue) {
+		func(ref *spec.Ref, c randfill.Continue) {
 			refFunc(ref, c, invisible == 0)
 		},
-		func(sa *spec.SchemaOrStringArray, c fuzz.Continue) {
+		func(sa *spec.SchemaOrStringArray, c randfill.Continue) {
 			*sa = spec.SchemaOrStringArray{}
-			if c.RandBool() {
-				c.Fuzz(&sa.Schema)
+			if c.Bool() {
+				c.Fill(&sa.Schema)
 			} else {
-				c.Fuzz(&sa.Property)
+				c.Fill(&sa.Property)
 			}
 			if sa.Schema == nil && len(sa.Property) == 0 {
 				*sa = spec.SchemaOrStringArray{Schema: &spec.Schema{}}
 			}
 		},
-		func(url *spec.SchemaURL, c fuzz.Continue) {
+		func(url *spec.SchemaURL, c randfill.Continue) {
 			*url = spec.SchemaURL("http://url")
 		},
-		func(s *spec.Dependencies, c fuzz.Continue) {
+		func(s *spec.Dependencies, c randfill.Continue) {
 			enter(s, false, c)
 			defer leave(false)
 
 			// and nothing with invisible==false
 		},
-		func(p *spec.SimpleSchema, c fuzz.Continue) {
-			// gofuzz is broken and calls this even for *SimpleSchema fields, ignoring NilChance, leading to infinite recursion
+		func(p *spec.SimpleSchema, c randfill.Continue) {
+			// randfill is broken and calls this even for *SimpleSchema fields, ignoring NilChance, leading to infinite recursion
 			if c.Float64() > nilChance(depth) {
 				return
 			}
@@ -827,7 +850,7 @@ func fuzzFuncs(f *fuzz.Fuzzer, refFunc func(ref *spec.Ref, c fuzz.Continue, visi
 			enter(p, true, c)
 			defer leave(true)
 
-			c.FuzzNoCustom(p)
+			c.FillNoCustom(p)
 
 			// reset JSON fields to some correct JSON
 			if p.Default != nil {
@@ -835,12 +858,12 @@ func fuzzFuncs(f *fuzz.Fuzzer, refFunc func(ref *spec.Ref, c fuzz.Continue, visi
 			}
 			p.Example = nil
 		},
-		func(s *spec.SwaggerSchemaProps, c fuzz.Continue) {
+		func(s *spec.SwaggerSchemaProps, c randfill.Continue) {
 			// nothing allowed
 			*s = spec.SwaggerSchemaProps{}
 		},
-		func(s *spec.SchemaProps, c fuzz.Continue) {
-			// gofuzz is broken and calls this even for *SchemaProps fields, ignoring NilChance, leading to infinite recursion
+		func(s *spec.SchemaProps, c randfill.Continue) {
+			// randfill is broken and calls this even for *SchemaProps fields, ignoring NilChance, leading to infinite recursion
 			if c.Float64() > nilChance(depth) {
 				return
 			}
@@ -848,9 +871,9 @@ func fuzzFuncs(f *fuzz.Fuzzer, refFunc func(ref *spec.Ref, c fuzz.Continue, visi
 			enter(s, true, c)
 			defer leave(true)
 
-			c.FuzzNoCustom(s)
+			c.FillNoCustom(s)
 
-			if c.RandBool() {
+			if c.Bool() {
 				types := []string{"object", "array", "boolean", "string", "integer", "number"}
 				s.Type = []string{types[c.Intn(len(types))]}
 			} else {
@@ -867,7 +890,7 @@ func fuzzFuncs(f *fuzz.Fuzzer, refFunc func(ref *spec.Ref, c fuzz.Continue, visi
 
 			if len(s.Type) == 1 && s.Type[0] == "array" {
 				s.Items = &spec.SchemaOrArray{Schema: &spec.Schema{}}
-				c.Fuzz(s.Items.Schema)
+				c.Fill(s.Items.Schema)
 			} else {
 				s.Items = nil
 			}
@@ -880,7 +903,7 @@ func fuzzFuncs(f *fuzz.Fuzzer, refFunc func(ref *spec.Ref, c fuzz.Continue, visi
 				s.Enum[i] = "42"
 			}
 		},
-		func(i *interface{}, c fuzz.Continue) {
+		func(i *interface{}, c randfill.Continue) {
 			// do nothing for examples and defaults. These are free form JSON fields.
 		},
 	)
@@ -912,11 +935,4 @@ func TestFilterOut(t *testing.T) {
 			}
 		})
 	}
-}
-
-func max(i, j int) int {
-	if i > j {
-		return i
-	}
-	return j
 }

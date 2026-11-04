@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"strings"
 	"testing"
@@ -34,6 +33,7 @@ import (
 	"k8s.io/client-go/discovery"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/rest/fake"
+	"k8s.io/ktesting"
 )
 
 func objBody(object interface{}) io.ReadCloser {
@@ -41,10 +41,11 @@ func objBody(object interface{}) io.ReadCloser {
 	if err != nil {
 		panic(err)
 	}
-	return ioutil.NopCloser(bytes.NewReader([]byte(output)))
+	return io.NopCloser(bytes.NewReader([]byte(output)))
 }
 
 func TestServerSupportsVersion(t *testing.T) {
+	tCtx := ktesting.Init(t)
 	tests := []struct {
 		name            string
 		requiredVersion schema.GroupVersion
@@ -67,16 +68,27 @@ func TestServerSupportsVersion(t *testing.T) {
 			statusCode:      http.StatusOK,
 		},
 		{
+			name:            "Status 403 Forbidden for core/v1 group returns error and is unsupported",
+			requiredVersion: schema.GroupVersion{Version: "v1"},
+			serverVersions:  []string{"/version1", v1.SchemeGroupVersion.String()},
+			expectErr:       func(err error) bool { return strings.Contains(err.Error(), "unknown") },
+			statusCode:      http.StatusForbidden,
+		},
+		{
+			name:            "Status 404 Not Found for core/v1 group returns empty and is unsupported",
+			requiredVersion: schema.GroupVersion{Version: "v1"},
+			serverVersions:  []string{"/version1", v1.SchemeGroupVersion.String()},
+			expectErr: func(err error) bool {
+				return strings.Contains(err.Error(), "server could not find the requested resource")
+			},
+			statusCode: http.StatusNotFound,
+		},
+		{
 			name:           "connection refused error",
 			serverVersions: []string{"version1"},
 			sendErr:        errors.New("connection refused"),
 			expectErr:      func(err error) bool { return strings.Contains(err.Error(), "connection refused") },
 			statusCode:     http.StatusOK,
-		},
-		{
-			name:            "discovery fails due to 404 Not Found errors and thus serverVersions is empty, use requested GroupVersion",
-			requiredVersion: schema.GroupVersion{Version: "version1"},
-			statusCode:      http.StatusNotFound,
 		},
 	}
 
@@ -91,7 +103,7 @@ func TestServerSupportsVersion(t *testing.T) {
 		})
 		c := discovery.NewDiscoveryClientForConfigOrDie(&restclient.Config{})
 		c.RESTClient().(*restclient.RESTClient).Client = fakeClient
-		err := discovery.ServerSupportsVersion(c, test.requiredVersion)
+		err := discovery.ServerSupportsVersionWithContext(tCtx, discovery.ToDiscoveryInterfaceWithContext(c), test.requiredVersion)
 		if err == nil && test.expectErr != nil {
 			t.Errorf("expected error, got nil for [%s].", test.name)
 		}

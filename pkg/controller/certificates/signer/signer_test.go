@@ -17,44 +17,79 @@ limitations under the License.
 package signer
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
-	"io/ioutil"
+	"fmt"
+	"os"
+
 	"math/rand"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 
-	capi "k8s.io/api/certificates/v1beta1"
-	"k8s.io/apimachinery/pkg/util/clock"
-	"k8s.io/apimachinery/pkg/util/diff"
+	capi "k8s.io/api/certificates/v1"
 	"k8s.io/client-go/kubernetes/fake"
 	testclient "k8s.io/client-go/testing"
 	"k8s.io/client-go/util/cert"
-
-	capihelper "k8s.io/kubernetes/pkg/apis/certificates/v1beta1"
+	"k8s.io/client-go/util/certificate/csr"
+	capihelper "k8s.io/kubernetes/pkg/apis/certificates/v1"
+	"k8s.io/kubernetes/pkg/controller/certificates"
+	testingclock "k8s.io/utils/clock/testing"
 )
 
-func TestSigner(t *testing.T) {
-	clock := clock.FakeClock{}
+// ignoreUnset is an option that ignores fields that are unset on the right
+// hand side of a comparison. This is useful in testing to assert that an
+// object is a derivative.
+func ignoreUnset() cmp.Option {
+	return cmp.Options{
+		// ignore unset fields in v2
+		cmp.FilterPath(func(path cmp.Path) bool {
+			_, v2 := path.Last().Values()
+			switch v2.Kind() {
+			case reflect.Slice, reflect.Map:
+				if v2.IsNil() || v2.Len() == 0 {
+					return true
+				}
+			case reflect.String:
+				if v2.Len() == 0 {
+					return true
+				}
+			case reflect.Interface, reflect.Pointer:
+				if v2.IsNil() {
+					return true
+				}
+			}
+			return false
+		}, cmp.Ignore()),
+		// ignore map entries that aren't set in v2
+		cmp.FilterPath(func(path cmp.Path) bool {
+			switch i := path.Last().(type) {
+			case cmp.MapIndex:
+				if _, v2 := i.Values(); !v2.IsValid() {
+					fmt.Println("E")
+					return true
+				}
+			}
+			return false
+		}, cmp.Ignore()),
+	}
+}
 
-	s, err := newSigner("./testdata/ca.crt", "./testdata/ca.key", nil, 1*time.Hour)
+func TestSigner(t *testing.T) {
+	fakeClock := testingclock.FakeClock{}
+
+	s, err := newSigner("kubernetes.io/legacy-unknown", "./testdata/ca.crt", "./testdata/ca.key", nil, 1*time.Hour)
 	if err != nil {
 		t.Fatalf("failed to create signer: %v", err)
 	}
-	currCA, err := s.caProvider.currentCA()
-	if err != nil {
-		t.Fatal(err)
-	}
-	currCA.Now = clock.Now
-	currCA.Backdate = 0
-	s.caProvider.caValue.Store(currCA)
 
-	csrb, err := ioutil.ReadFile("./testdata/kubelet.csr")
+	csrb, err := os.ReadFile("./testdata/kubelet.csr")
 	if err != nil {
 		t.Fatalf("failed to read CSR: %v", err)
 	}
@@ -68,7 +103,11 @@ func TestSigner(t *testing.T) {
 		capi.UsageKeyEncipherment,
 		capi.UsageServerAuth,
 		capi.UsageClientAuth,
-	})
+	},
+		// requesting a duration that is greater than TTL is ignored
+		csr.DurationToExpirationSeconds(3*time.Hour),
+		fakeClock.Now,
+	)
 	if err != nil {
 		t.Fatalf("failed to sign CSR: %v", err)
 	}
@@ -93,14 +132,15 @@ func TestSigner(t *testing.T) {
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
-		NotAfter:              clock.Now().Add(1 * time.Hour),
+		NotBefore:             fakeClock.Now().Add(-5 * time.Minute),
+		NotAfter:              fakeClock.Now().Add(1 * time.Hour),
 		PublicKeyAlgorithm:    x509.ECDSA,
 		SignatureAlgorithm:    x509.SHA256WithRSA,
 		MaxPathLen:            -1,
 	}
 
-	if !cmp.Equal(*certs[0], want, diff.IgnoreUnset()) {
-		t.Errorf("unexpected diff: %v", cmp.Diff(certs[0], want, diff.IgnoreUnset()))
+	if !cmp.Equal(*certs[0], want, ignoreUnset()) {
+		t.Errorf("unexpected diff: %v", cmp.Diff(certs[0], want, ignoreUnset()))
 	}
 }
 
@@ -114,12 +154,20 @@ func TestHandle(t *testing.T) {
 		usages     []capi.KeyUsage
 		// whether the generated CSR should be marked as approved
 		approved bool
+		// whether the generated CSR should be marked as failed
+		failed bool
 		// the signerName to be set on the generated CSR
 		signerName string
 		// if true, expect an error to be returned
 		err bool
+		// if true, expect an error to be returned during construction
+		constructionErr bool
 		// additional verification function
 		verify func(*testing.T, []testclient.Action)
+		// cert file to use
+		certFile string
+		// key file to use
+		keyFile string
 	}{
 		{
 			name:       "should sign if signerName is kubernetes.io/kube-apiserver-client",
@@ -138,6 +186,28 @@ func TestHandle(t *testing.T) {
 					t.Errorf("expected certificate to be issued but it was not")
 				}
 			},
+			certFile: "./testdata/ca.crt",
+			keyFile:  "./testdata/ca.key",
+		},
+		{
+			name:       "should sign without key encipherment if signerName is kubernetes.io/kube-apiserver-client",
+			signerName: "kubernetes.io/kube-apiserver-client",
+			commonName: "hello-world",
+			org:        []string{"some-org"},
+			usages:     []capi.KeyUsage{capi.UsageClientAuth, capi.UsageDigitalSignature},
+			approved:   true,
+			verify: func(t *testing.T, as []testclient.Action) {
+				if len(as) != 1 {
+					t.Errorf("expected one Update action but got %d", len(as))
+					return
+				}
+				csr := as[0].(testclient.UpdateAction).GetObject().(*capi.CertificateSigningRequest)
+				if len(csr.Status.Certificate) == 0 {
+					t.Errorf("expected certificate to be issued but it was not")
+				}
+			},
+			certFile: "./testdata/ca.crt",
+			keyFile:  "./testdata/ca.key",
 		},
 		{
 			name:       "should refuse to sign if signerName is kubernetes.io/kube-apiserver-client and contains an unexpected usage",
@@ -147,11 +217,20 @@ func TestHandle(t *testing.T) {
 			usages:     []capi.KeyUsage{capi.UsageServerAuth, capi.UsageClientAuth, capi.UsageDigitalSignature, capi.UsageKeyEncipherment},
 			approved:   true,
 			verify: func(t *testing.T, as []testclient.Action) {
-				if len(as) != 0 {
-					t.Errorf("expected no Update action but got %d", len(as))
+				if len(as) != 1 {
+					t.Errorf("expected one Update action but got %d", len(as))
 					return
 				}
+				csr := as[0].(testclient.UpdateAction).GetObject().(*capi.CertificateSigningRequest)
+				if len(csr.Status.Certificate) != 0 {
+					t.Errorf("expected no certificate to be issued")
+				}
+				if !certificates.HasTrueCondition(csr, capi.CertificateFailed) {
+					t.Errorf("expected Failed condition")
+				}
 			},
+			certFile: "./testdata/ca.crt",
+			keyFile:  "./testdata/ca.key",
 		},
 		{
 			name:       "should sign if signerName is kubernetes.io/kube-apiserver-client-kubelet",
@@ -170,6 +249,28 @@ func TestHandle(t *testing.T) {
 					t.Errorf("expected certificate to be issued but it was not")
 				}
 			},
+			certFile: "./testdata/ca.crt",
+			keyFile:  "./testdata/ca.key",
+		},
+		{
+			name:       "should sign without usage key encipherment if signerName is kubernetes.io/kube-apiserver-client-kubelet",
+			signerName: "kubernetes.io/kube-apiserver-client-kubelet",
+			commonName: "system:node:hello-world",
+			org:        []string{"system:nodes"},
+			usages:     []capi.KeyUsage{capi.UsageClientAuth, capi.UsageDigitalSignature},
+			approved:   true,
+			verify: func(t *testing.T, as []testclient.Action) {
+				if len(as) != 1 {
+					t.Errorf("expected one Update action but got %d", len(as))
+					return
+				}
+				csr := as[0].(testclient.UpdateAction).GetObject().(*capi.CertificateSigningRequest)
+				if len(csr.Status.Certificate) == 0 {
+					t.Errorf("expected certificate to be issued but it was not")
+				}
+			},
+			certFile: "./testdata/ca.crt",
+			keyFile:  "./testdata/ca.key",
 		},
 		{
 			name:       "should sign if signerName is kubernetes.io/legacy-unknown",
@@ -185,6 +286,8 @@ func TestHandle(t *testing.T) {
 					t.Errorf("expected certificate to be issued but it was not")
 				}
 			},
+			certFile: "./testdata/ca.crt",
+			keyFile:  "./testdata/ca.key",
 		},
 		{
 			name:       "should sign if signerName is kubernetes.io/kubelet-serving",
@@ -204,16 +307,59 @@ func TestHandle(t *testing.T) {
 					t.Errorf("expected certificate to be issued but it was not")
 				}
 			},
+			certFile: "./testdata/ca.crt",
+			keyFile:  "./testdata/ca.key",
 		},
 		{
-			name:       "should do nothing if an unrecognised signerName is used",
-			signerName: "kubernetes.io/not-recognised",
+			name:       "should sign without usage key encipherment if signerName is kubernetes.io/kubelet-serving",
+			signerName: "kubernetes.io/kubelet-serving",
+			commonName: "system:node:testnode",
+			org:        []string{"system:nodes"},
+			usages:     []capi.KeyUsage{capi.UsageServerAuth, capi.UsageDigitalSignature},
+			dnsNames:   []string{"example.com"},
 			approved:   true,
+			verify: func(t *testing.T, as []testclient.Action) {
+				if len(as) != 1 {
+					t.Errorf("expected one Update action but got %d", len(as))
+					return
+				}
+				csr := as[0].(testclient.UpdateAction).GetObject().(*capi.CertificateSigningRequest)
+				if len(csr.Status.Certificate) == 0 {
+					t.Errorf("expected certificate to be issued but it was not")
+				}
+			},
+			certFile: "./testdata/ca.crt",
+			keyFile:  "./testdata/ca.key",
+		},
+		{
+			name:       "should do nothing if failed",
+			signerName: "kubernetes.io/kubelet-serving",
+			commonName: "system:node:testnode",
+			org:        []string{"system:nodes"},
+			usages:     []capi.KeyUsage{capi.UsageServerAuth, capi.UsageDigitalSignature, capi.UsageKeyEncipherment},
+			dnsNames:   []string{"example.com"},
+			approved:   true,
+			failed:     true,
 			verify: func(t *testing.T, as []testclient.Action) {
 				if len(as) != 0 {
 					t.Errorf("expected no action to be taken")
 				}
 			},
+			certFile: "./testdata/ca.crt",
+			keyFile:  "./testdata/ca.key",
+		},
+		{
+			name:            "should do nothing if an unrecognised signerName is used",
+			signerName:      "kubernetes.io/not-recognised",
+			constructionErr: true,
+			approved:        true,
+			verify: func(t *testing.T, as []testclient.Action) {
+				if len(as) != 0 {
+					t.Errorf("expected no action to be taken")
+				}
+			},
+			certFile: "./testdata/ca.crt",
+			keyFile:  "./testdata/ca.key",
 		},
 		{
 			name:       "should do nothing if not approved",
@@ -223,42 +369,256 @@ func TestHandle(t *testing.T) {
 					t.Errorf("expected no action to be taken")
 				}
 			},
+			certFile: "./testdata/ca.crt",
+			keyFile:  "./testdata/ca.key",
 		},
 		{
-			name:       "should do nothing if signerName does not start with kubernetes.io",
-			signerName: "example.com/sample-name",
-			approved:   true,
+			name:            "should do nothing if signerName does not start with kubernetes.io",
+			signerName:      "example.com/sample-name",
+			constructionErr: true,
+			approved:        true,
 			verify: func(t *testing.T, as []testclient.Action) {
 				if len(as) != 0 {
 					t.Errorf("expected no action to be taken")
 				}
 			},
+			certFile: "./testdata/ca.crt",
+			keyFile:  "./testdata/ca.key",
 		},
 		{
-			name:       "should do nothing if signerName starts with kubernetes.io but is unrecognised",
-			signerName: "kubernetes.io/not-a-real-signer",
-			approved:   true,
+			name:            "should do nothing if signerName starts with kubernetes.io but is unrecognised",
+			signerName:      "kubernetes.io/not-a-real-signer",
+			constructionErr: true,
+			approved:        true,
 			verify: func(t *testing.T, as []testclient.Action) {
 				if len(as) != 0 {
 					t.Errorf("expected no action to be taken")
 				}
 			},
+			certFile: "./testdata/ca.crt",
+			keyFile:  "./testdata/ca.key",
+		},
+		{
+			name:       "should sign if signerName is kubernetes.io/kube-apiserver-client with ML-DSA",
+			signerName: "kubernetes.io/kube-apiserver-client",
+			commonName: "hello-world",
+			org:        []string{"some-org"},
+			usages:     []capi.KeyUsage{capi.UsageClientAuth, capi.UsageDigitalSignature},
+			approved:   true,
+			verify: func(t *testing.T, as []testclient.Action) {
+				if len(as) != 1 {
+					t.Errorf("expected one Update action but got %d", len(as))
+					return
+				}
+				csr := as[0].(testclient.UpdateAction).GetObject().(*capi.CertificateSigningRequest)
+				if len(csr.Status.Certificate) == 0 {
+					t.Errorf("expected certificate to be issued but it was not")
+				}
+
+				block, _ := pem.Decode(csr.Status.Certificate)
+				if block == nil {
+					t.Errorf("pem decoding status.certificate resulted in an empty block")
+				}
+				cert, err := x509.ParseCertificate(block.Bytes)
+				if err != nil {
+					t.Error("parsing certificate: %w", err)
+				}
+
+				if cert.SignatureAlgorithm != x509.MLDSA44 {
+					t.Errorf("expected signature algorithm to be %v but got %v", x509.MLDSA44, cert.SignatureAlgorithm)
+				}
+			},
+			certFile: "./testdata/ca-mldsa44.crt",
+			keyFile:  "./testdata/ca-mldsa44.key",
+		},
+		{
+			name:       "should sign if signerName is kubernetes.io/kube-apiserver-client-kubelet with ML-DSA",
+			signerName: "kubernetes.io/kube-apiserver-client-kubelet",
+			commonName: "system:node:hello-world",
+			org:        []string{"system:nodes"},
+			usages:     []capi.KeyUsage{capi.UsageClientAuth, capi.UsageDigitalSignature},
+			approved:   true,
+			verify: func(t *testing.T, as []testclient.Action) {
+				if len(as) != 1 {
+					t.Errorf("expected one Update action but got %d", len(as))
+					return
+				}
+				csr := as[0].(testclient.UpdateAction).GetObject().(*capi.CertificateSigningRequest)
+				if len(csr.Status.Certificate) == 0 {
+					t.Errorf("expected certificate to be issued but it was not")
+				}
+
+				block, _ := pem.Decode(csr.Status.Certificate)
+				if block == nil {
+					t.Errorf("pem decoding status.certificate resulted in an empty block")
+				}
+				cert, err := x509.ParseCertificate(block.Bytes)
+				if err != nil {
+					t.Error("parsing certificate: %w", err)
+				}
+
+				if cert.SignatureAlgorithm != x509.MLDSA44 {
+					t.Errorf("expected signature algorithm to be %v but got %v", x509.MLDSA44, cert.SignatureAlgorithm)
+				}
+			},
+			certFile: "./testdata/ca-mldsa44.crt",
+			keyFile:  "./testdata/ca-mldsa44.key",
+		},
+		{
+			name:       "should sign if signerName is kubernetes.io/legacy-unknown with ML-DSA",
+			signerName: "kubernetes.io/legacy-unknown",
+			approved:   true,
+			verify: func(t *testing.T, as []testclient.Action) {
+				if len(as) != 1 {
+					t.Errorf("expected one Update action but got %d", len(as))
+					return
+				}
+				csr := as[0].(testclient.UpdateAction).GetObject().(*capi.CertificateSigningRequest)
+				if len(csr.Status.Certificate) == 0 {
+					t.Errorf("expected certificate to be issued but it was not")
+				}
+
+				block, _ := pem.Decode(csr.Status.Certificate)
+				if block == nil {
+					t.Errorf("pem decoding status.certificate resulted in an empty block")
+				}
+				cert, err := x509.ParseCertificate(block.Bytes)
+				if err != nil {
+					t.Error("parsing certificate: %w", err)
+				}
+
+				if cert.SignatureAlgorithm != x509.MLDSA44 {
+					t.Errorf("expected signature algorithm to be %v but got %v", x509.MLDSA44, cert.SignatureAlgorithm)
+				}
+			},
+			certFile: "./testdata/ca-mldsa44.crt",
+			keyFile:  "./testdata/ca-mldsa44.key",
+		},
+		{
+			name:       "should sign if signerName is kubernetes.io/kubelet-serving with ML-DSA",
+			signerName: "kubernetes.io/kubelet-serving",
+			commonName: "system:node:testnode",
+			org:        []string{"system:nodes"},
+			usages:     []capi.KeyUsage{capi.UsageServerAuth, capi.UsageDigitalSignature},
+			dnsNames:   []string{"example.com"},
+			approved:   true,
+			verify: func(t *testing.T, as []testclient.Action) {
+				if len(as) != 1 {
+					t.Errorf("expected one Update action but got %d", len(as))
+					return
+				}
+				csr := as[0].(testclient.UpdateAction).GetObject().(*capi.CertificateSigningRequest)
+				if len(csr.Status.Certificate) == 0 {
+					t.Errorf("expected certificate to be issued but it was not")
+				}
+
+				block, _ := pem.Decode(csr.Status.Certificate)
+				if block == nil {
+					t.Errorf("pem decoding status.certificate resulted in an empty block")
+				}
+				cert, err := x509.ParseCertificate(block.Bytes)
+				if err != nil {
+					t.Error("parsing certificate: %w", err)
+				}
+
+				if cert.SignatureAlgorithm != x509.MLDSA44 {
+					t.Errorf("expected signature algorithm to be %v but got %v", x509.MLDSA44, cert.SignatureAlgorithm)
+				}
+			},
+			certFile: "./testdata/ca-mldsa44.crt",
+			keyFile:  "./testdata/ca-mldsa44.key",
+		},
+		{
+			name:       "should error if signerName is kubernetes.io/kube-apiserver-client with ML-DSA with invalid usage entry",
+			signerName: "kubernetes.io/kube-apiserver-client",
+			commonName: "hello-world",
+			org:        []string{"some-org"},
+			usages:     []capi.KeyUsage{capi.UsageClientAuth, capi.UsageDigitalSignature, capi.UsageKeyEncipherment},
+			approved:   true,
+			err:        true,
+			certFile:   "./testdata/ca-mldsa44.crt",
+			keyFile:    "./testdata/ca-mldsa44.key",
+		},
+		{
+			name:       "should error if signerName is kubernetes.io/kube-apiserver-client-kubelet with ML-DSA with invalid usage entry",
+			signerName: "kubernetes.io/kube-apiserver-client-kubelet",
+			commonName: "system:node:hello-world",
+			org:        []string{"system:nodes"},
+			usages:     []capi.KeyUsage{capi.UsageClientAuth, capi.UsageDigitalSignature, capi.UsageKeyEncipherment},
+			approved:   true,
+			err:        true,
+			certFile:   "./testdata/ca-mldsa44.crt",
+			keyFile:    "./testdata/ca-mldsa44.key",
+		},
+		{
+			name:       "should sign if signerName is kubernetes.io/legacy-unknown with ML-DSA with invalid usage entry",
+			signerName: "kubernetes.io/legacy-unknown",
+			usages:     []capi.KeyUsage{capi.UsageClientAuth, capi.UsageDigitalSignature, capi.UsageKeyEncipherment},
+			approved:   true,
+			verify: func(t *testing.T, as []testclient.Action) {
+				if len(as) != 1 {
+					t.Errorf("expected one Update action but got %d", len(as))
+					return
+				}
+				csr := as[0].(testclient.UpdateAction).GetObject().(*capi.CertificateSigningRequest)
+				if len(csr.Status.Certificate) == 0 {
+					t.Errorf("expected certificate to be issued but it was not")
+				}
+
+				block, _ := pem.Decode(csr.Status.Certificate)
+				if block == nil {
+					t.Errorf("pem decoding status.certificate resulted in an empty block")
+				}
+				cert, err := x509.ParseCertificate(block.Bytes)
+				if err != nil {
+					t.Error("parsing certificate: %w", err)
+				}
+
+				if cert.SignatureAlgorithm != x509.MLDSA44 {
+					t.Errorf("expected signature algorithm to be %v but got %v", x509.MLDSA44, cert.SignatureAlgorithm)
+				}
+			},
+			certFile: "./testdata/ca-mldsa44.crt",
+			keyFile:  "./testdata/ca-mldsa44.key",
+		},
+		{
+			name:       "should error if signerName is kubernetes.io/kubelet-serving with ML-DSA with invalid usage",
+			signerName: "kubernetes.io/kubelet-serving",
+			commonName: "system:node:testnode",
+			org:        []string{"system:nodes"},
+			usages:     []capi.KeyUsage{capi.UsageServerAuth, capi.UsageDigitalSignature, capi.UsageKeyEncipherment},
+			dnsNames:   []string{"example.com"},
+			approved:   true,
+			err:        true,
+			certFile:   "./testdata/ca-mldsa44.crt",
+			keyFile:    "./testdata/ca-mldsa44.key",
 		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			client := &fake.Clientset{}
-			s, err := newSigner("./testdata/ca.crt", "./testdata/ca.key", client, 1*time.Hour)
-			if err != nil {
+			s, err := newSigner(c.signerName, c.certFile, c.keyFile, client, 1*time.Hour)
+			switch {
+			case c.constructionErr && err != nil:
+				return
+			case c.constructionErr && err == nil:
+				t.Fatalf("expected failure during construction of controller")
+			case !c.constructionErr && err != nil:
 				t.Fatalf("failed to create signer: %v", err)
+
+			case !c.constructionErr && err == nil:
+				// continue with rest of test
 			}
 
-			csr := makeTestCSR(csrBuilder{cn: c.commonName, signerName: c.signerName, approved: c.approved, usages: c.usages, org: c.org, dnsNames: c.dnsNames})
-			if err := s.handle(csr); err != nil && !c.err {
+			csr := makeTestCSR(csrBuilder{cn: c.commonName, signerName: c.signerName, approved: c.approved, failed: c.failed, usages: c.usages, org: c.org, dnsNames: c.dnsNames})
+			ctx := context.TODO()
+			if err := s.handle(ctx, csr); err != nil && !c.err {
 				t.Errorf("unexpected err: %v", err)
 			}
-			c.verify(t, client.Actions())
+			if c.verify != nil {
+				c.verify(t, client.Actions())
+			}
 		})
 	}
 }
@@ -273,6 +633,7 @@ type csrBuilder struct {
 	org        []string
 	signerName string
 	approved   bool
+	failed     bool
 	usages     []capi.KeyUsage
 }
 
@@ -298,12 +659,84 @@ func makeTestCSR(b csrBuilder) *capi.CertificateSigningRequest {
 		},
 	}
 	if b.signerName != "" {
-		csr.Spec.SignerName = &b.signerName
+		csr.Spec.SignerName = b.signerName
 	}
 	if b.approved {
 		csr.Status.Conditions = append(csr.Status.Conditions, capi.CertificateSigningRequestCondition{
 			Type: capi.CertificateApproved,
 		})
 	}
+	if b.failed {
+		csr.Status.Conditions = append(csr.Status.Conditions, capi.CertificateSigningRequestCondition{
+			Type: capi.CertificateFailed,
+		})
+	}
 	return csr
+}
+
+func Test_signer_duration(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		certTTL           time.Duration
+		expirationSeconds *int32
+		want              time.Duration
+	}{
+		{
+			name:              "can request shorter duration than TTL",
+			certTTL:           time.Hour,
+			expirationSeconds: csr.DurationToExpirationSeconds(30 * time.Minute),
+			want:              30 * time.Minute,
+		},
+		{
+			name:              "cannot request longer duration than TTL",
+			certTTL:           time.Hour,
+			expirationSeconds: csr.DurationToExpirationSeconds(3 * time.Hour),
+			want:              time.Hour,
+		},
+		{
+			name:              "cannot request negative duration",
+			certTTL:           time.Hour,
+			expirationSeconds: csr.DurationToExpirationSeconds(-time.Minute),
+			want:              10 * time.Minute,
+		},
+		{
+			name:              "cannot request duration less than 10 mins",
+			certTTL:           time.Hour,
+			expirationSeconds: csr.DurationToExpirationSeconds(10*time.Minute - time.Second),
+			want:              10 * time.Minute,
+		},
+		{
+			name:              "can request duration of exactly 10 mins",
+			certTTL:           time.Hour,
+			expirationSeconds: csr.DurationToExpirationSeconds(10 * time.Minute),
+			want:              10 * time.Minute,
+		},
+		{
+			name:              "can request duration equal to the default",
+			certTTL:           time.Hour,
+			expirationSeconds: csr.DurationToExpirationSeconds(time.Hour),
+			want:              time.Hour,
+		},
+		{
+			name:              "can choose not to request a duration to get the default",
+			certTTL:           time.Hour,
+			expirationSeconds: nil,
+			want:              time.Hour,
+		},
+	}
+	for _, tt := range tests {
+
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := &signer{
+				certTTL: tt.certTTL,
+			}
+			if got := s.duration(tt.expirationSeconds); got != tt.want {
+				t.Errorf("duration() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }

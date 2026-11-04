@@ -23,55 +23,58 @@ import (
 	"fmt"
 	"strconv"
 
-	appsv1beta2 "k8s.io/api/apps/v1beta2"
-	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
-	apivalidation "k8s.io/apimachinery/pkg/api/validation"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/registry/rest"
 	apistorage "k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/names"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/api/pod"
 	"k8s.io/kubernetes/pkg/apis/apps"
-	"k8s.io/kubernetes/pkg/apis/apps/validation"
-	corevalidation "k8s.io/kubernetes/pkg/apis/core/validation"
+	appsvalidation "k8s.io/kubernetes/pkg/apis/apps/validation"
+	"k8s.io/kubernetes/pkg/features"
 )
 
 // rsStrategy implements verification logic for ReplicaSets.
 type rsStrategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating ReplicaSet objects.
-var Strategy = rsStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = rsStrategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
-// DefaultGarbageCollectionPolicy returns OrphanDependents for extensions/v1beta1 and apps/v1beta2 for backwards compatibility,
-// and DeleteDependents for all other versions.
+// Make sure we correctly implement the interface.
+var _ = rest.GarbageCollectionDeleteStrategy(Strategy)
+
+// DefaultGarbageCollectionPolicy returns DeleteDependents for all currently served versions.
 func (rsStrategy) DefaultGarbageCollectionPolicy(ctx context.Context) rest.GarbageCollectionPolicy {
-	var groupVersion schema.GroupVersion
-	if requestInfo, found := genericapirequest.RequestInfoFrom(ctx); found {
-		groupVersion = schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}
-	}
-	switch groupVersion {
-	case extensionsv1beta1.SchemeGroupVersion, appsv1beta2.SchemeGroupVersion:
-		// for back compatibility
-		return rest.OrphanDependents
-	default:
-		return rest.DeleteDependents
-	}
+	return rest.DeleteDependents
 }
 
 // NamespaceScoped returns true because all ReplicaSets need to be within a namespace.
 func (rsStrategy) NamespaceScoped() bool {
 	return true
+}
+
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (rsStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"apps/v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+	}
+
+	return fields
 }
 
 // PrepareForCreate clears the status of a ReplicaSet before creation.
@@ -109,9 +112,19 @@ func (rsStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object)
 // Validate validates a new ReplicaSet.
 func (rsStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	rs := obj.(*apps.ReplicaSet)
-	allErrs := validation.ValidateReplicaSet(rs)
-	allErrs = append(allErrs, corevalidation.ValidateConditionalPodTemplate(&rs.Spec.Template, nil, field.NewPath("spec.template"))...)
-	return allErrs
+	opts := pod.GetValidationOptionsFromPodTemplate(&rs.Spec.Template, nil)
+	return appsvalidation.ValidateReplicaSet(rs, opts)
+}
+
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (rsStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string {
+	newRS := obj.(*apps.ReplicaSet)
+	var warnings []string
+	if msgs := utilvalidation.IsDNS1123Label(newRS.Name); len(msgs) != 0 {
+		warnings = append(warnings, fmt.Sprintf("metadata.name: this is used in Pod names and hostnames, which can result in surprising behavior; a DNS label is recommended: %v", msgs))
+	}
+	warnings = append(warnings, pod.GetWarningsForPodTemplate(ctx, field.NewPath("spec", "template"), &newRS.Spec.Template, nil)...)
+	return warnings
 }
 
 // Canonicalize normalizes the object after validation.
@@ -120,7 +133,7 @@ func (rsStrategy) Canonicalize(obj runtime.Object) {
 
 // AllowCreateOnUpdate is false for ReplicaSets; this means a POST is
 // needed to create one.
-func (rsStrategy) AllowCreateOnUpdate() bool {
+func (rsStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
@@ -128,29 +141,23 @@ func (rsStrategy) AllowCreateOnUpdate() bool {
 func (rsStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	newReplicaSet := obj.(*apps.ReplicaSet)
 	oldReplicaSet := old.(*apps.ReplicaSet)
-	allErrs := validation.ValidateReplicaSet(obj.(*apps.ReplicaSet))
-	allErrs = append(allErrs, validation.ValidateReplicaSetUpdate(newReplicaSet, oldReplicaSet)...)
-	allErrs = append(allErrs, corevalidation.ValidateConditionalPodTemplate(&newReplicaSet.Spec.Template, &oldReplicaSet.Spec.Template, field.NewPath("spec.template"))...)
 
-	// Update is not allowed to set Spec.Selector for all groups/versions except extensions/v1beta1.
-	// If RequestInfo is nil, it is better to revert to old behavior (i.e. allow update to set Spec.Selector)
-	// to prevent unintentionally breaking users who may rely on the old behavior.
-	// TODO(#50791): after extensions/v1beta1 is removed, move selector immutability check inside ValidateReplicaSetUpdate().
-	if requestInfo, found := genericapirequest.RequestInfoFrom(ctx); found {
-		groupVersion := schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}
-		switch groupVersion {
-		case extensionsv1beta1.SchemeGroupVersion:
-			// no-op for compatibility
-		default:
-			// disallow mutation of selector
-			allErrs = append(allErrs, apivalidation.ValidateImmutableField(newReplicaSet.Spec.Selector, oldReplicaSet.Spec.Selector, field.NewPath("spec").Child("selector"))...)
-		}
-	}
-
-	return allErrs
+	opts := pod.GetValidationOptionsFromPodTemplate(&newReplicaSet.Spec.Template, &oldReplicaSet.Spec.Template)
+	return appsvalidation.ValidateReplicaSetUpdate(newReplicaSet, oldReplicaSet, opts)
 }
 
-func (rsStrategy) AllowUnconditionalUpdate() bool {
+// WarningsOnUpdate returns warnings for the given update.
+func (rsStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	var warnings []string
+	newReplicaSet := obj.(*apps.ReplicaSet)
+	oldReplicaSet := old.(*apps.ReplicaSet)
+	if newReplicaSet.Generation != oldReplicaSet.Generation {
+		warnings = pod.GetWarningsForPodTemplate(ctx, field.NewPath("spec", "template"), &newReplicaSet.Spec.Template, &oldReplicaSet.Spec.Template)
+	}
+	return warnings
+}
+
+func (rsStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return true
 }
 
@@ -190,13 +197,37 @@ type rsStatusStrategy struct {
 // StatusStrategy is the default logic invoked when updating object status.
 var StatusStrategy = rsStatusStrategy{Strategy}
 
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (rsStatusStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return map[fieldpath.APIVersion]*fieldpath.Set{
+		"apps/v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("spec"),
+		),
+	}
+}
+
 func (rsStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newRS := obj.(*apps.ReplicaSet)
 	oldRS := old.(*apps.ReplicaSet)
 	// update is not allowed to set spec
 	newRS.Spec = oldRS.Spec
+	dropDisabledStatusFields(&newRS.Status, &oldRS.Status)
 }
 
 func (rsStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
-	return validation.ValidateReplicaSetStatusUpdate(obj.(*apps.ReplicaSet), old.(*apps.ReplicaSet))
+	return appsvalidation.ValidateReplicaSetStatusUpdate(obj.(*apps.ReplicaSet), old.(*apps.ReplicaSet))
+}
+
+// WarningsOnUpdate returns warnings for the given update.
+func (rsStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
+}
+
+// dropDisabledStatusFields removes disabled fields from the replica set status.
+func dropDisabledStatusFields(rsStatus, oldRSStatus *apps.ReplicaSetStatus) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.DeploymentReplicaSetTerminatingReplicas) &&
+		(oldRSStatus == nil || oldRSStatus.TerminatingReplicas == nil) {
+		rsStatus.TerminatingReplicas = nil
+	}
 }

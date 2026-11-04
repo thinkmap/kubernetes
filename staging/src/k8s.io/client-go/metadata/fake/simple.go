@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/testing"
+	"k8s.io/klog/v2"
 )
 
 // MetadataClient assists in creating fake objects for use when testing, since metadata.Getter
@@ -39,6 +40,11 @@ type MetadataClient interface {
 	metadata.Getter
 	CreateFake(obj *metav1.PartialObjectMetadata, opts metav1.CreateOptions, subresources ...string) (*metav1.PartialObjectMetadata, error)
 	UpdateFake(obj *metav1.PartialObjectMetadata, opts metav1.UpdateOptions, subresources ...string) (*metav1.PartialObjectMetadata, error)
+}
+
+// NewTestScheme creates a unique Scheme for each test.
+func NewTestScheme() *runtime.Scheme {
+	return runtime.NewScheme()
 }
 
 // NewSimpleMetadataClient creates a new client that will use the provided scheme and respond with the
@@ -53,19 +59,23 @@ func NewSimpleMetadataClient(scheme *runtime.Scheme, objects ...runtime.Object) 
 	}
 
 	codecs := serializer.NewCodecFactory(scheme)
-	o := testing.NewObjectTracker(scheme, codecs.UniversalDeserializer())
+	o := testing.NewObjectTrackerWithLogger(klog.TODO() /* We need some way for the caller to pass a logger - see also NewSimpleDynamicClientWithCustomListKinds. */, scheme, codecs.UniversalDeserializer())
 	for _, obj := range objects {
 		if err := o.Add(obj); err != nil {
 			panic(err)
 		}
 	}
 
-	cs := &FakeMetadataClient{scheme: scheme}
+	cs := &FakeMetadataClient{scheme: scheme, tracker: o}
 	cs.AddReactor("*", "*", testing.ObjectReaction(o))
 	cs.AddWatchReactor("*", func(action testing.Action) (handled bool, ret watch.Interface, err error) {
+		var opts metav1.ListOptions
+		if watchAction, ok := action.(testing.WatchActionImpl); ok {
+			opts = watchAction.ListOptions
+		}
 		gvr := action.GetResource()
 		ns := action.GetNamespace()
-		watch, err := o.Watch(gvr, ns)
+		watch, err := o.Watch(gvr, ns, opts)
 		if err != nil {
 			return false, nil, err
 		}
@@ -80,7 +90,8 @@ func NewSimpleMetadataClient(scheme *runtime.Scheme, objects ...runtime.Object) 
 // you want to test easier.
 type FakeMetadataClient struct {
 	testing.Fake
-	scheme *runtime.Scheme
+	scheme  *runtime.Scheme
+	tracker testing.ObjectTracker
 }
 
 type metadataResourceClient struct {
@@ -89,11 +100,22 @@ type metadataResourceClient struct {
 	resource  schema.GroupVersionResource
 }
 
-var _ metadata.Interface = &FakeMetadataClient{}
+var (
+	_ metadata.Interface = &FakeMetadataClient{}
+	_ testing.FakeClient = &FakeMetadataClient{}
+)
+
+func (c *FakeMetadataClient) Tracker() testing.ObjectTracker {
+	return c.tracker
+}
 
 // Resource returns an interface for accessing the provided resource.
 func (c *FakeMetadataClient) Resource(resource schema.GroupVersionResource) metadata.Getter {
 	return &metadataResourceClient{client: c, resource: resource}
+}
+
+func (c *FakeMetadataClient) IsWatchListSemanticsUnSupported() bool {
+	return true
 }
 
 // Namespace returns an interface for accessing the current resource in the specified
@@ -114,7 +136,8 @@ func (c *metadataResourceClient) CreateFake(obj *metav1.PartialObjectMetadata, o
 			Invokes(testing.NewRootCreateAction(c.resource, obj), obj)
 
 	case len(c.namespace) == 0 && len(subresources) > 0:
-		accessor, err := meta.Accessor(obj)
+		var accessor metav1.Object // avoid shadowing err
+		accessor, err = meta.Accessor(obj)
 		if err != nil {
 			return nil, err
 		}
@@ -127,7 +150,8 @@ func (c *metadataResourceClient) CreateFake(obj *metav1.PartialObjectMetadata, o
 			Invokes(testing.NewCreateAction(c.resource, c.namespace, obj), obj)
 
 	case len(c.namespace) > 0 && len(subresources) > 0:
-		accessor, err := meta.Accessor(obj)
+		var accessor metav1.Object // avoid shadowing err
+		accessor, err = meta.Accessor(obj)
 		if err != nil {
 			return nil, err
 		}
@@ -220,22 +244,61 @@ func (c *metadataResourceClient) Delete(ctx context.Context, name string, opts m
 	switch {
 	case len(c.namespace) == 0 && len(subresources) == 0:
 		_, err = c.client.Fake.
-			Invokes(testing.NewRootDeleteAction(c.resource, name), &metav1.Status{Status: "metadata delete fail"})
+			Invokes(testing.NewRootDeleteActionWithOptions(c.resource, name, opts), &metav1.Status{Status: "metadata delete fail"})
 
 	case len(c.namespace) == 0 && len(subresources) > 0:
 		_, err = c.client.Fake.
-			Invokes(testing.NewRootDeleteSubresourceAction(c.resource, strings.Join(subresources, "/"), name), &metav1.Status{Status: "metadata delete fail"})
+			Invokes(testing.NewRootDeleteSubresourceActionWithOptions(c.resource, strings.Join(subresources, "/"), name, opts), &metav1.Status{Status: "metadata delete fail"})
 
 	case len(c.namespace) > 0 && len(subresources) == 0:
 		_, err = c.client.Fake.
-			Invokes(testing.NewDeleteAction(c.resource, c.namespace, name), &metav1.Status{Status: "metadata delete fail"})
+			Invokes(testing.NewDeleteActionWithOptions(c.resource, c.namespace, name, opts), &metav1.Status{Status: "metadata delete fail"})
 
 	case len(c.namespace) > 0 && len(subresources) > 0:
 		_, err = c.client.Fake.
-			Invokes(testing.NewDeleteSubresourceAction(c.resource, strings.Join(subresources, "/"), c.namespace, name), &metav1.Status{Status: "metadata delete fail"})
+			Invokes(testing.NewDeleteSubresourceActionWithOptions(c.resource, strings.Join(subresources, "/"), c.namespace, name, opts), &metav1.Status{Status: "metadata delete fail"})
 	}
 
 	return err
+}
+
+// DeleteWithResult records the object deletion and processes it via the reactor, returning status or object.
+func (c *metadataResourceClient) DeleteWithResult(ctx context.Context, name string, opts metav1.DeleteOptions, subresources ...string) (metav1.APIResult, error) {
+	var uncastRet runtime.Object
+	var err error
+	switch {
+	case len(c.namespace) == 0 && len(subresources) == 0:
+		uncastRet, err = c.client.Fake.
+			Invokes(testing.NewRootDeleteActionWithOptions(c.resource, name, opts), &metav1.Status{Status: "metadata delete fail"})
+
+	case len(c.namespace) == 0 && len(subresources) > 0:
+		uncastRet, err = c.client.Fake.
+			Invokes(testing.NewRootDeleteSubresourceActionWithOptions(c.resource, strings.Join(subresources, "/"), name, opts), &metav1.Status{Status: "metadata delete fail"})
+
+	case len(c.namespace) > 0 && len(subresources) == 0:
+		uncastRet, err = c.client.Fake.
+			Invokes(testing.NewDeleteActionWithOptions(c.resource, c.namespace, name, opts), &metav1.Status{Status: "metadata delete fail"})
+
+	case len(c.namespace) > 0 && len(subresources) > 0:
+		uncastRet, err = c.client.Fake.
+			Invokes(testing.NewDeleteSubresourceActionWithOptions(c.resource, strings.Join(subresources, "/"), c.namespace, name, opts), &metav1.Status{Status: "metadata delete fail"})
+	}
+
+	if err != nil {
+		fakeResult := testing.FakeAPIResult{Err: err}
+		if statusErr, ok := err.(interface{ Status() metav1.Status }); ok {
+			fakeResult.Code = int(statusErr.Status().Code)
+		}
+		return fakeResult, err
+	}
+	if uncastRet == nil {
+		return testing.FakeAPIResult{}, nil
+	}
+	fakeResult := testing.FakeAPIResult{Obj: uncastRet, Code: 200}
+	if status, ok := uncastRet.(*metav1.Status); ok {
+		fakeResult.Code = int(status.Code)
+	}
+	return fakeResult, nil
 }
 
 // DeleteCollection records the object collection deletion and processes it via the reactor.
@@ -339,6 +402,7 @@ func (c *metadataResourceClient) List(ctx context.Context, opts metav1.ListOptio
 }
 
 func (c *metadataResourceClient) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+	opts.Watch = true
 	switch {
 	case len(c.namespace) == 0:
 		return c.client.Fake.
@@ -347,7 +411,6 @@ func (c *metadataResourceClient) Watch(ctx context.Context, opts metav1.ListOpti
 	case len(c.namespace) > 0:
 		return c.client.Fake.
 			InvokesWatch(testing.NewWatchAction(c.resource, c.namespace, opts))
-
 	}
 
 	panic("math broke")

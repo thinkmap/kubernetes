@@ -20,17 +20,20 @@ import (
 	"context"
 	"fmt"
 
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/kubernetes/pkg/features"
+
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	genericrest "k8s.io/apiserver/pkg/registry/generic/rest"
 	"k8s.io/apiserver/pkg/registry/rest"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/core/validation"
-	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/client"
 	"k8s.io/kubernetes/pkg/registry/core/pod"
+	"k8s.io/utils/ptr"
 
 	// ensure types are installed
 	_ "k8s.io/kubernetes/pkg/apis/core/install"
@@ -49,6 +52,12 @@ var _ = rest.GetterWithOptions(&LogREST{})
 func (r *LogREST) New() runtime.Object {
 	// TODO - return a resource that represents a log
 	return &api.Pod{}
+}
+
+// Destroy cleans up resources on shutdown.
+func (r *LogREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
 }
 
 // ProducesMIMETypes returns a list of the MIME types the specified HTTP verb (GET, POST, DELETE,
@@ -70,15 +79,24 @@ func (r *LogREST) ProducesObject(verb string) interface{} {
 
 // Get retrieves a runtime.Object that will stream the contents of the pod log
 func (r *LogREST) Get(ctx context.Context, name string, opts runtime.Object) (runtime.Object, error) {
+	// register the metrics if the context is used.  This assumes sync.Once is fast.  If it's not, it could be an init block.
+	registerMetrics()
+
 	logOpts, ok := opts.(*api.PodLogOptions)
 	if !ok {
 		return nil, fmt.Errorf("invalid options object: %#v", opts)
 	}
-	if !utilfeature.DefaultFeatureGate.Enabled(features.AllowInsecureBackendProxy) {
-		logOpts.InsecureSkipTLSVerifyBackend = false
-	}
 
-	if errs := validation.ValidatePodLogOptions(logOpts); len(errs) > 0 {
+	countSkipTLSMetric(logOpts.InsecureSkipTLSVerifyBackend)
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLogsQuerySplitStreams) {
+		// Even with defaulters, logOpts.Stream can be nil if no arguments are provided at all.
+		if logOpts.Stream == nil {
+			// Default to "All" to maintain backward compatibility.
+			logOpts.Stream = ptr.To(api.LogStreamAll)
+		}
+	}
+	if errs := validation.ValidatePodLogOptions(logOpts, utilfeature.DefaultFeatureGate.Enabled(features.PodLogsQuerySplitStreams)); len(errs) > 0 {
 		return nil, errors.NewInvalid(api.Kind("PodLogOptions"), name, errs)
 	}
 	location, transport, err := pod.LogLocation(ctx, r.Store, r.KubeletConn, name, logOpts)
@@ -86,13 +104,28 @@ func (r *LogREST) Get(ctx context.Context, name string, opts runtime.Object) (ru
 		return nil, err
 	}
 	return &genericrest.LocationStreamer{
-		Location:        location,
-		Transport:       transport,
-		ContentType:     "text/plain",
-		Flush:           logOpts.Follow,
-		ResponseChecker: genericrest.NewGenericHttpResponseChecker(api.Resource("pods/log"), name),
-		RedirectChecker: genericrest.PreventRedirects,
+		Location:                    location,
+		Transport:                   transport,
+		ContentType:                 "text/plain",
+		Flush:                       logOpts.Follow,
+		ResponseChecker:             genericrest.NewGenericHttpResponseChecker(api.Resource("pods/log"), name),
+		RedirectChecker:             genericrest.PreventRedirects,
+		TLSVerificationErrorCounter: podLogsTLSFailure,
 	}, nil
+}
+
+func countSkipTLSMetric(insecureSkipTLSVerifyBackend bool) {
+	usageType := usageEnforce
+	if insecureSkipTLSVerifyBackend {
+		usageType = usageSkipAllowed
+	}
+
+	counter, err := podLogsUsage.GetMetricWithLabelValues(usageType)
+	if err != nil {
+		utilruntime.HandleError(err)
+		return
+	}
+	counter.Inc()
 }
 
 // NewGetOptions creates a new options object

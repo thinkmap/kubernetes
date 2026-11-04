@@ -21,9 +21,9 @@ import (
 	"fmt"
 	"io"
 
-	certificatesv1beta1 "k8s.io/api/certificates/v1beta1"
+	certificatesv1 "k8s.io/api/certificates/v1"
 	"k8s.io/apiserver/pkg/admission"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	certificatesapi "k8s.io/kubernetes/pkg/apis/certificates"
 )
 
@@ -71,11 +71,11 @@ func (p *Plugin) Validate(_ context.Context, a admission.Attributes, _ admission
 		return admission.NewForbidden(a, fmt.Errorf("expected type CertificateSigningRequest, got: %T", a.GetObject()))
 	}
 
-	if csr.Spec.SignerName != certificatesv1beta1.KubeAPIServerClientSignerName {
+	if csr.Spec.SignerName != certificatesv1.KubeAPIServerClientSignerName {
 		return nil
 	}
 
-	csrParsed, err := certificatesapi.ParseCSR(csr)
+	csrParsed, err := certificatesapi.ParseCSR(csr.Spec.Request)
 	if err != nil {
 		return admission.NewForbidden(a, fmt.Errorf("failed to parse CSR: %v", err))
 	}
@@ -83,9 +83,9 @@ func (p *Plugin) Validate(_ context.Context, a admission.Attributes, _ admission
 	for _, group := range csrParsed.Subject.Organization {
 		if group == "system:masters" {
 			klog.V(4).Infof("CSR %s rejected by admission plugin %s for attempting to use signer %s with system:masters group",
-				csr.Name, PluginName, certificatesv1beta1.KubeAPIServerClientSignerName)
+				csr.Name, PluginName, certificatesv1.KubeAPIServerClientSignerName)
 			return admission.NewForbidden(a, fmt.Errorf("use of %s signer with system:masters group is not allowed",
-				certificatesv1beta1.KubeAPIServerClientSignerName))
+				certificatesv1.KubeAPIServerClientSignerName))
 		}
 	}
 

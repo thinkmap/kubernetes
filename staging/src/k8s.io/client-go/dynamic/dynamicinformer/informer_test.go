@@ -18,18 +18,30 @@ package dynamicinformer_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+
+	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/diff"
+	"k8s.io/apimachinery/pkg/util/json"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/dynamic/fake"
+	clientfeatures "k8s.io/client-go/features"
+	clientfeaturestesting "k8s.io/client-go/features/testing"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
+	"net/http"
+	"net/http/httptest"
 )
 
 type triggerFunc func(gvr schema.GroupVersionResource, ns string, fakeClient *fake.FakeDynamicClient, testObject *unstructured.Unstructured) *unstructured.Unstructured
@@ -37,6 +49,7 @@ type triggerFunc func(gvr schema.GroupVersionResource, ns string, fakeClient *fa
 func triggerFactory(t *testing.T) triggerFunc {
 	return func(gvr schema.GroupVersionResource, ns string, fakeClient *fake.FakeDynamicClient, _ *unstructured.Unstructured) *unstructured.Unstructured {
 		testObject := newUnstructured("apps/v1", "Deployment", "ns-foo", "name-foo")
+		testObject.SetLabels(map[string]string{"environment": "test"})
 		createdObj, err := fakeClient.Resource(gvr).Namespace(ns).Create(context.TODO(), testObject, metav1.CreateOptions{})
 		if err != nil {
 			t.Error(err)
@@ -53,15 +66,101 @@ func handler(rcvCh chan<- *unstructured.Unstructured) *cache.ResourceEventHandle
 	}
 }
 
+func TestWatchListSemanticsSimple(t *testing.T) {
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, true)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if _, ok := req.URL.Query()["watch"]; !ok {
+			t.Errorf("expected a watch request, params: %v", req.URL.Query())
+			http.Error(w, fmt.Errorf("unexpected request").Error(), http.StatusInternalServerError)
+			return
+		}
+
+		obj := &appsv1.Deployment{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Annotations: map[string]string{
+					metav1.InitialEventsAnnotationKey: "true",
+				},
+			},
+		}
+		rawObj, err := json.Marshal(obj)
+		if err != nil {
+			t.Errorf("failed to marshal rawObj: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		watchEvent := &metav1.WatchEvent{
+			Type:   string(watch.Bookmark),
+			Object: runtime.RawExtension{Raw: rawObj},
+		}
+		rawRsp, err := json.Marshal(watchEvent)
+		if err != nil {
+			t.Errorf("failed to marshal watchEvent: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, err = w.Write(rawRsp)
+		if err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	cfg := &rest.Config{Host: server.URL}
+	client, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	factory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(client, 0, "ns", nil)
+	target := factory.ForResource(schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	factory.StartWithContext(ctx)
+
+	if !cache.WaitForCacheSync(ctx.Done(), target.Informer().HasSynced) {
+		t.Fatalf("failed to wait for caches to sync")
+	}
+}
+
+func TestUnSupportWatchListSemantics(t *testing.T) {
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, true)
+	scheme := runtime.NewScheme()
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add corev1 to scheme: %v", err)
+	}
+	// The fake client doesn’t support WatchList semantics,
+	// so we don’t need to prepare a response.
+	fakeClient := fake.NewSimpleDynamicClient(scheme)
+	factory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(fakeClient, 0, "ns", nil)
+	target := factory.ForResource(schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	factory.StartWithContext(ctx)
+
+	if !cache.WaitForCacheSync(ctx.Done(), target.Informer().HasSynced) {
+		t.Fatalf("failed to wait for caches to sync")
+	}
+}
+
 func TestFilteredDynamicSharedInformerFactory(t *testing.T) {
 	scenarios := []struct {
-		name        string
-		existingObj *unstructured.Unstructured
-		gvr         schema.GroupVersionResource
-		informNS    string
-		ns          string
-		trigger     func(gvr schema.GroupVersionResource, ns string, fakeClient *fake.FakeDynamicClient, testObject *unstructured.Unstructured) *unstructured.Unstructured
-		handler     func(rcvCh chan<- *unstructured.Unstructured) *cache.ResourceEventHandlerFuncs
+		name             string
+		existingObj      *unstructured.Unstructured
+		gvr              schema.GroupVersionResource
+		informNS         string
+		ns               string
+		trigger          func(gvr schema.GroupVersionResource, ns string, fakeClient *fake.FakeDynamicClient, testObject *unstructured.Unstructured) *unstructured.Unstructured
+		handler          func(rcvCh chan<- *unstructured.Unstructured) *cache.ResourceEventHandlerFuncs
+		tweakListOptions dynamicinformer.TweakListOptionsFunc
 	}{
 		// scenario 1
 		{
@@ -81,6 +180,50 @@ func TestFilteredDynamicSharedInformerFactory(t *testing.T) {
 			trigger:  triggerFactory(t),
 			handler:  handler,
 		},
+		{
+			name:     "tweak options: test adding an object not matching field selector should not trigger AddFunc",
+			informNS: "ns-foo",
+			ns:       "ns-foo",
+			gvr:      schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"},
+			trigger:  triggerFactory(t),
+			handler:  handler,
+			tweakListOptions: func(opts *metav1.ListOptions) {
+				opts.FieldSelector = "metadata.name=name-bar"
+			},
+		},
+		{
+			name:     "tweak options: test adding an object matching field selector should trigger AddFunc",
+			informNS: "ns-foo",
+			ns:       "ns-foo",
+			gvr:      schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"},
+			trigger:  triggerFactory(t),
+			handler:  handler,
+			tweakListOptions: func(opts *metav1.ListOptions) {
+				opts.FieldSelector = "metadata.name=name-foo"
+			},
+		},
+		{
+			name:     "tweak options: test adding an object not matching label selector should not trigger AddFunc",
+			informNS: "ns-foo",
+			ns:       "ns-foo",
+			gvr:      schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"},
+			trigger:  triggerFactory(t),
+			handler:  handler,
+			tweakListOptions: func(opts *metav1.ListOptions) {
+				opts.LabelSelector = "environment=production"
+			},
+		},
+		{
+			name:     "tweak options: test adding an object matching label selector should trigger AddFunc",
+			informNS: "ns-foo",
+			ns:       "ns-foo",
+			gvr:      schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"},
+			trigger:  triggerFactory(t),
+			handler:  handler,
+			tweakListOptions: func(opts *metav1.ListOptions) {
+				opts.LabelSelector = "environment=test"
+			},
+		},
 	}
 
 	for _, ts := range scenarios {
@@ -95,15 +238,21 @@ func TestFilteredDynamicSharedInformerFactory(t *testing.T) {
 			if ts.existingObj != nil {
 				objs = append(objs, ts.existingObj)
 			}
-			fakeClient := fake.NewSimpleDynamicClient(scheme, objs...)
+			// don't adjust the scheme to include deploymentlist. This is testing whether an informer can be created against using
+			// a client that doesn't have a type registered in the scheme.
+			gvrToListKind := map[schema.GroupVersionResource]string{
+				{Group: "apps", Version: "v1", Resource: "deployments"}: "DeploymentList",
+			}
+			fakeClient := fake.NewSimpleDynamicClientWithCustomListKinds(scheme, gvrToListKind, objs...)
 			target := dynamicinformer.NewFilteredDynamicSharedInformerFactory(fakeClient, 0, ts.informNS, nil)
 
 			// act
 			informerListerForGvr := target.ForResource(ts.gvr)
-			informerListerForGvr.Informer().AddEventHandler(ts.handler(informerReciveObjectCh))
-			target.Start(ctx.Done())
-			if synced := target.WaitForCacheSync(ctx.Done()); !synced[ts.gvr] {
-				t.Errorf("informer for %s hasn't synced", ts.gvr)
+			logger := klog.FromContext(ctx)
+			_, _ = informerListerForGvr.Informer().AddEventHandlerWithOptions(ts.handler(informerReciveObjectCh), cache.HandlerOptions{Logger: &logger})
+			target.StartWithContext(ctx)
+			if result := target.WaitForCacheSyncWithContext(ctx); result.Err != nil || !result.Synced[ts.gvr] {
+				t.Errorf("informer for %s hasn't synced: %v", ts.gvr, result.Err)
 			}
 
 			testObject := ts.trigger(ts.gvr, ts.ns, fakeClient, ts.existingObj)
@@ -113,7 +262,7 @@ func TestFilteredDynamicSharedInformerFactory(t *testing.T) {
 					t.Errorf("informer received an object for namespace %s when watching namespace %s", ts.ns, ts.informNS)
 				}
 				if !equality.Semantic.DeepEqual(testObject, objFromInformer) {
-					t.Fatalf("%v", diff.ObjectDiff(testObject, objFromInformer))
+					t.Fatalf("%v", cmp.Diff(testObject, objFromInformer))
 				}
 			case <-ctx.Done():
 				if ts.ns == ts.informNS {
@@ -214,22 +363,28 @@ func TestDynamicSharedInformerFactory(t *testing.T) {
 			if ts.existingObj != nil {
 				objs = append(objs, ts.existingObj)
 			}
-			fakeClient := fake.NewSimpleDynamicClient(scheme, objs...)
+			// don't adjust the scheme to include deploymentlist. This is testing whether an informer can be created against using
+			// a client that doesn't have a type registered in the scheme.
+			gvrToListKind := map[schema.GroupVersionResource]string{
+				{Group: "extensions", Version: "v1beta1", Resource: "deployments"}: "DeploymentList",
+			}
+			fakeClient := fake.NewSimpleDynamicClientWithCustomListKinds(scheme, gvrToListKind, objs...)
 			target := dynamicinformer.NewDynamicSharedInformerFactory(fakeClient, 0)
 
 			// act
 			informerListerForGvr := target.ForResource(ts.gvr)
-			informerListerForGvr.Informer().AddEventHandler(ts.handler(informerReciveObjectCh))
-			target.Start(ctx.Done())
-			if synced := target.WaitForCacheSync(ctx.Done()); !synced[ts.gvr] {
-				t.Errorf("informer for %s hasn't synced", ts.gvr)
+			logger := klog.FromContext(ctx)
+			_, _ = informerListerForGvr.Informer().AddEventHandlerWithOptions(ts.handler(informerReciveObjectCh), cache.HandlerOptions{Logger: &logger})
+			target.StartWithContext(ctx)
+			if result := target.WaitForCacheSyncWithContext(ctx); result.Err != nil || !result.Synced[ts.gvr] {
+				t.Errorf("informer for %s hasn't synced: %v", ts.gvr, result.Err)
 			}
 
 			testObject := ts.trigger(ts.gvr, ts.ns, fakeClient, ts.existingObj)
 			select {
 			case objFromInformer := <-informerReciveObjectCh:
 				if !equality.Semantic.DeepEqual(testObject, objFromInformer) {
-					t.Fatalf("%v", diff.ObjectDiff(testObject, objFromInformer))
+					t.Fatalf("%v", cmp.Diff(testObject, objFromInformer))
 				}
 			case <-ctx.Done():
 				t.Errorf("tested informer haven't received an object, waited %v", timeout)

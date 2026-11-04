@@ -22,16 +22,17 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"fmt"
 	"math/big"
 	"net/url"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 
-	capi "k8s.io/api/certificates/v1beta1"
-	"k8s.io/apimachinery/pkg/util/diff"
+	capi "k8s.io/api/certificates/v1"
 )
 
 func TestCertificateAuthority(t *testing.T) {
@@ -40,6 +41,7 @@ func TestCertificateAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now()
+	nowFunc := func() time.Time { return now }
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(42),
 		Subject: pkix.Name{
@@ -47,7 +49,7 @@ func TestCertificateAuthority(t *testing.T) {
 		},
 		NotBefore:             now.Add(-24 * time.Hour),
 		NotAfter:              now.Add(24 * time.Hour),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 	}
@@ -68,15 +70,15 @@ func TestCertificateAuthority(t *testing.T) {
 	tests := []struct {
 		name     string
 		cr       x509.CertificateRequest
-		backdate time.Duration
 		policy   SigningPolicy
+		mutateCA func(ca *CertificateAuthority)
 
 		want    x509.Certificate
-		wantErr bool
+		wantErr string
 	}{
 		{
 			name:   "ca info",
-			policy: PermissiveSigningPolicy{TTL: time.Hour},
+			policy: PermissiveSigningPolicy{TTL: time.Hour, Now: nowFunc},
 			want: x509.Certificate{
 				Issuer:                caCert.Subject,
 				AuthorityKeyId:        caCert.SubjectKeyId,
@@ -87,7 +89,7 @@ func TestCertificateAuthority(t *testing.T) {
 		},
 		{
 			name:   "key usage",
-			policy: PermissiveSigningPolicy{TTL: time.Hour, Usages: []capi.KeyUsage{"signing"}},
+			policy: PermissiveSigningPolicy{TTL: time.Hour, Usages: []capi.KeyUsage{"signing"}, Now: nowFunc},
 			want: x509.Certificate{
 				NotBefore:             now,
 				NotAfter:              now.Add(1 * time.Hour),
@@ -97,7 +99,7 @@ func TestCertificateAuthority(t *testing.T) {
 		},
 		{
 			name:   "ext key usage",
-			policy: PermissiveSigningPolicy{TTL: time.Hour, Usages: []capi.KeyUsage{"client auth"}},
+			policy: PermissiveSigningPolicy{TTL: time.Hour, Usages: []capi.KeyUsage{"client auth"}, Now: nowFunc},
 			want: x509.Certificate{
 				NotBefore:             now,
 				NotAfter:              now.Add(1 * time.Hour),
@@ -106,9 +108,8 @@ func TestCertificateAuthority(t *testing.T) {
 			},
 		},
 		{
-			name:     "backdate",
-			policy:   PermissiveSigningPolicy{TTL: time.Hour},
-			backdate: 5 * time.Minute,
+			name:   "backdate without short",
+			policy: PermissiveSigningPolicy{TTL: time.Hour, Backdate: 5 * time.Minute, Now: nowFunc},
 			want: x509.Certificate{
 				NotBefore:             now.Add(-5 * time.Minute),
 				NotAfter:              now.Add(55 * time.Minute),
@@ -116,8 +117,44 @@ func TestCertificateAuthority(t *testing.T) {
 			},
 		},
 		{
+			name:   "backdate without short and super small ttl",
+			policy: PermissiveSigningPolicy{TTL: time.Minute, Backdate: 5 * time.Minute, Now: nowFunc},
+			want: x509.Certificate{
+				NotBefore:             now.Add(-5 * time.Minute),
+				NotAfter:              now.Add(-4 * time.Minute),
+				BasicConstraintsValid: true,
+			},
+		},
+		{
+			name:   "backdate with short",
+			policy: PermissiveSigningPolicy{TTL: time.Hour, Backdate: 5 * time.Minute, Short: 8 * time.Hour, Now: nowFunc},
+			want: x509.Certificate{
+				NotBefore:             now.Add(-5 * time.Minute),
+				NotAfter:              now.Add(time.Hour),
+				BasicConstraintsValid: true,
+			},
+		},
+		{
+			name:   "backdate with short and super small ttl",
+			policy: PermissiveSigningPolicy{TTL: time.Minute, Backdate: 5 * time.Minute, Short: 8 * time.Hour, Now: nowFunc},
+			want: x509.Certificate{
+				NotBefore:             now.Add(-5 * time.Minute),
+				NotAfter:              now.Add(time.Minute),
+				BasicConstraintsValid: true,
+			},
+		},
+		{
+			name:   "backdate with short but longer ttl",
+			policy: PermissiveSigningPolicy{TTL: 24 * time.Hour, Backdate: 5 * time.Minute, Short: 8 * time.Hour, Now: nowFunc},
+			want: x509.Certificate{
+				NotBefore:             now.Add(-5 * time.Minute),
+				NotAfter:              now.Add(24*time.Hour - 5*time.Minute),
+				BasicConstraintsValid: true,
+			},
+		},
+		{
 			name:   "truncate expiration",
-			policy: PermissiveSigningPolicy{TTL: 48 * time.Hour},
+			policy: PermissiveSigningPolicy{TTL: 48 * time.Hour, Now: nowFunc},
 			want: x509.Certificate{
 				NotBefore:             now,
 				NotAfter:              now.Add(24 * time.Hour),
@@ -126,7 +163,7 @@ func TestCertificateAuthority(t *testing.T) {
 		},
 		{
 			name:   "uri sans",
-			policy: PermissiveSigningPolicy{TTL: time.Hour},
+			policy: PermissiveSigningPolicy{TTL: time.Hour, Now: nowFunc},
 			cr: x509.CertificateRequest{
 				URIs: []*url.URL{uri},
 			},
@@ -137,6 +174,22 @@ func TestCertificateAuthority(t *testing.T) {
 				BasicConstraintsValid: true,
 			},
 		},
+		{
+			name:   "expired ca",
+			policy: PermissiveSigningPolicy{TTL: time.Hour, Now: nowFunc},
+			mutateCA: func(ca *CertificateAuthority) {
+				ca.Certificate.NotAfter = now // pretend that the CA has expired
+			},
+			wantErr: "the signer has expired: NotAfter=" + now.String(),
+		},
+		{
+			name:   "expired ca with backdate",
+			policy: PermissiveSigningPolicy{TTL: time.Hour, Backdate: 5 * time.Minute, Now: nowFunc},
+			mutateCA: func(ca *CertificateAuthority) {
+				ca.Certificate.NotAfter = now // pretend that the CA has expired
+			},
+			wantErr: "refusing to sign a certificate that expired in the past: NotAfter=" + now.String(),
+		},
 	}
 
 	crKey, err := ecdsa.GenerateKey(elliptic.P224(), rand.Reader)
@@ -146,13 +199,15 @@ func TestCertificateAuthority(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			caCertShallowCopy := *caCert
+
 			ca := &CertificateAuthority{
-				Certificate: caCert,
+				Certificate: &caCertShallowCopy,
 				PrivateKey:  caKey,
-				Now: func() time.Time {
-					return now
-				},
-				Backdate: test.backdate,
+			}
+
+			if test.mutateCA != nil {
+				test.mutateCA(ca)
 			}
 
 			csr, err := x509.CreateCertificateRequest(rand.Reader, &test.cr, crKey)
@@ -161,14 +216,14 @@ func TestCertificateAuthority(t *testing.T) {
 			}
 
 			certDER, err := ca.Sign(csr, test.policy)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if test.wantErr {
-				if err == nil {
-					t.Fatal("expected error")
+			if len(test.wantErr) > 0 {
+				if errStr := errString(err); test.wantErr != errStr {
+					t.Fatalf("expected error %s but got %s", test.wantErr, errStr)
 				}
 				return
+			}
+			if err != nil {
+				t.Fatal(err)
 			}
 
 			cert, err := x509.ParseCertificate(certDER)
@@ -183,7 +238,7 @@ func TestCertificateAuthority(t *testing.T) {
 					"Version",
 					"MaxPathLen",
 				),
-				diff.IgnoreUnset(),
+				ignoreUnset(),
 				cmp.Transformer("RoundTime", func(x time.Time) time.Time {
 					return x.Truncate(time.Second)
 				}),
@@ -196,4 +251,50 @@ func TestCertificateAuthority(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ignoreUnset is an option that ignores fields that are unset on the right
+// hand side of a comparison. This is useful in testing to assert that an
+// object is a derivative.
+func ignoreUnset() cmp.Option {
+	return cmp.Options{
+		// ignore unset fields in v2
+		cmp.FilterPath(func(path cmp.Path) bool {
+			_, v2 := path.Last().Values()
+			switch v2.Kind() {
+			case reflect.Slice, reflect.Map:
+				if v2.IsNil() || v2.Len() == 0 {
+					return true
+				}
+			case reflect.String:
+				if v2.Len() == 0 {
+					return true
+				}
+			case reflect.Interface, reflect.Pointer:
+				if v2.IsNil() {
+					return true
+				}
+			}
+			return false
+		}, cmp.Ignore()),
+		// ignore map entries that aren't set in v2
+		cmp.FilterPath(func(path cmp.Path) bool {
+			switch i := path.Last().(type) {
+			case cmp.MapIndex:
+				if _, v2 := i.Values(); !v2.IsValid() {
+					fmt.Println("E")
+					return true
+				}
+			}
+			return false
+		}, cmp.Ignore()),
+	}
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	return err.Error()
 }

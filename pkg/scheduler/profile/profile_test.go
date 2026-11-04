@@ -23,93 +23,19 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/api/events/v1beta1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/klog/v2/ktesting"
+	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
-	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
+	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 )
 
-var fakeRegistry = framework.Registry{
-	"QueueSort": newFakePlugin,
-	"Bind1":     newFakePlugin,
-	"Bind2":     newFakePlugin,
-	"Another":   newFakePlugin,
-}
-
-func TestNewProfile(t *testing.T) {
-	cases := []struct {
-		name    string
-		cfg     config.KubeSchedulerProfile
-		wantErr string
-	}{
-		{
-			name: "valid",
-			cfg: config.KubeSchedulerProfile{
-				SchedulerName: "valid-profile",
-				Plugins: &config.Plugins{
-					QueueSort: &config.PluginSet{
-						Enabled: []config.Plugin{
-							{Name: "QueueSort"},
-						},
-					},
-					Bind: &config.PluginSet{
-						Enabled: []config.Plugin{
-							{Name: "Bind1"},
-						},
-					},
-				},
-				PluginConfig: []config.PluginConfig{
-					{
-						Name: "QueueSort",
-						Args: &runtime.Unknown{Raw: []byte("{}")},
-					},
-				},
-			},
-		},
-		{
-			name: "invalid framework configuration",
-			cfg: config.KubeSchedulerProfile{
-				SchedulerName: "invalid-profile",
-				Plugins: &config.Plugins{
-					QueueSort: &config.PluginSet{
-						Enabled: []config.Plugin{
-							{Name: "QueueSort"},
-						},
-					},
-				},
-			},
-			wantErr: "at least one bind plugin is needed",
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			c := fake.NewSimpleClientset()
-			b := events.NewBroadcaster(&events.EventSinkImpl{Interface: c.EventsV1beta1().Events("")})
-			p, err := NewProfile(tc.cfg, fakeFrameworkFactory, NewRecorderFactory(b))
-			if err := checkErr(err, tc.wantErr); err != nil {
-				t.Fatal(err)
-			}
-			if len(tc.wantErr) != 0 {
-				return
-			}
-
-			called := make(chan struct{})
-			var ctrl string
-			stopFn := b.StartEventWatcher(func(obj runtime.Object) {
-				e, _ := obj.(*v1beta1.Event)
-				ctrl = e.ReportingController
-				close(called)
-			})
-			p.Recorder.Eventf(&v1.Pod{}, nil, v1.EventTypeNormal, "", "", "")
-			<-called
-			stopFn()
-			if ctrl != tc.cfg.SchedulerName {
-				t.Errorf("got controller name %q in event, want %q", ctrl, tc.cfg.SchedulerName)
-			}
-		})
-	}
+var fakeRegistry = frameworkruntime.Registry{
+	"QueueSort": newFakePlugin("QueueSort"),
+	"Bind1":     newFakePlugin("Bind1"),
+	"Bind2":     newFakePlugin("Bind2"),
+	"Another":   newFakePlugin("Another"),
 }
 
 func TestNewMap(t *testing.T) {
@@ -124,12 +50,12 @@ func TestNewMap(t *testing.T) {
 				{
 					SchedulerName: "profile-1",
 					Plugins: &config.Plugins{
-						QueueSort: &config.PluginSet{
+						QueueSort: config.PluginSet{
 							Enabled: []config.Plugin{
 								{Name: "QueueSort"},
 							},
 						},
-						Bind: &config.PluginSet{
+						Bind: config.PluginSet{
 							Enabled: []config.Plugin{
 								{Name: "Bind1"},
 							},
@@ -139,12 +65,12 @@ func TestNewMap(t *testing.T) {
 				{
 					SchedulerName: "profile-2",
 					Plugins: &config.Plugins{
-						QueueSort: &config.PluginSet{
+						QueueSort: config.PluginSet{
 							Enabled: []config.Plugin{
 								{Name: "QueueSort"},
 							},
 						},
-						Bind: &config.PluginSet{
+						Bind: config.PluginSet{
 							Enabled: []config.Plugin{
 								{Name: "Bind2"},
 							},
@@ -165,12 +91,12 @@ func TestNewMap(t *testing.T) {
 				{
 					SchedulerName: "profile-1",
 					Plugins: &config.Plugins{
-						QueueSort: &config.PluginSet{
+						QueueSort: config.PluginSet{
 							Enabled: []config.Plugin{
 								{Name: "QueueSort"},
 							},
 						},
-						Bind: &config.PluginSet{
+						Bind: config.PluginSet{
 							Enabled: []config.Plugin{
 								{Name: "Bind1"},
 							},
@@ -180,12 +106,12 @@ func TestNewMap(t *testing.T) {
 				{
 					SchedulerName: "profile-2",
 					Plugins: &config.Plugins{
-						QueueSort: &config.PluginSet{
+						QueueSort: config.PluginSet{
 							Enabled: []config.Plugin{
 								{Name: "Another"},
 							},
 						},
-						Bind: &config.PluginSet{
+						Bind: config.PluginSet{
 							Enabled: []config.Plugin{
 								{Name: "Bind2"},
 							},
@@ -201,12 +127,12 @@ func TestNewMap(t *testing.T) {
 				{
 					SchedulerName: "profile-1",
 					Plugins: &config.Plugins{
-						QueueSort: &config.PluginSet{
+						QueueSort: config.PluginSet{
 							Enabled: []config.Plugin{
 								{Name: "QueueSort"},
 							},
 						},
-						Bind: &config.PluginSet{
+						Bind: config.PluginSet{
 							Enabled: []config.Plugin{
 								{Name: "Bind1"},
 							},
@@ -222,12 +148,12 @@ func TestNewMap(t *testing.T) {
 				{
 					SchedulerName: "profile-2",
 					Plugins: &config.Plugins{
-						QueueSort: &config.PluginSet{
+						QueueSort: config.PluginSet{
 							Enabled: []config.Plugin{
 								{Name: "QueueSort"},
 							},
 						},
-						Bind: &config.PluginSet{
+						Bind: config.PluginSet{
 							Enabled: []config.Plugin{
 								{Name: "Bind2"},
 							},
@@ -243,12 +169,12 @@ func TestNewMap(t *testing.T) {
 				{
 					SchedulerName: "profile-1",
 					Plugins: &config.Plugins{
-						QueueSort: &config.PluginSet{
+						QueueSort: config.PluginSet{
 							Enabled: []config.Plugin{
 								{Name: "QueueSort"},
 							},
 						},
-						Bind: &config.PluginSet{
+						Bind: config.PluginSet{
 							Enabled: []config.Plugin{
 								{Name: "Bind1"},
 							},
@@ -258,12 +184,12 @@ func TestNewMap(t *testing.T) {
 				{
 					SchedulerName: "profile-1",
 					Plugins: &config.Plugins{
-						QueueSort: &config.PluginSet{
+						QueueSort: config.PluginSet{
 							Enabled: []config.Plugin{
 								{Name: "QueueSort"},
 							},
 						},
-						Bind: &config.PluginSet{
+						Bind: config.PluginSet{
 							Enabled: []config.Plugin{
 								{Name: "Bind2"},
 							},
@@ -273,10 +199,68 @@ func TestNewMap(t *testing.T) {
 			},
 			wantErr: "duplicate profile",
 		},
+		{
+			name: "scheduler name is needed",
+			cfgs: []config.KubeSchedulerProfile{
+				{
+					Plugins: &config.Plugins{
+						QueueSort: config.PluginSet{
+							Enabled: []config.Plugin{
+								{Name: "QueueSort"},
+							},
+						},
+						Bind: config.PluginSet{
+							Enabled: []config.Plugin{
+								{Name: "Bind1"},
+							},
+						},
+					},
+				},
+			},
+			wantErr: "scheduler name is needed",
+		},
+		{
+			name: "plugins required for profile",
+			cfgs: []config.KubeSchedulerProfile{
+				{
+					SchedulerName: "profile-1",
+				},
+			},
+			wantErr: "plugins required for profile",
+		},
+		{
+			name: "invalid framework configuration",
+			cfgs: []config.KubeSchedulerProfile{
+				{
+					SchedulerName: "invalid-profile",
+					Plugins: &config.Plugins{
+						QueueSort: config.PluginSet{
+							Enabled: []config.Plugin{
+								{Name: "QueueSort"},
+							},
+						},
+					},
+				},
+			},
+			wantErr: "at least one bind plugin is needed",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			m, err := NewMap(tc.cfgs, fakeFrameworkFactory, nilRecorderFactory)
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			m, err := NewMap(ctx, tc.cfgs, fakeRegistry, nilRecorderFactory)
+			defer func() {
+				if m != nil {
+					// to close all frameworks registered in this map.
+					err := m.Close()
+					if err != nil {
+						t.Errorf("error closing map: %v", err)
+					}
+				}
+			}()
+
 			if err := checkErr(err, tc.wantErr); err != nil {
 				t.Fatal(err)
 			}
@@ -290,29 +274,106 @@ func TestNewMap(t *testing.T) {
 	}
 }
 
-type fakePlugin struct{}
+func TestFrameworkForPod(t *testing.T) {
+	_, ctx := ktesting.NewTestContext(t)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-func (p *fakePlugin) Name() string {
-	return ""
+	cfgs := []config.KubeSchedulerProfile{
+		{
+			SchedulerName: v1.DefaultSchedulerName,
+			Plugins: &config.Plugins{
+				QueueSort: config.PluginSet{Enabled: []config.Plugin{{Name: "QueueSort"}}},
+				Bind:      config.PluginSet{Enabled: []config.Plugin{{Name: "Bind1"}}},
+			},
+		},
+		{
+			SchedulerName: "custom-scheduler",
+			Plugins: &config.Plugins{
+				QueueSort: config.PluginSet{Enabled: []config.Plugin{{Name: "QueueSort"}}},
+				Bind:      config.PluginSet{Enabled: []config.Plugin{{Name: "Bind2"}}},
+			},
+		},
+	}
+
+	m, err := NewMap(ctx, cfgs, fakeRegistry, nilRecorderFactory)
+	if err != nil {
+		t.Fatalf("failed to create profile map: %v", err)
+	}
+	defer func() {
+		err := m.Close()
+		if err != nil {
+			t.Errorf("error closing map: %v", err)
+		}
+	}()
+
+	tests := []struct {
+		name          string
+		schedulerName string
+		wantErr       string
+	}{
+		{
+			name:          "explicit scheduler name matching profile",
+			schedulerName: "custom-scheduler",
+		},
+		{
+			name:          "empty scheduler name defaults to default-scheduler",
+			schedulerName: "",
+		},
+		{
+			name:          "unknown scheduler name returns error",
+			schedulerName: "non-existent",
+			wantErr:       `profile not found for scheduler name "non-existent"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := &v1.Pod{
+				Spec: v1.PodSpec{
+					SchedulerName: tt.schedulerName,
+				},
+			}
+			fwk, err := m.FrameworkForPod(pod)
+			if tt.wantErr != "" {
+				if err.Error() != tt.wantErr {
+					t.Errorf("FrameworkForPod() error = %v, wantErr %v", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("Unexpected error: %v", err)
+			}
+			if fwk == nil {
+				t.Errorf("expected non-nil framework for scheduler name %q", tt.schedulerName)
+			}
+		})
+	}
 }
 
-func (p *fakePlugin) Less(*framework.QueuedPodInfo, *framework.QueuedPodInfo) bool {
+type fakePlugin struct {
+	name string
+}
+
+func (p *fakePlugin) Name() string {
+	return p.name
+}
+
+func (p *fakePlugin) Less(fwk.QueuedEntityInfo, fwk.QueuedEntityInfo) bool {
 	return false
 }
 
-func (p *fakePlugin) Bind(context.Context, *framework.CycleState, *v1.Pod, string) *framework.Status {
+func (p *fakePlugin) Bind(context.Context, fwk.CycleState, *v1.Pod, string) *fwk.Status {
 	return nil
 }
 
-func newFakePlugin(_ runtime.Object, _ framework.FrameworkHandle) (framework.Plugin, error) {
-	return &fakePlugin{}, nil
+func newFakePlugin(name string) func(ctx context.Context, object runtime.Object, handle fwk.Handle) (fwk.Plugin, error) {
+	return func(_ context.Context, _ runtime.Object, _ fwk.Handle) (fwk.Plugin, error) {
+		return &fakePlugin{name: name}, nil
+	}
 }
 
-func fakeFrameworkFactory(cfg config.KubeSchedulerProfile) (framework.Framework, error) {
-	return framework.NewFramework(fakeRegistry, cfg.Plugins, cfg.PluginConfig)
-}
-
-func nilRecorderFactory(_ string) events.EventRecorder {
+func nilRecorderFactory(_ string) events.EventRecorderLogger {
 	return nil
 }
 

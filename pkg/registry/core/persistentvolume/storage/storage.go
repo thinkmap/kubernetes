@@ -19,6 +19,8 @@ package storage
 import (
 	"context"
 
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/registry/generic"
@@ -39,15 +41,17 @@ type REST struct {
 // NewREST returns a RESTStorage object that will work against persistent volumes.
 func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST, error) {
 	store := &genericregistry.Store{
-		NewFunc:                  func() runtime.Object { return &api.PersistentVolume{} },
-		NewListFunc:              func() runtime.Object { return &api.PersistentVolumeList{} },
-		PredicateFunc:            persistentvolume.MatchPersistentVolumes,
-		DefaultQualifiedResource: api.Resource("persistentvolumes"),
+		NewFunc:                   func() runtime.Object { return &api.PersistentVolume{} },
+		NewListFunc:               func() runtime.Object { return &api.PersistentVolumeList{} },
+		PredicateFunc:             persistentvolume.MatchPersistentVolumes,
+		DefaultQualifiedResource:  api.Resource("persistentvolumes"),
+		SingularQualifiedResource: api.Resource("persistentvolume"),
 
 		CreateStrategy:      persistentvolume.Strategy,
 		UpdateStrategy:      persistentvolume.Strategy,
 		DeleteStrategy:      persistentvolume.Strategy,
 		ReturnDeletedObject: true,
+		ResetFieldsStrategy: persistentvolume.Strategy,
 
 		TableConvertor: printerstorage.TableConvertor{TableGenerator: printers.NewTableGenerator().With(printersinternal.AddHandlers)},
 	}
@@ -58,6 +62,7 @@ func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST, error) {
 
 	statusStore := *store
 	statusStore.UpdateStrategy = persistentvolume.StatusStrategy
+	statusStore.ResetFieldsStrategy = persistentvolume.StatusStrategy
 
 	return &REST{store}, &StatusREST{store: &statusStore}, nil
 }
@@ -80,6 +85,12 @@ func (r *StatusREST) New() runtime.Object {
 	return &api.PersistentVolume{}
 }
 
+// Destroy cleans up resources on shutdown.
+func (r *StatusREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
+}
+
 // Get retrieves the object from the storage. It is required to support Patch.
 func (r *StatusREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
 	return r.store.Get(ctx, name, options)
@@ -90,4 +101,13 @@ func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.Updat
 	// We are explicitly setting forceAllowCreate to false in the call to the underlying storage because
 	// subresources should never allow create on update.
 	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, false, options)
+}
+
+// GetResetFields implements rest.ResetFieldsStrategy
+func (r *StatusREST) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return r.store.GetResetFields()
+}
+
+func (r *StatusREST) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
+	return r.store.ConvertToTable(ctx, object, tableOptions)
 }

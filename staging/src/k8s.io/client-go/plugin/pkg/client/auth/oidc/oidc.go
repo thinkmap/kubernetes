@@ -22,7 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -31,7 +31,7 @@ import (
 	"golang.org/x/oauth2"
 	"k8s.io/apimachinery/pkg/util/net"
 	restclient "k8s.io/client-go/rest"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -301,7 +301,7 @@ func tokenEndpoint(client *http.Client, issuer string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}

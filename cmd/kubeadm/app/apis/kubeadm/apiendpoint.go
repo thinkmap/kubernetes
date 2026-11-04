@@ -20,7 +20,9 @@ import (
 	"net"
 	"strconv"
 
-	"github.com/pkg/errors"
+	netutils "k8s.io/utils/net"
+
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 )
 
 // APIEndpointFromString returns an APIEndpoint struct based on a "host:port" raw string.
@@ -28,6 +30,9 @@ func APIEndpointFromString(apiEndpoint string) (APIEndpoint, error) {
 	apiEndpointHost, apiEndpointPortStr, err := net.SplitHostPort(apiEndpoint)
 	if err != nil {
 		return APIEndpoint{}, errors.Wrapf(err, "invalid advertise address endpoint: %s", apiEndpoint)
+	}
+	if netutils.ParseIPSloppy(apiEndpointHost) == nil {
+		return APIEndpoint{}, errors.Errorf("invalid API endpoint IP: %s", apiEndpointHost)
 	}
 	apiEndpointPort, err := net.LookupPort("tcp", apiEndpointPortStr)
 	if err != nil {

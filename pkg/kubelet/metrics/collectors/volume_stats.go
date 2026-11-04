@@ -17,9 +17,11 @@ limitations under the License.
 package collectors
 
 import (
+	"context"
+
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/component-base/metrics"
-	stats "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1"
+	stats "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	kubeletmetrics "k8s.io/kubernetes/pkg/kubelet/metrics"
 	serverstats "k8s.io/kubernetes/pkg/kubelet/server/stats"
 )
@@ -89,16 +91,18 @@ func (collector *volumeStatsCollector) DescribeWithStability(ch chan<- *metrics.
 
 // CollectWithStability implements the metrics.StableCollector interface.
 func (collector *volumeStatsCollector) CollectWithStability(ch chan<- metrics.Metric) {
-	podStats, err := collector.statsProvider.ListPodStats()
+	// Use context.TODO() because we currently do not have a proper context to pass in.
+	// Replace this with an appropriate context when refactoring this function to accept a context parameter.
+	ctx := context.TODO()
+	podStats, err := collector.statsProvider.ListPodStats(ctx)
 	if err != nil {
 		return
 	}
 	addGauge := func(desc *metrics.Desc, pvcRef *stats.PVCReference, v float64, lv ...string) {
 		lv = append([]string{pvcRef.Namespace, pvcRef.Name}, lv...)
-
 		ch <- metrics.NewLazyConstMetric(desc, metrics.GaugeValue, v, lv...)
 	}
-	allPVCs := sets.String{}
+	allPVCs := sets.Set[stats.PVCReference]{}
 	for _, podStat := range podStats {
 		if podStat.VolumeStats == nil {
 			continue
@@ -109,8 +113,7 @@ func (collector *volumeStatsCollector) CollectWithStability(ch chan<- metrics.Me
 				// ignore if no PVC reference
 				continue
 			}
-			pvcUniqStr := pvcRef.Namespace + "/" + pvcRef.Name
-			if allPVCs.Has(pvcUniqStr) {
+			if allPVCs.Has(*pvcRef) {
 				// ignore if already collected
 				continue
 			}
@@ -120,7 +123,7 @@ func (collector *volumeStatsCollector) CollectWithStability(ch chan<- metrics.Me
 			addGauge(volumeStatsInodesDesc, pvcRef, float64(*volumeStat.Inodes))
 			addGauge(volumeStatsInodesFreeDesc, pvcRef, float64(*volumeStat.InodesFree))
 			addGauge(volumeStatsInodesUsedDesc, pvcRef, float64(*volumeStat.InodesUsed))
-			allPVCs.Insert(pvcUniqStr)
+			allPVCs.Insert(*pvcRef)
 		}
 	}
 }

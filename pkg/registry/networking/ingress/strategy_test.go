@@ -17,19 +17,24 @@ limitations under the License.
 package ingress
 
 import (
+	"context"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
-	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/networking"
 )
 
 func newIngress() networking.Ingress {
+	serviceBackend := &networking.IngressServiceBackend{
+		Name: "default-backend",
+		Port: networking.ServiceBackendPort{
+			Name:   "",
+			Number: 80,
+		},
+	}
 	defaultBackend := networking.IngressBackend{
-		ServiceName: "default-backend",
-		ServicePort: intstr.FromInt(80),
+		Service: serviceBackend.DeepCopy(),
 	}
 	implementationPathType := networking.PathTypeImplementationSpecific
 	return networking.Ingress{
@@ -38,10 +43,7 @@ func newIngress() networking.Ingress {
 			Namespace: metav1.NamespaceDefault,
 		},
 		Spec: networking.IngressSpec{
-			Backend: &networking.IngressBackend{
-				ServiceName: "default-backend",
-				ServicePort: intstr.FromInt(80),
-			},
+			DefaultBackend: defaultBackend.DeepCopy(),
 			Rules: []networking.IngressRule{
 				{
 					Host: "foo.bar.com",
@@ -51,7 +53,7 @@ func newIngress() networking.Ingress {
 								{
 									Path:     "/foo",
 									PathType: &implementationPathType,
-									Backend:  defaultBackend,
+									Backend:  *defaultBackend.DeepCopy(),
 								},
 							},
 						},
@@ -60,8 +62,8 @@ func newIngress() networking.Ingress {
 			},
 		},
 		Status: networking.IngressStatus{
-			LoadBalancer: api.LoadBalancerStatus{
-				Ingress: []api.LoadBalancerIngress{
+			LoadBalancer: networking.IngressLoadBalancerStatus{
+				Ingress: []networking.IngressLoadBalancerIngress{
 					{IP: "127.0.0.1"},
 				},
 			},
@@ -72,14 +74,14 @@ func newIngress() networking.Ingress {
 func TestIngressStrategy(t *testing.T) {
 	ctx := genericapirequest.NewDefaultContext()
 	apiRequest := genericapirequest.RequestInfo{APIGroup: "networking.k8s.io",
-		APIVersion: "v1beta1",
+		APIVersion: "v1",
 		Resource:   "ingresses",
 	}
 	ctx = genericapirequest.WithRequestInfo(ctx, &apiRequest)
 	if !Strategy.NamespaceScoped() {
 		t.Errorf("Ingress must be namespace scoped")
 	}
-	if Strategy.AllowCreateOnUpdate() {
+	if Strategy.AllowCreateOnUpdate(context.Background()) {
 		t.Errorf("Ingress should not allow create on update")
 	}
 
@@ -110,17 +112,17 @@ func TestIngressStatusStrategy(t *testing.T) {
 	if !StatusStrategy.NamespaceScoped() {
 		t.Errorf("Ingress must be namespace scoped")
 	}
-	if StatusStrategy.AllowCreateOnUpdate() {
+	if StatusStrategy.AllowCreateOnUpdate(context.Background()) {
 		t.Errorf("Ingress should not allow create on update")
 	}
 	oldIngress := newIngress()
 	newIngress := newIngress()
 	oldIngress.ResourceVersion = "4"
 	newIngress.ResourceVersion = "4"
-	newIngress.Spec.Backend.ServiceName = "ignore"
+	newIngress.Spec.DefaultBackend.Service.Name = "ignore"
 	newIngress.Status = networking.IngressStatus{
-		LoadBalancer: api.LoadBalancerStatus{
-			Ingress: []api.LoadBalancerIngress{
+		LoadBalancer: networking.IngressLoadBalancerStatus{
+			Ingress: []networking.IngressLoadBalancerIngress{
 				{IP: "127.0.0.2"},
 			},
 		},
@@ -129,11 +131,22 @@ func TestIngressStatusStrategy(t *testing.T) {
 	if newIngress.Status.LoadBalancer.Ingress[0].IP != "127.0.0.2" {
 		t.Errorf("Ingress status updates should allow change of status fields")
 	}
-	if newIngress.Spec.Backend.ServiceName != "default-backend" {
+	if newIngress.Spec.DefaultBackend.Service.Name != "default-backend" {
 		t.Errorf("PrepareForUpdate should have preserved old spec")
 	}
 	errs := StatusStrategy.ValidateUpdate(ctx, &newIngress, &oldIngress)
 	if len(errs) != 0 {
 		t.Errorf("Unexpected error %v", errs)
+	}
+
+	warnings := StatusStrategy.WarningsOnUpdate(ctx, &newIngress, &oldIngress)
+	if len(warnings) != 0 {
+		t.Errorf("Unexpected warnings %v", errs)
+	}
+
+	newIngress.Status.LoadBalancer.Ingress[0].IP = "127.000.000.002"
+	warnings = StatusStrategy.WarningsOnUpdate(ctx, &newIngress, &oldIngress)
+	if len(warnings) != 1 {
+		t.Errorf("Did not get warning for bad IP")
 	}
 }

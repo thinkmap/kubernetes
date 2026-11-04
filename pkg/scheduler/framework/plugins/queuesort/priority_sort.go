@@ -17,34 +17,36 @@ limitations under the License.
 package queuesort
 
 import (
+	"context"
+
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/kubernetes/pkg/api/v1/pod"
-	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
+	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 )
 
 // Name is the name of the plugin used in the plugin registry and configurations.
-const Name = "PrioritySort"
+const Name = names.PrioritySort
 
 // PrioritySort is a plugin that implements Priority based sorting.
 type PrioritySort struct{}
 
-var _ framework.QueueSortPlugin = &PrioritySort{}
+var _ fwk.QueueSortPlugin = &PrioritySort{}
 
 // Name returns name of the plugin.
 func (pl *PrioritySort) Name() string {
 	return Name
 }
 
-// Less is the function used by the activeQ heap algorithm to sort pods.
-// It sorts pods based on their priority. When priorities are equal, it uses
-// PodQueueInfo.timestamp.
-func (pl *PrioritySort) Less(pInfo1, pInfo2 *framework.QueuedPodInfo) bool {
-	p1 := pod.GetPodPriority(pInfo1.Pod)
-	p2 := pod.GetPodPriority(pInfo2.Pod)
-	return (p1 > p2) || (p1 == p2 && pInfo1.Timestamp.Before(pInfo2.Timestamp))
+// Less is the function used by the activeQ heap algorithm to sort entities.
+// It sorts entities based on their priority. When priorities are equal, it uses
+// the entity timestamp.
+func (pl *PrioritySort) Less(entity1, entity2 fwk.QueuedEntityInfo) bool {
+	p1 := entity1.GetPriority()
+	p2 := entity2.GetPriority()
+	return (p1 > p2) || (p1 == p2 && entity1.GetTimestamp().Before(entity2.GetTimestamp()))
 }
 
 // New initializes a new plugin and returns it.
-func New(_ runtime.Object, handle framework.FrameworkHandle) (framework.Plugin, error) {
+func New(_ context.Context, _ runtime.Object, handle fwk.Handle) (fwk.Plugin, error) {
 	return &PrioritySort{}, nil
 }

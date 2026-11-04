@@ -22,13 +22,16 @@ import (
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/cli-runtime/pkg/printers"
 	appsv1client "k8s.io/client-go/kubernetes/typed/apps/v1"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -59,10 +62,10 @@ type ClusterInfoDumpOptions struct {
 	RESTClientGetter genericclioptions.RESTClientGetter
 	LogsForObject    polymorphichelpers.LogsForObjectFunc
 
-	genericclioptions.IOStreams
+	genericiooptions.IOStreams
 }
 
-func NewCmdClusterInfoDump(f cmdutil.Factory, ioStreams genericclioptions.IOStreams) *cobra.Command {
+func NewCmdClusterInfoDump(restClientGetter genericclioptions.RESTClientGetter, ioStreams genericiooptions.IOStreams) *cobra.Command {
 	o := &ClusterInfoDumpOptions{
 		PrintFlags: genericclioptions.NewPrintFlags("").WithTypeSetter(scheme.Scheme).WithDefaultOutput("json"),
 
@@ -71,11 +74,11 @@ func NewCmdClusterInfoDump(f cmdutil.Factory, ioStreams genericclioptions.IOStre
 
 	cmd := &cobra.Command{
 		Use:     "dump",
-		Short:   i18n.T("Dump lots of relevant info for debugging and diagnosis"),
+		Short:   i18n.T("Dump relevant information for debugging and diagnosis"),
 		Long:    dumpLong,
 		Example: dumpExample,
 		Run: func(cmd *cobra.Command, args []string) {
-			cmdutil.CheckErr(o.Complete(f, cmd))
+			cmdutil.CheckErr(o.Complete(restClientGetter, cmd))
 			cmdutil.CheckErr(o.Run())
 		},
 	}
@@ -91,12 +94,12 @@ func NewCmdClusterInfoDump(f cmdutil.Factory, ioStreams genericclioptions.IOStre
 
 var (
 	dumpLong = templates.LongDesc(i18n.T(`
-    Dumps cluster info out suitable for debugging and diagnosing cluster problems.  By default, dumps everything to
-    stdout. You can optionally specify a directory with --output-directory.  If you specify a directory, kubernetes will
-    build a set of files in that directory.  By default only dumps things in the 'kube-system' namespace, but you can
+    Dump cluster information out suitable for debugging and diagnosing cluster problems.  By default, dumps everything to
+    stdout. You can optionally specify a directory with --output-directory.  If you specify a directory, Kubernetes will
+    build a set of files in that directory.  By default, only dumps things in the current namespace and 'kube-system' namespace, but you can
     switch to a different namespace with the --namespaces flag, or specify --all-namespaces to dump all namespaces.
 
-    The command also dumps the logs of all of the pods in the cluster, these logs are dumped into different directories
+    The command also dumps the logs of all of the pods in the cluster; these logs are dumped into different directories
     based on namespace and pod name.`))
 
 	dumpExample = templates.Examples(i18n.T(`
@@ -113,20 +116,34 @@ var (
     kubectl cluster-info dump --namespaces default,kube-system --output-directory=/path/to/cluster-state`))
 )
 
-func setupOutputWriter(dir string, defaultWriter io.Writer, filename string, fileExtension string) io.Writer {
+// setupOutputWriter returns the writer to dump filename to, plus a function that
+// releases it. The release function is a no-op for defaultWriter, which the
+// caller owns.
+func setupOutputWriter(dir string, defaultWriter io.Writer, filename string, fileExtension string) (io.Writer, func()) {
 	if len(dir) == 0 || dir == "-" {
-		return defaultWriter
+		return defaultWriter, func() {}
 	}
-	fullFile := path.Join(dir, filename) + fileExtension
-	parent := path.Dir(fullFile)
-	cmdutil.CheckErr(os.MkdirAll(parent, 0755))
+	fullFile := filepath.Join(dir, filename) + fileExtension
+	parent := filepath.Dir(fullFile)
+	// Dump output can contain sensitive cluster state, such as pod logs with
+	// embedded credentials, so restrict created directories and files to the
+	// owner.
+	cmdutil.CheckErr(os.MkdirAll(parent, 0700))
 
-	file, err := os.Create(fullFile)
+	file, err := os.OpenFile(fullFile, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 	cmdutil.CheckErr(err)
-	return file
+	return file, func() { file.Close() } //nolint:errcheck
 }
 
-func (o *ClusterInfoDumpOptions) Complete(f cmdutil.Factory, cmd *cobra.Command) error {
+// printObj prints obj to the file (or stdout) selected by setupOutputWriter and
+// closes the file, so a large dump does not exhaust file descriptors.
+func (o *ClusterInfoDumpOptions) printObj(obj runtime.Object, filename string, fileExtension string) error {
+	writer, closeWriter := setupOutputWriter(o.OutputDir, o.Out, filename, fileExtension)
+	defer closeWriter()
+	return o.PrintObj(obj, writer)
+}
+
+func (o *ClusterInfoDumpOptions) Complete(restClientGetter genericclioptions.RESTClientGetter, cmd *cobra.Command) error {
 	printer, err := o.PrintFlags.ToPrinter()
 	if err != nil {
 		return err
@@ -134,7 +151,7 @@ func (o *ClusterInfoDumpOptions) Complete(f cmdutil.Factory, cmd *cobra.Command)
 
 	o.PrintObj = printer.PrintObj
 
-	config, err := f.ToRESTConfig()
+	config, err := restClientGetter.ToRESTConfig()
 	if err != nil {
 		return err
 	}
@@ -154,12 +171,12 @@ func (o *ClusterInfoDumpOptions) Complete(f cmdutil.Factory, cmd *cobra.Command)
 		return err
 	}
 
-	o.Namespace, _, err = f.ToRawKubeConfigLoader().Namespace()
+	o.Namespace, _, err = restClientGetter.ToRawKubeConfigLoader().Namespace()
 	if err != nil {
 		return err
 	}
-	// TODO this should eventually just be the completed kubeconfigflag struct
-	o.RESTClientGetter = f
+
+	o.RESTClientGetter = restClientGetter
 	o.LogsForObject = polymorphichelpers.LogsForObjectFn
 
 	return nil
@@ -181,7 +198,7 @@ func (o *ClusterInfoDumpOptions) Run() error {
 		}
 	}
 
-	if err := o.PrintObj(nodes, setupOutputWriter(o.OutputDir, o.Out, "nodes", fileExtension)); err != nil {
+	if err := o.printObj(nodes, "nodes", fileExtension); err != nil {
 		return err
 	}
 
@@ -200,6 +217,8 @@ func (o *ClusterInfoDumpOptions) Run() error {
 				metav1.NamespaceSystem,
 				o.Namespace,
 			}
+		} else {
+			namespaces = o.Namespaces
 		}
 	}
 	for _, namespace := range namespaces {
@@ -209,7 +228,7 @@ func (o *ClusterInfoDumpOptions) Run() error {
 		if err != nil {
 			return err
 		}
-		if err := o.PrintObj(events, setupOutputWriter(o.OutputDir, o.Out, path.Join(namespace, "events"), fileExtension)); err != nil {
+		if err := o.printObj(events, path.Join(namespace, "events"), fileExtension); err != nil {
 			return err
 		}
 
@@ -217,7 +236,7 @@ func (o *ClusterInfoDumpOptions) Run() error {
 		if err != nil {
 			return err
 		}
-		if err := o.PrintObj(rcs, setupOutputWriter(o.OutputDir, o.Out, path.Join(namespace, "replication-controllers"), fileExtension)); err != nil {
+		if err := o.printObj(rcs, path.Join(namespace, "replication-controllers"), fileExtension); err != nil {
 			return err
 		}
 
@@ -225,7 +244,7 @@ func (o *ClusterInfoDumpOptions) Run() error {
 		if err != nil {
 			return err
 		}
-		if err := o.PrintObj(svcs, setupOutputWriter(o.OutputDir, o.Out, path.Join(namespace, "services"), fileExtension)); err != nil {
+		if err := o.printObj(svcs, path.Join(namespace, "services"), fileExtension); err != nil {
 			return err
 		}
 
@@ -233,7 +252,7 @@ func (o *ClusterInfoDumpOptions) Run() error {
 		if err != nil {
 			return err
 		}
-		if err := o.PrintObj(sets, setupOutputWriter(o.OutputDir, o.Out, path.Join(namespace, "daemonsets"), fileExtension)); err != nil {
+		if err := o.printObj(sets, path.Join(namespace, "daemonsets"), fileExtension); err != nil {
 			return err
 		}
 
@@ -241,7 +260,7 @@ func (o *ClusterInfoDumpOptions) Run() error {
 		if err != nil {
 			return err
 		}
-		if err := o.PrintObj(deps, setupOutputWriter(o.OutputDir, o.Out, path.Join(namespace, "deployments"), fileExtension)); err != nil {
+		if err := o.printObj(deps, path.Join(namespace, "deployments"), fileExtension); err != nil {
 			return err
 		}
 
@@ -249,7 +268,7 @@ func (o *ClusterInfoDumpOptions) Run() error {
 		if err != nil {
 			return err
 		}
-		if err := o.PrintObj(rps, setupOutputWriter(o.OutputDir, o.Out, path.Join(namespace, "replicasets"), fileExtension)); err != nil {
+		if err := o.printObj(rps, path.Join(namespace, "replicasets"), fileExtension); err != nil {
 			return err
 		}
 
@@ -258,7 +277,7 @@ func (o *ClusterInfoDumpOptions) Run() error {
 			return err
 		}
 
-		if err := o.PrintObj(pods, setupOutputWriter(o.OutputDir, o.Out, path.Join(namespace, "pods"), fileExtension)); err != nil {
+		if err := o.printObj(pods, path.Join(namespace, "pods"), fileExtension); err != nil {
 			return err
 		}
 
@@ -288,7 +307,7 @@ func (o *ClusterInfoDumpOptions) Run() error {
 			pod := &pods.Items[ix]
 			initcontainers := pod.Spec.InitContainers
 			containers := pod.Spec.Containers
-			writer := setupOutputWriter(o.OutputDir, o.Out, path.Join(namespace, pod.Name, "logs"), ".txt")
+			writer, closeWriter := setupOutputWriter(o.OutputDir, o.Out, path.Join(namespace, pod.Name, "logs"), ".txt")
 
 			for i := range initcontainers {
 				printContainer(writer, initcontainers[i], pod)
@@ -296,6 +315,7 @@ func (o *ClusterInfoDumpOptions) Run() error {
 			for i := range containers {
 				printContainer(writer, containers[i], pod)
 			}
+			closeWriter()
 		}
 	}
 

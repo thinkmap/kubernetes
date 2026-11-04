@@ -29,15 +29,15 @@ func TestPolicySingleNumaNodeCanAdmitPodResult(t *testing.T) {
 	}{
 		{
 			name:     "Preferred is set to false in topology hints",
-			hint:     TopologyHint{nil, false},
+			hint:     TopologyHint{NUMANodeAffinity: nil, Preferred: false},
 			expected: false,
 		},
 	}
+	numaInfo := commonNUMAInfoTwoNodes()
 
 	for _, tc := range tcases {
-		numaNodes := []int{0, 1}
-		policy := NewSingleNumaNodePolicy(numaNodes)
-		result := policy.(*singleNumaNodePolicy).canAdmitPodResult(&tc.hint)
+		policy := singleNumaNodePolicy{numaInfo: numaInfo, opts: PolicyOptions{}}
+		result := policy.canAdmitPodResult(&tc.hint)
 
 		if result != tc.expected {
 			t.Errorf("Expected result to be %t, got %t", tc.expected, result)
@@ -156,11 +156,11 @@ func TestPolicySingleNumaNodeFilterHints(t *testing.T) {
 }
 
 func TestPolicySingleNumaNodeMerge(t *testing.T) {
-	numaNodes := []int{0, 1}
-	policy := NewSingleNumaNodePolicy(numaNodes)
+	numaInfo := commonNUMAInfoFourNodes()
+	policy := singleNumaNodePolicy{numaInfo: numaInfo, opts: PolicyOptions{}}
 
-	tcases := commonPolicyMergeTestCases(numaNodes)
-	tcases = append(tcases, policy.(*singleNumaNodePolicy).mergeTestCases(numaNodes)...)
+	tcases := commonPolicyMergeTestCases(numaInfo.Nodes)
+	tcases = append(tcases, policy.mergeTestCases(numaInfo.Nodes)...)
 
-	testPolicyMerge(policy, tcases, t)
+	testPolicyMerge(&policy, tcases, t)
 }

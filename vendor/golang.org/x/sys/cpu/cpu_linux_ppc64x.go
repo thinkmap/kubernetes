@@ -2,18 +2,16 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build linux
-// +build ppc64 ppc64le
+//go:build linux && (ppc64 || ppc64le)
 
 package cpu
-
-const cacheLineSize = 128
 
 // HWCAP/HWCAP2 bits. These are exposed by the kernel.
 const (
 	// ISA Level
 	_PPC_FEATURE2_ARCH_2_07 = 0x80000000
 	_PPC_FEATURE2_ARCH_3_00 = 0x00800000
+	_PPC_FEATURE2_ARCH_3_1  = 0x00040000
 
 	// CPU features
 	_PPC_FEATURE2_DARN = 0x00200000
@@ -24,6 +22,9 @@ func doinit() {
 	// HWCAP2 feature bits
 	PPC64.IsPOWER8 = isSet(hwCap2, _PPC_FEATURE2_ARCH_2_07)
 	PPC64.IsPOWER9 = isSet(hwCap2, _PPC_FEATURE2_ARCH_3_00)
+	// ISA 3.1 covers both POWER10 and POWER11: POWER11 did not introduce a
+	// new architected HWCAP level, so there is no separate IsPOWER11.
+	PPC64.IsPOWER10 = isSet(hwCap2, _PPC_FEATURE2_ARCH_3_1)
 	PPC64.HasDARN = isSet(hwCap2, _PPC_FEATURE2_DARN)
 	PPC64.HasSCV = isSet(hwCap2, _PPC_FEATURE2_SCV)
 }

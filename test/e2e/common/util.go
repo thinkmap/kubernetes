@@ -20,7 +20,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os"
 	"text/template"
 	"time"
 
@@ -34,8 +33,10 @@ import (
 	e2erc "k8s.io/kubernetes/test/e2e/framework/rc"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 )
+
+// TODO: Cleanup this file.
 
 // Suite represents test suite.
 type Suite string
@@ -47,58 +48,57 @@ const (
 	NodeE2E Suite = "node e2e"
 )
 
-var (
-	// non-Administrator Windows user used in tests. This is the Windows equivalent of the Linux non-root UID usage.
-	nonAdminTestUserName = "ContainerUser"
-	// non-root UID used in tests.
-	nonRootTestUserID = int64(1000)
-)
-
 // CurrentSuite represents current test suite.
 var CurrentSuite Suite
 
-// CommonImageWhiteList is the list of images used in common test. These images should be prepulled
-// before a tests starts, so that the tests won't fail due image pulling flakes. Currently, this is
-// only used by node e2e test.
+// PrePulledImages are a list of images used in e2e/common tests. These images should be prepulled
+// before tests starts, so that the tests won't fail due image pulling flakes.
+// Currently, this is only used by node e2e test and E2E tests.
+// See also updateImageAllowList() in ../../e2e_node/image_list.go
 // TODO(random-liu): Change the image puller pod to use similar mechanism.
-var CommonImageWhiteList = sets.NewString(
+var PrePulledImages = sets.NewString(
+	imageutils.GetE2EImage(imageutils.AgnhostPrev),
 	imageutils.GetE2EImage(imageutils.Agnhost),
 	imageutils.GetE2EImage(imageutils.BusyBox),
 	imageutils.GetE2EImage(imageutils.IpcUtils),
 	imageutils.GetE2EImage(imageutils.Nginx),
-	imageutils.GetE2EImage(imageutils.Httpd),
 	imageutils.GetE2EImage(imageutils.VolumeNFSServer),
-	imageutils.GetE2EImage(imageutils.VolumeGlusterServer),
 	imageutils.GetE2EImage(imageutils.NonRoot),
 )
 
+// WindowsPrePulledImages are a list of images used in e2e/common tests. These images should be prepulled
+// before tests starts, so that the tests won't fail due image pulling flakes. These images also have
+// Windows support. Currently, this is only used by E2E tests.
+var WindowsPrePulledImages = sets.NewString(
+	imageutils.GetE2EImage(imageutils.AgnhostPrev),
+	imageutils.GetE2EImage(imageutils.Agnhost),
+	imageutils.GetE2EImage(imageutils.BusyBox),
+	imageutils.GetE2EImage(imageutils.Nginx),
+)
+
 type testImagesStruct struct {
-	AgnhostImage  string
-	BusyBoxImage  string
-	KittenImage   string
-	NautilusImage string
-	NginxImage    string
-	NginxNewImage string
-	HttpdImage    string
-	HttpdNewImage string
-	PauseImage    string
-	RedisImage    string
+	AgnhostPrevImage string
+	AgnhostImage     string
+	BusyBoxImage     string
+	KittenImage      string
+	NautilusImage    string
+	NginxImage       string
+	NginxNewImage    string
+	PauseImage       string
 }
 
 var testImages testImagesStruct
 
 func init() {
 	testImages = testImagesStruct{
+		imageutils.GetE2EImage(imageutils.AgnhostPrev),
 		imageutils.GetE2EImage(imageutils.Agnhost),
 		imageutils.GetE2EImage(imageutils.BusyBox),
 		imageutils.GetE2EImage(imageutils.Kitten),
 		imageutils.GetE2EImage(imageutils.Nautilus),
 		imageutils.GetE2EImage(imageutils.Nginx),
 		imageutils.GetE2EImage(imageutils.NginxNew),
-		imageutils.GetE2EImage(imageutils.Httpd),
-		imageutils.GetE2EImage(imageutils.HttpdNew),
 		imageutils.GetE2EImage(imageutils.Pause),
-		imageutils.GetE2EImage(imageutils.Redis),
 	}
 }
 
@@ -116,33 +116,31 @@ func SubstituteImageName(content string) string {
 	return contentWithImageName.String()
 }
 
-func svcByName(name string, port int) *v1.Service {
+func svcByName(name string, port int, selector map[string]string) *v1.Service {
 	return &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 		},
 		Spec: v1.ServiceSpec{
-			Type: v1.ServiceTypeNodePort,
-			Selector: map[string]string{
-				"name": name,
-			},
+			Type:     v1.ServiceTypeNodePort,
+			Selector: selector,
 			Ports: []v1.ServicePort{{
 				Port:       int32(port),
-				TargetPort: intstr.FromInt(port),
+				TargetPort: intstr.FromInt32(int32(port)),
 			}},
 		},
 	}
 }
 
-// NewSVCByName creates a service by name.
-func NewSVCByName(c clientset.Interface, ns, name string) error {
+// NewSVCByName creates a service with the specified selector.
+func NewSVCByName(c clientset.Interface, ns, name string, selector map[string]string) error {
 	const testPort = 9376
-	_, err := c.CoreV1().Services(ns).Create(context.TODO(), svcByName(name, testPort), metav1.CreateOptions{})
+	_, err := c.CoreV1().Services(ns).Create(context.TODO(), svcByName(name, testPort, selector), metav1.CreateOptions{})
 	return err
 }
 
-// NewRCByName creates a replication controller with a selector by name of name.
-func NewRCByName(c clientset.Interface, ns, name string, replicas int32, gracePeriod *int64, containerArgs []string) (*v1.ReplicationController, error) {
+// NewRCByName creates a replication controller with a selector by a specified set of labels.
+func NewRCByName(c clientset.Interface, ns, name string, replicas int32, gracePeriod *int64, containerArgs []string, rcLabels map[string]string) (*v1.ReplicationController, error) {
 	ginkgo.By(fmt.Sprintf("creating replication controller %s", name))
 
 	if containerArgs == nil {
@@ -150,7 +148,7 @@ func NewRCByName(c clientset.Interface, ns, name string, replicas int32, gracePe
 	}
 
 	return c.CoreV1().ReplicationControllers(ns).Create(context.TODO(), rcByNamePort(
-		name, replicas, framework.ServeHostnameImage, containerArgs, 9376, v1.ProtocolTCP, map[string]string{}, gracePeriod), metav1.CreateOptions{})
+		name, replicas, imageutils.GetE2EImage(imageutils.Agnhost), containerArgs, 9376, v1.ProtocolTCP, rcLabels, gracePeriod), metav1.CreateOptions{})
 }
 
 // RestartNodes restarts specific nodes.
@@ -160,7 +158,9 @@ func RestartNodes(c clientset.Interface, nodes []v1.Node) error {
 	for i := range nodes {
 		node := &nodes[i]
 		zone := framework.TestContext.CloudConfig.Zone
-		if z, ok := node.Labels[v1.LabelZoneFailureDomain]; ok {
+		if z, ok := node.Labels[v1.LabelFailureDomainBetaZone]; ok {
+			zone = z
+		} else if z, ok := node.Labels[v1.LabelTopologyZone]; ok {
 			zone = z
 		}
 		nodeNamesByZone[zone] = append(nodeNamesByZone[zone], node.Name)
@@ -188,11 +188,11 @@ func RestartNodes(c clientset.Interface, nodes []v1.Node) error {
 		if err := wait.Poll(30*time.Second, framework.RestartNodeReadyAgainTimeout, func() (bool, error) {
 			newNode, err := c.CoreV1().Nodes().Get(context.TODO(), node.Name, metav1.GetOptions{})
 			if err != nil {
-				return false, fmt.Errorf("error getting node info after reboot: %s", err)
+				return false, fmt.Errorf("error getting node info after reboot: %w", err)
 			}
 			return node.Status.NodeInfo.BootID != newNode.Status.NodeInfo.BootID, nil
 		}); err != nil {
-			return fmt.Errorf("error waiting for node %s boot ID to change: %s", node.Name, err)
+			return fmt.Errorf("error waiting for node %s boot ID to change: %w", node.Name, err)
 		}
 	}
 	return nil
@@ -208,35 +208,4 @@ func rcByNamePort(name string, replicas int32, image string, containerArgs []str
 		Args:  containerArgs,
 		Ports: []v1.ContainerPort{{ContainerPort: int32(port), Protocol: protocol}},
 	}, gracePeriod)
-}
-
-// setPodNonRootUser configures the Pod to run as a non-root user.
-// For Windows, it sets the RunAsUserName field to ContainerUser, and for Linux, it sets the RunAsUser field to 1000.
-func setPodNonRootUser(pod *v1.Pod) {
-	if framework.NodeOSDistroIs("windows") {
-		pod.Spec.SecurityContext.WindowsOptions = &v1.WindowsSecurityContextOptions{RunAsUserName: &nonAdminTestUserName}
-	} else {
-		pod.Spec.SecurityContext.RunAsUser = &nonRootTestUserID
-	}
-}
-
-// getFileModeRegex returns a file mode related regex which should be matched by the mounttest pods' output.
-// If the given mask is nil, then the regex will contain the default OS file modes, which are 0644 for Linux and 0775 for Windows.
-func getFileModeRegex(filePath string, mask *int32) string {
-	var (
-		linuxMask   int32
-		windowsMask int32
-	)
-	if mask == nil {
-		linuxMask = int32(0644)
-		windowsMask = int32(0775)
-	} else {
-		linuxMask = *mask
-		windowsMask = *mask
-	}
-
-	linuxOutput := fmt.Sprintf("mode of file \"%s\": %v", filePath, os.FileMode(linuxMask))
-	windowsOutput := fmt.Sprintf("mode of Windows file \"%v\": %s", filePath, os.FileMode(windowsMask))
-
-	return fmt.Sprintf("(%s|%s)", linuxOutput, windowsOutput)
 }

@@ -1,4 +1,4 @@
-// +build !linux
+//go:build !linux
 
 /*
 Copyright 2015 The Kubernetes Authors.
@@ -19,8 +19,11 @@ limitations under the License.
 package emptydir
 
 import (
+	"fmt"
+
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/utils/mount"
+	"k8s.io/kubernetes/pkg/volume"
+	"k8s.io/mount-utils"
 
 	v1 "k8s.io/api/core/v1"
 )
@@ -32,4 +35,9 @@ type realMountDetector struct {
 
 func (m *realMountDetector) GetMountMedium(path string, requestedMedium v1.StorageMedium) (v1.StorageMedium, bool, *resource.Quantity, error) {
 	return v1.StorageMediumDefault, false, nil, nil
+}
+
+// ResizeEphemeralVolume resizes the volume on the node.
+func (plugin *emptyDirPlugin) ResizeEphemeralVolume(spec *volume.Spec, pod *v1.Pod, newSize *resource.Quantity) error {
+	return fmt.Errorf("in-place resize of memory-backed volumes is only supported on Linux")
 }

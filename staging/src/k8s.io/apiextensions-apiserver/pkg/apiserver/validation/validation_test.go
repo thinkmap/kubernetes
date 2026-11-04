@@ -17,20 +17,37 @@ limitations under the License.
 package validation
 
 import (
+	"context"
+	"math"
 	"math/rand"
+	"os"
+	"strconv"
 	"testing"
+	"time"
 
-	"github.com/go-openapi/spec"
+	"github.com/google/go-cmp/cmp"
 
+	kjson "sigs.k8s.io/json"
+
+	"k8s.io/apimachinery/pkg/util/version"
+	"k8s.io/apiserver/pkg/cel/environment"
+	"k8s.io/utils/ptr"
+
+	kubeopenapispec "k8s.io/kube-openapi/pkg/validation/spec"
+
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	apiextensionsfuzzer "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/fuzzer"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apiextensionsv1conversion "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
+	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel"
 	"k8s.io/apimachinery/pkg/api/apitesting/fuzzer"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apimachinery/pkg/util/sets"
+	celconfig "k8s.io/apiserver/pkg/apis/cel"
 )
 
 // TestRoundTrip checks the conversion to go-openapi types.
@@ -43,22 +60,31 @@ func TestRoundTrip(t *testing.T) {
 	if err := apiextensions.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	if err := apiextensionsv1.AddToScheme(scheme); err != nil {
+	if err := apiextensionsv1conversion.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
 
-	seed := rand.Int63()
-	t.Logf("seed: %d", seed)
+	seed := int64(time.Now().Nanosecond())
+	if override := os.Getenv("TEST_RAND_SEED"); len(override) > 0 {
+		overrideSeed, err := strconv.Atoi(override)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seed = int64(overrideSeed)
+		t.Logf("using overridden seed: %d", seed)
+	} else {
+		t.Logf("seed (override with TEST_RAND_SEED if desired): %d", seed)
+	}
 	fuzzerFuncs := fuzzer.MergeFuzzerFuncs(apiextensionsfuzzer.Funcs)
 	f := fuzzer.FuzzerFor(fuzzerFuncs, rand.NewSource(seed), codecs)
 
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 50; i++ {
 		// fuzz internal types
 		internal := &apiextensions.JSONSchemaProps{}
-		f.Fuzz(internal)
+		f.Fill(internal)
 
 		// internal -> go-openapi
-		openAPITypes := &spec.Schema{}
+		openAPITypes := &kubeopenapispec.Schema{}
 		if err := ConvertJSONSchemaProps(internal, openAPITypes); err != nil {
 			t.Fatal(err)
 		}
@@ -71,8 +97,10 @@ func TestRoundTrip(t *testing.T) {
 
 		// JSON -> in-memory JSON => convertNullTypeToNullable => JSON
 		var j interface{}
-		if err := json.Unmarshal(openAPIJSON, &j); err != nil {
+		if strictErrs, err := kjson.UnmarshalStrict(openAPIJSON, &j); err != nil {
 			t.Fatal(err)
+		} else if len(strictErrs) > 0 {
+			t.Fatal(strictErrs)
 		}
 		j = stripIntOrStringType(j)
 		openAPIJSON, err = json.Marshal(j)
@@ -82,8 +110,10 @@ func TestRoundTrip(t *testing.T) {
 
 		// JSON -> external
 		external := &apiextensionsv1.JSONSchemaProps{}
-		if err := json.Unmarshal(openAPIJSON, external); err != nil {
+		if strictErrs, err := kjson.UnmarshalStrict(openAPIJSON, external); err != nil {
 			t.Fatal(err)
+		} else if len(strictErrs) > 0 {
+			t.Fatal(strictErrs)
 		}
 
 		// external -> internal
@@ -93,7 +123,8 @@ func TestRoundTrip(t *testing.T) {
 		}
 
 		if !apiequality.Semantic.DeepEqual(internal, internalRoundTripped) {
-			t.Fatalf("%d: expected\n\t%#v, got \n\t%#v", i, internal, internalRoundTripped)
+			t.Log(string(openAPIJSON))
+			t.Fatalf("%d: unexpected diff\n\t%s", i, cmp.Diff(internal, internalRoundTripped))
 		}
 	}
 }
@@ -125,18 +156,22 @@ func stripIntOrStringType(x interface{}) interface{} {
 
 type failingObject struct {
 	object     interface{}
+	oldObject  interface{}
 	expectErrs []string
 }
 
 func TestValidateCustomResource(t *testing.T) {
 	tests := []struct {
 		name           string
+		compatVersion  *version.Version
 		schema         apiextensions.JSONSchemaProps
 		objects        []interface{}
+		oldObjects     []interface{}
 		failingObjects []failingObject
 	}{
 		{name: "!nullable",
 			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
 				Properties: map[string]apiextensions.JSONSchemaProps{
 					"field": {
 						Type:     "object",
@@ -159,6 +194,7 @@ func TestValidateCustomResource(t *testing.T) {
 		},
 		{name: "nullable",
 			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
 				Properties: map[string]apiextensions.JSONSchemaProps{
 					"field": {
 						Type:     "object",
@@ -181,6 +217,7 @@ func TestValidateCustomResource(t *testing.T) {
 		},
 		{name: "nullable and no type",
 			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
 				Properties: map[string]apiextensions.JSONSchemaProps{
 					"field": {
 						Nullable: true,
@@ -200,6 +237,7 @@ func TestValidateCustomResource(t *testing.T) {
 		},
 		{name: "x-kubernetes-int-or-string",
 			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
 				Properties: map[string]apiextensions.JSONSchemaProps{
 					"field": {
 						XIntOrString: true,
@@ -221,6 +259,7 @@ func TestValidateCustomResource(t *testing.T) {
 		},
 		{name: "nullable and x-kubernetes-int-or-string",
 			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
 				Properties: map[string]apiextensions.JSONSchemaProps{
 					"field": {
 						Nullable:     true,
@@ -243,6 +282,7 @@ func TestValidateCustomResource(t *testing.T) {
 		},
 		{name: "nullable, x-kubernetes-int-or-string and user-provided anyOf",
 			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
 				Properties: map[string]apiextensions.JSONSchemaProps{
 					"field": {
 						Nullable:     true,
@@ -262,22 +302,23 @@ func TestValidateCustomResource(t *testing.T) {
 			},
 			failingObjects: []failingObject{
 				{object: map[string]interface{}{"field": true}, expectErrs: []string{
-					`: Invalid value: "": "field" must validate at least one schema (anyOf)`,
+					`<nil>: Invalid value: "": "field" must validate at least one schema (anyOf)`,
 					`field: Invalid value: "boolean": field in body must be of type integer,string: "boolean"`,
 					`field: Invalid value: "boolean": field in body must be of type integer: "boolean"`,
 				}},
 				{object: map[string]interface{}{"field": 1.2}, expectErrs: []string{
-					`: Invalid value: "": "field" must validate at least one schema (anyOf)`,
+					`<nil>: Invalid value: "": "field" must validate at least one schema (anyOf)`,
 					`field: Invalid value: "number": field in body must be of type integer,string: "number"`,
 					`field: Invalid value: "number": field in body must be of type integer: "number"`,
+					`<nil>: Invalid value: "": Checked value must be of type integer (default format) in field`,
 				}},
 				{object: map[string]interface{}{"field": map[string]interface{}{}}, expectErrs: []string{
-					`: Invalid value: "": "field" must validate at least one schema (anyOf)`,
+					`<nil>: Invalid value: "": "field" must validate at least one schema (anyOf)`,
 					`field: Invalid value: "object": field in body must be of type integer,string: "object"`,
 					`field: Invalid value: "object": field in body must be of type integer: "object"`,
 				}},
 				{object: map[string]interface{}{"field": []interface{}{}}, expectErrs: []string{
-					`: Invalid value: "": "field" must validate at least one schema (anyOf)`,
+					`<nil>: Invalid value: "": "field" must validate at least one schema (anyOf)`,
 					`field: Invalid value: "array": field in body must be of type integer,string: "array"`,
 					`field: Invalid value: "array": field in body must be of type integer: "array"`,
 				}},
@@ -285,6 +326,7 @@ func TestValidateCustomResource(t *testing.T) {
 		},
 		{name: "nullable, x-kubernetes-int-or-string and user-provider allOf",
 			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
 				Properties: map[string]apiextensions.JSONSchemaProps{
 					"field": {
 						Nullable:     true,
@@ -308,26 +350,27 @@ func TestValidateCustomResource(t *testing.T) {
 			},
 			failingObjects: []failingObject{
 				{object: map[string]interface{}{"field": true}, expectErrs: []string{
-					`: Invalid value: "": "field" must validate all the schemas (allOf). None validated`,
-					`: Invalid value: "": "field" must validate at least one schema (anyOf)`,
+					`<nil>: Invalid value: "": "field" must validate all the schemas (allOf). None validated`,
+					`<nil>: Invalid value: "": "field" must validate at least one schema (anyOf)`,
 					`field: Invalid value: "boolean": field in body must be of type integer,string: "boolean"`,
 					`field: Invalid value: "boolean": field in body must be of type integer: "boolean"`,
 				}},
 				{object: map[string]interface{}{"field": 1.2}, expectErrs: []string{
-					`: Invalid value: "": "field" must validate all the schemas (allOf). None validated`,
-					`: Invalid value: "": "field" must validate at least one schema (anyOf)`,
+					`<nil>: Invalid value: "": "field" must validate all the schemas (allOf). None validated`,
+					`<nil>: Invalid value: "": "field" must validate at least one schema (anyOf)`,
 					`field: Invalid value: "number": field in body must be of type integer,string: "number"`,
 					`field: Invalid value: "number": field in body must be of type integer: "number"`,
+					`<nil>: Invalid value: "": Checked value must be of type integer (default format) in field`,
 				}},
 				{object: map[string]interface{}{"field": map[string]interface{}{}}, expectErrs: []string{
-					`: Invalid value: "": "field" must validate all the schemas (allOf). None validated`,
-					`: Invalid value: "": "field" must validate at least one schema (anyOf)`,
+					`<nil>: Invalid value: "": "field" must validate all the schemas (allOf). None validated`,
+					`<nil>: Invalid value: "": "field" must validate at least one schema (anyOf)`,
 					`field: Invalid value: "object": field in body must be of type integer,string: "object"`,
 					`field: Invalid value: "object": field in body must be of type integer: "object"`,
 				}},
 				{object: map[string]interface{}{"field": []interface{}{}}, expectErrs: []string{
-					`: Invalid value: "": "field" must validate all the schemas (allOf). None validated`,
-					`: Invalid value: "": "field" must validate at least one schema (anyOf)`,
+					`<nil>: Invalid value: "": "field" must validate all the schemas (allOf). None validated`,
+					`<nil>: Invalid value: "": "field" must validate at least one schema (anyOf)`,
 					`field: Invalid value: "array": field in body must be of type integer,string: "array"`,
 					`field: Invalid value: "array": field in body must be of type integer: "array"`,
 				}},
@@ -335,6 +378,7 @@ func TestValidateCustomResource(t *testing.T) {
 		},
 		{name: "invalid regex",
 			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
 				Properties: map[string]apiextensions.JSONSchemaProps{
 					"field": {
 						Type:    "string",
@@ -343,11 +387,12 @@ func TestValidateCustomResource(t *testing.T) {
 				},
 			},
 			failingObjects: []failingObject{
-				{object: map[string]interface{}{"field": "foo"}, expectErrs: []string{"field: Invalid value: \"\": field in body should match '+, but pattern is invalid: error parsing regexp: missing argument to repetition operator: `+`'"}},
+				{object: map[string]interface{}{"field": "foo"}, expectErrs: []string{"field: Invalid value: \"foo\": field in body should match '+, but pattern is invalid: error parsing regexp: missing argument to repetition operator: `+`'"}},
 			},
 		},
 		{name: "required field",
 			schema: apiextensions.JSONSchemaProps{
+				Type:     "object",
 				Required: []string{"field"},
 				Properties: map[string]apiextensions.JSONSchemaProps{
 					"field": {
@@ -366,6 +411,7 @@ func TestValidateCustomResource(t *testing.T) {
 		},
 		{name: "enum",
 			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
 				Properties: map[string]apiextensions.JSONSchemaProps{
 					"field": {
 						Type:     "object",
@@ -396,20 +442,374 @@ func TestValidateCustomResource(t *testing.T) {
 				}},
 			},
 		},
+		{name: "immutability transition rule",
+			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
+				Properties: map[string]apiextensions.JSONSchemaProps{
+					"field": {
+						Type: "string",
+						XValidations: []apiextensions.ValidationRule{
+							{
+								Rule: "self == oldSelf",
+							},
+						},
+					},
+				},
+			},
+			objects: []interface{}{
+				map[string]interface{}{"field": "x"},
+			},
+			oldObjects: []interface{}{
+				map[string]interface{}{"field": "x"},
+			},
+			failingObjects: []failingObject{
+				{
+					object:    map[string]interface{}{"field": "y"},
+					oldObject: map[string]interface{}{"field": "x"},
+					expectErrs: []string{
+						`field: Invalid value: "y": failed rule: self == oldSelf`,
+					}},
+			},
+		},
+		{name: "correlatable transition rule",
+			// Ensures a transition rule under a "listMap" is supported.
+			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
+				Properties: map[string]apiextensions.JSONSchemaProps{
+					"field": {
+						Type:         "array",
+						XListType:    &listMapType,
+						XListMapKeys: []string{"k1", "k2"},
+						Items: &apiextensions.JSONSchemaPropsOrArray{
+							Schema: &apiextensions.JSONSchemaProps{
+								Type: "object",
+								Properties: map[string]apiextensions.JSONSchemaProps{
+									"k1": {
+										Type: "string",
+									},
+									"k2": {
+										Type: "string",
+									},
+									"v1": {
+										Type: "number",
+										XValidations: []apiextensions.ValidationRule{
+											{
+												Rule: "self >= oldSelf",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			objects: []interface{}{
+				map[string]interface{}{"field": []interface{}{map[string]interface{}{"k1": "a", "k2": "b", "v1": 1.2}}},
+			},
+			oldObjects: []interface{}{
+				map[string]interface{}{"field": []interface{}{map[string]interface{}{"k1": "a", "k2": "b", "v1": 1.0}}},
+			},
+			failingObjects: []failingObject{
+				{
+					object:    map[string]interface{}{"field": []interface{}{map[string]interface{}{"k1": "a", "k2": "b", "v1": 0.9}}},
+					oldObject: map[string]interface{}{"field": []interface{}{map[string]interface{}{"k1": "a", "k2": "b", "v1": 1.0}}},
+					expectErrs: []string{
+						`field[0].v1: Invalid value: 0.9: failed rule: self >= oldSelf`,
+					}},
+			},
+		},
+		{name: "validation rule under non-correlatable field",
+			// The array makes the rule on the nested string non-correlatable
+			// for transition rule purposes. This test ensures that a rule that
+			// does NOT use oldSelf (is not a transition rule), still behaves
+			// as expected under a non-correlatable field.
+			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
+				Properties: map[string]apiextensions.JSONSchemaProps{
+					"field": {
+						Type: "array",
+						Items: &apiextensions.JSONSchemaPropsOrArray{
+							Schema: &apiextensions.JSONSchemaProps{
+								Type: "object",
+								Properties: map[string]apiextensions.JSONSchemaProps{
+									"x": {
+										Type: "string",
+										XValidations: []apiextensions.ValidationRule{
+											{
+												Rule: "self == 'x'",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			objects: []interface{}{
+				map[string]interface{}{"field": []interface{}{map[string]interface{}{"x": "x"}}},
+			},
+			failingObjects: []failingObject{
+				{
+					object: map[string]interface{}{"field": []interface{}{map[string]interface{}{"x": "y"}}},
+					expectErrs: []string{
+						`field[0].x: Invalid value: "y": failed rule: self == 'x'`,
+					}},
+			},
+		},
+		{name: "maxProperties",
+			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
+				Properties: map[string]apiextensions.JSONSchemaProps{
+					"fieldX": {
+						Type:          "object",
+						MaxProperties: ptr.To[int64](2),
+					},
+				},
+			},
+			failingObjects: []failingObject{
+				{object: map[string]interface{}{"fieldX": map[string]interface{}{"a": true, "b": true, "c": true}}, expectErrs: []string{
+					`fieldX: Too many: 3: must have at most 2 items`,
+				}},
+			},
+		},
+		{name: "maxItems",
+			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
+				Properties: map[string]apiextensions.JSONSchemaProps{
+					"fieldX": {
+						Type:     "array",
+						MaxItems: ptr.To[int64](2),
+					},
+				},
+			},
+			failingObjects: []failingObject{
+				{object: map[string]interface{}{"fieldX": []interface{}{"a", "b", "c"}}, expectErrs: []string{
+					`fieldX: Too many: 3: must have at most 2 items`,
+				}},
+			},
+		},
+		{name: "minProperties",
+			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
+				Properties: map[string]apiextensions.JSONSchemaProps{
+					"fieldX": {
+						Type:          "object",
+						MinProperties: ptr.To[int64](1),
+					},
+				},
+			},
+			failingObjects: []failingObject{
+				{object: map[string]interface{}{"fieldX": map[string]interface{}{}}, expectErrs: []string{
+					`fieldX: Too few: 0: must have at least 1 item`,
+				}},
+			},
+		},
+		{name: "minItems",
+			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
+				Properties: map[string]apiextensions.JSONSchemaProps{
+					"fieldX": {
+						Type:     "array",
+						MinItems: ptr.To[int64](2),
+					},
+				},
+			},
+			failingObjects: []failingObject{
+				{object: map[string]interface{}{"fieldX": []interface{}{"a"}}, expectErrs: []string{
+					`fieldX: Too few: 1: must have at least 2 items`,
+				}},
+			},
+		},
+		{name: "minLength",
+			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
+				Properties: map[string]apiextensions.JSONSchemaProps{
+					"fieldX": {
+						Type:      "string",
+						MinLength: ptr.To[int64](3),
+					},
+				},
+			},
+			failingObjects: []failingObject{
+				{object: map[string]interface{}{"fieldX": "ab"}, expectErrs: []string{
+					`fieldX: Too short: must be at least 3 characters`,
+				}},
+			},
+		},
+		{name: "maxLength",
+			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
+				Properties: map[string]apiextensions.JSONSchemaProps{
+					"fieldX": {
+						Type:      "string",
+						MaxLength: ptr.To[int64](2),
+					},
+				},
+			},
+			failingObjects: []failingObject{
+				{object: map[string]interface{}{"fieldX": "abc"}, expectErrs: []string{
+					`fieldX: Too long: may not be more than 2 bytes`,
+				}},
+			},
+		},
+		{name: "k8sLongName",
+			compatVersion: version.MajorMinor(1, 34),
+			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
+				Properties: map[string]apiextensions.JSONSchemaProps{
+					"fieldX": {
+						Type:   "string",
+						Format: "k8s-long-name",
+					},
+				},
+			},
+			failingObjects: []failingObject{
+				{object: map[string]interface{}{"fieldX": "a.-"}, expectErrs: []string{
+					`fieldX: Invalid value: "a.-": fieldX in body must be of type k8s-long-name: "a.-"`,
+				}},
+			},
+		},
+		{name: "k8sShortName",
+			compatVersion: version.MajorMinor(1, 34),
+			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
+				Properties: map[string]apiextensions.JSONSchemaProps{
+					"fieldX": {
+						Type:   "string",
+						Format: "k8s-short-name",
+					},
+				},
+			},
+			failingObjects: []failingObject{
+				{object: map[string]interface{}{"fieldX": "a-"}, expectErrs: []string{
+					`fieldX: Invalid value: "a-": fieldX in body must be of type k8s-short-name: "a-"`,
+				}},
+			},
+		},
+		{name: "numeric formats valid",
+			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
+				Properties: map[string]apiextensions.JSONSchemaProps{
+					"intThirtyTwo":  {Type: "integer", Format: "int32"},
+					"intSixtyFour":  {Type: "integer", Format: "int64"},
+					"floatThreeTwo": {Type: "number", Format: "float"},
+					"floatSixFour":  {Type: "number", Format: "double"},
+				},
+			},
+			objects: []interface{}{
+				map[string]interface{}{
+					"intThirtyTwo":  int64(math.MinInt32),
+					"intSixtyFour":  int64(math.MinInt64),
+					"floatThreeTwo": float64(-math.MaxFloat32),
+					"floatSixFour":  float64(-math.MaxFloat64),
+				},
+				map[string]interface{}{
+					"intThirtyTwo":  int64(0),
+					"intSixtyFour":  int64(0),
+					"floatThreeTwo": float64(0),
+					"floatSixFour":  float64(0),
+				},
+				map[string]interface{}{
+					"intThirtyTwo":  int64(math.MaxInt32),
+					"intSixtyFour":  int64(math.MaxInt64),
+					"floatThreeTwo": float64(math.MaxFloat32),
+					"floatSixFour":  float64(math.MaxFloat64),
+				},
+			},
+		},
+		{name: "numeric formats invalid",
+			schema: apiextensions.JSONSchemaProps{
+				Type: "object",
+				Properties: map[string]apiextensions.JSONSchemaProps{
+					"intThirtyTwo":  {Type: "integer", Format: "int32"},
+					"intSixtyFour":  {Type: "integer", Format: "int64"},
+					"floatThreeTwo": {Type: "number", Format: "float"},
+					"floatSixFour":  {Type: "number", Format: "double"},
+				},
+			},
+			failingObjects: []failingObject{
+				{
+					object: map[string]interface{}{"intThirtyTwo": int64(math.MaxInt32 + 1)},
+					expectErrs: []string{
+						`<nil>: Invalid value: "": Checked value must be of type integer with format int32 in intThirtyTwo`,
+					},
+				},
+				{
+					object: map[string]interface{}{"intThirtyTwo": int64(math.MinInt32 - 1)},
+					expectErrs: []string{
+						`<nil>: Invalid value: "": Checked value must be of type integer with format int32 in intThirtyTwo`,
+					},
+				},
+				// int64 overflow is not possible with int64 input, but we can test it with float64
+				{
+					object: map[string]interface{}{"intSixtyFour": float64(math.MaxInt64) * 1.1},
+					expectErrs: []string{
+						`intSixtyFour: Invalid value: "float64": intSixtyFour in body must be of type int64: "float64"`,
+						`<nil>: Invalid value: "": Checked value must be of type integer with format int64 in intSixtyFour`,
+					},
+				},
+				{
+					object: map[string]interface{}{"intSixtyFour": float64(math.MinInt64) * 1.1},
+					expectErrs: []string{
+						`intSixtyFour: Invalid value: "float64": intSixtyFour in body must be of type int64: "float64"`,
+						`<nil>: Invalid value: "": Checked value must be of type integer with format int64 in intSixtyFour`,
+					},
+				},
+				{
+					object: map[string]interface{}{"floatThreeTwo": float64(math.MaxFloat32 * 1.1)},
+					expectErrs: []string{
+						`<nil>: Invalid value: "": Checked value must be of type number with format float in floatThreeTwo`,
+					},
+				},
+				{
+					object: map[string]interface{}{"floatThreeTwo": float64(-math.MaxFloat32 * 1.1)},
+					expectErrs: []string{
+						`<nil>: Invalid value: "": Checked value must be of type number with format float in floatThreeTwo`,
+					},
+				},
+				// double overflow (float64) is handled by JSON parsing, but we can try to pass a value that might trigger it if not parsed as such.
+				// However, standard JSON unmarshalling usually caps at float64 limits or errors out.
+				// The validator itself checks ranges. Since Go's float64 matches double, true overflow is hard to represent without a custom numeric type.
+				// We will skip explicit double overflow tests here as they often result in +Inf/-Inf which might be handled differently or parse errors.
+			},
+		},
 	}
 	for _, tt := range tests {
+		compatVersion := tt.compatVersion
+		if compatVersion == nil {
+			compatVersion = environment.DefaultCompatibilityVersion()
+		}
+
 		t.Run(tt.name, func(t *testing.T) {
-			validator, _, err := NewSchemaValidator(&apiextensions.CustomResourceValidation{OpenAPIV3Schema: &tt.schema})
+			validator, _, err := NewSchemaValidatorForVersion(&tt.schema, compatVersion)
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, obj := range tt.objects {
+			structural, err := structuralschema.NewStructural(&tt.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			celValidator := cel.NewValidator(structural, false, celconfig.PerCallLimit)
+			for i, obj := range tt.objects {
+				var oldObject interface{}
+				if len(tt.oldObjects) == len(tt.objects) {
+					oldObject = tt.oldObjects[i]
+				}
 				if errs := ValidateCustomResource(nil, obj, validator); len(errs) > 0 {
 					t.Errorf("unexpected validation error for %v: %v", obj, errs)
 				}
+				errs, _ := celValidator.Validate(context.TODO(), nil, structural, obj, oldObject, celconfig.RuntimeCELCostBudget)
+				if len(errs) > 0 {
+					t.Error(errs.ToAggregate().Error())
+				}
 			}
 			for i, failingObject := range tt.failingObjects {
-				if errs := ValidateCustomResource(nil, failingObject.object, validator); len(errs) == 0 {
+				errs := ValidateCustomResource(nil, failingObject.object, validator)
+				celErrs, _ := celValidator.Validate(context.TODO(), nil, structural, failingObject.object, failingObject.oldObject, celconfig.RuntimeCELCostBudget)
+				errs = append(errs, celErrs...)
+				if len(errs) == 0 {
 					t.Errorf("missing error for %v", failingObject.object)
 				} else {
 					sawErrors := sets.NewString()
@@ -471,7 +871,7 @@ func TestItemsProperty(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			validator, _, err := NewSchemaValidator(&apiextensions.CustomResourceValidation{OpenAPIV3Schema: &tt.args.schema})
+			validator, _, err := NewSchemaValidator(&tt.args.schema)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -485,3 +885,5 @@ func TestItemsProperty(t *testing.T) {
 		})
 	}
 }
+
+var listMapType = "map"

@@ -23,8 +23,8 @@ import (
 	"testing"
 	"time"
 
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	crdclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/typed/apiextensions/v1"
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	crdclient "k8s.io/apiextensions-api/pkg/client/clientset/clientset/typed/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/pkg/controller/finalizer"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -69,18 +69,17 @@ func TestOverlappingBuiltInResources(t *testing.T) {
 
 // TestOverlappingCustomResourceAPIService ensures creating and deleting a custom resource overlapping with APIServices does not destroy APIService data
 func TestOverlappingCustomResourceAPIService(t *testing.T) {
-	master := StartRealMasterOrDie(t)
-	defer master.Cleanup()
+	apiServer := StartRealAPIServerOrDie(t)
 
-	apiServiceClient, err := apiregistrationclient.NewForConfig(master.Config)
+	apiServiceClient, err := apiregistrationclient.NewForConfig(apiServer.Config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	crdClient, err := crdclient.NewForConfig(master.Config)
+	crdClient, err := crdclient.NewForConfig(apiServer.Config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dynamicClient, err := dynamic.NewForConfig(master.Config)
+	dynamicClient, err := dynamic.NewForConfig(apiServer.Config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +179,7 @@ func TestOverlappingCustomResourceAPIService(t *testing.T) {
 	}
 
 	// discovery is handled by the built-in handler
-	v1Resources, err := master.Client.Discovery().ServerResourcesForGroupVersion("apiregistration.k8s.io/v1")
+	v1Resources, err := apiServer.Client.Discovery().ServerResourcesForGroupVersion("apiregistration.k8s.io/v1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +190,7 @@ func TestOverlappingCustomResourceAPIService(t *testing.T) {
 			}
 		}
 	}
-	v2Resources, err := master.Client.Discovery().ServerResourcesForGroupVersion("apiregistration.k8s.io/v2")
+	v2Resources, err := apiServer.Client.Discovery().ServerResourcesForGroupVersion("apiregistration.k8s.io/v2")
 	if err == nil {
 		t.Fatalf("expected error looking up apiregistration.k8s.io/v2 discovery, got %#v", v2Resources)
 	}
@@ -231,14 +230,13 @@ func TestOverlappingCustomResourceAPIService(t *testing.T) {
 
 // TestOverlappingCustomResourceCustomResourceDefinition ensures creating and deleting a custom resource overlapping with CustomResourceDefinition does not destroy CustomResourceDefinition data
 func TestOverlappingCustomResourceCustomResourceDefinition(t *testing.T) {
-	master := StartRealMasterOrDie(t)
-	defer master.Cleanup()
+	apiServer := StartRealAPIServerOrDie(t)
 
-	crdClient, err := crdclient.NewForConfig(master.Config)
+	crdClient, err := crdclient.NewForConfig(apiServer.Config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dynamicClient, err := dynamic.NewForConfig(master.Config)
+	dynamicClient, err := dynamic.NewForConfig(apiServer.Config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,7 +329,7 @@ func TestOverlappingCustomResourceCustomResourceDefinition(t *testing.T) {
 	}
 
 	// discovery is handled by the built-in handler
-	v1Resources, err := master.Client.Discovery().ServerResourcesForGroupVersion("apiextensions.k8s.io/v1")
+	v1Resources, err := apiServer.Client.Discovery().ServerResourcesForGroupVersion("apiextensions.k8s.io/v1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +340,7 @@ func TestOverlappingCustomResourceCustomResourceDefinition(t *testing.T) {
 			}
 		}
 	}
-	v2Resources, err := master.Client.Discovery().ServerResourcesForGroupVersion("apiextensions.k8s.io/v2")
+	v2Resources, err := apiServer.Client.Discovery().ServerResourcesForGroupVersion("apiextensions.k8s.io/v2")
 	if err == nil {
 		t.Fatalf("expected error looking up apiregistration.k8s.io/v2 discovery, got %#v", v2Resources)
 	}

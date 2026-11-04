@@ -18,11 +18,14 @@ package generators
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 
-	"k8s.io/gengo/examples/set-gen/sets"
-	"k8s.io/gengo/types"
+	"k8s.io/gengo/v2"
+	"k8s.io/gengo/v2/types"
+	"k8s.io/kube-openapi/pkg/util/sets"
 )
 
 const extensionPrefix = "x-kubernetes-"
@@ -66,6 +69,17 @@ var tagToExtension = map[string]extensionAttributes{
 		kind:          types.Struct,
 		allowedValues: sets.NewString("atomic", "granular"),
 	},
+	"validations": {
+		xName: "x-kubernetes-validations",
+		kind:  types.Slice,
+	},
+}
+
+// tagAliases maps the "k8s:" spellings of tagToExtension tags to the tags they
+// alias. See resolveTagAliases.
+var tagAliases = map[string]string{
+	"k8s:listType":   "listType",
+	"k8s:listMapKey": "listMapKey",
 }
 
 // Extension encapsulates information necessary to generate an OpenAPI extension.
@@ -141,6 +155,22 @@ func sortedMapKeys(m map[string][]string) []string {
 	return keys
 }
 
+// resolveTagAliases treats tagAliases as aliases of the unprefixed tags, which
+// win where both are present. +k8s:listMapKey is only used on map lists.
+func resolveTagAliases(tagValues map[string][]string) {
+	_, hasListMapKey := tagValues["listMapKey"]
+	for alias, tag := range tagAliases {
+		if _, ok := tagValues[tag]; !ok {
+			if values, ok := tagValues[alias]; ok {
+				tagValues[tag] = values
+			}
+		}
+	}
+	if !hasListMapKey && !slices.Equal(tagValues["listType"], []string{"map"}) {
+		delete(tagValues, "listMapKey")
+	}
+}
+
 // Parses comments to return openapi extensions. Returns a list of
 // extensions which parsed correctly, as well as a list of the
 // parse errors. Validating extensions is performed separately.
@@ -166,8 +196,19 @@ func parseExtensions(comments []string) ([]extension, []error) {
 			extensions = append(extensions, e)
 		}
 	}
-	// Next, generate extensions from "idlTags" (e.g. +listType)
-	tagValues := types.ExtractCommentTags("+", comments)
+	// Next, generate extensions from "idlTags" (e.g. +listType) and their aliases.
+	idlTags := slices.AppendSeq(slices.Collect(maps.Keys(tagToExtension)), maps.Keys(tagAliases))
+	tags, err := gengo.ExtractFunctionStyleCommentTags("+", idlTags, comments)
+	if err != nil {
+		return extensions, append(errors, err)
+	}
+	tagValues := map[string][]string{}
+	for name, nameTags := range tags {
+		for _, tag := range nameTags {
+			tagValues[name] = append(tagValues[name], tag.Value)
+		}
+	}
+	resolveTagAliases(tagValues)
 	for _, idlTag := range sortedMapKeys(tagValues) {
 		xAttrs, exists := tagToExtension[idlTag]
 		if !exists {

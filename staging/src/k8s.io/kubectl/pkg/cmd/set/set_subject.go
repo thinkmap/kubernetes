@@ -28,8 +28,10 @@ import (
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/cli-runtime/pkg/printers"
 	"k8s.io/cli-runtime/pkg/resource"
+	"k8s.io/client-go/tools/clientcmd"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/scheme"
 	"k8s.io/kubectl/pkg/util/i18n"
@@ -37,17 +39,17 @@ import (
 )
 
 var (
-	subjectLong = templates.LongDesc(`
-	Update User, Group or ServiceAccount in a RoleBinding/ClusterRoleBinding.`)
+	subjectLong = templates.LongDesc(i18n.T(`
+	Update the user, group, or service account in a role binding or cluster role binding.`))
 
 	subjectExample = templates.Examples(`
-	# Update a ClusterRoleBinding for serviceaccount1
+	# Update a cluster role binding for serviceaccount1
 	kubectl set subject clusterrolebinding admin --serviceaccount=namespace:serviceaccount1
 
-	# Update a RoleBinding for user1, user2, and group1
+	# Update a role binding for user1, user2, and group1
 	kubectl set subject rolebinding admin --user=user1 --user=user2 --group=group1
 
-	# Print the result (in yaml format) of updating rolebinding subjects from a local, without hitting the server
+	# Print the result (in YAML format) of updating rolebinding subjects from a local, without hitting the server
 	kubectl create rolebinding admin --role=admin --user=admin -o yaml --dry-run=client | kubectl set subject --local -f - --user=foo -o yaml`)
 )
 
@@ -66,8 +68,8 @@ type SubjectOptions struct {
 	Output            string
 	All               bool
 	DryRunStrategy    cmdutil.DryRunStrategy
-	DryRunVerifier    *resource.DryRunVerifier
 	Local             bool
+	fieldManager      string
 
 	Users           []string
 	Groups          []string
@@ -77,11 +79,11 @@ type SubjectOptions struct {
 
 	PrintObj printers.ResourcePrinterFunc
 
-	genericclioptions.IOStreams
+	genericiooptions.IOStreams
 }
 
 // NewSubjectOptions returns an initialized SubjectOptions instance
-func NewSubjectOptions(streams genericclioptions.IOStreams) *SubjectOptions {
+func NewSubjectOptions(streams genericiooptions.IOStreams) *SubjectOptions {
 	return &SubjectOptions{
 		PrintFlags: genericclioptions.NewPrintFlags("subjects updated").WithTypeSetter(scheme.Scheme),
 
@@ -90,12 +92,12 @@ func NewSubjectOptions(streams genericclioptions.IOStreams) *SubjectOptions {
 }
 
 // NewCmdSubject returns the "new subject" sub command
-func NewCmdSubject(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.Command {
+func NewCmdSubject(f cmdutil.Factory, streams genericiooptions.IOStreams) *cobra.Command {
 	o := NewSubjectOptions(streams)
 	cmd := &cobra.Command{
 		Use:                   "subject (-f FILENAME | TYPE NAME) [--user=username] [--group=groupname] [--serviceaccount=namespace:serviceaccountname] [--dry-run=server|client|none]",
 		DisableFlagsInUseLine: true,
-		Short:                 i18n.T("Update User, Group or ServiceAccount in a RoleBinding/ClusterRoleBinding"),
+		Short:                 i18n.T("Update the user, group, or service account in a role binding or cluster role binding"),
 		Long:                  subjectLong,
 		Example:               subjectExample,
 		Run: func(cmd *cobra.Command, args []string) {
@@ -108,13 +110,14 @@ func NewCmdSubject(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobr
 	o.PrintFlags.AddFlags(cmd)
 
 	cmdutil.AddFilenameOptionFlags(cmd, &o.FilenameOptions, "the resource to update the subjects")
-	cmd.Flags().BoolVar(&o.All, "all", o.All, "Select all resources, including uninitialized ones, in the namespace of the specified resource types")
-	cmd.Flags().StringVarP(&o.Selector, "selector", "l", o.Selector, "Selector (label query) to filter on, not including uninitialized ones, supports '=', '==', and '!='.(e.g. -l key1=value1,key2=value2)")
+	cmd.Flags().BoolVar(&o.All, "all", o.All, "Select all resources, in the namespace of the specified resource types")
+	cmdutil.AddLabelSelectorFlagVar(cmd, &o.Selector)
 	cmd.Flags().BoolVar(&o.Local, "local", o.Local, "If true, set subject will NOT contact api-server but run locally.")
 	cmdutil.AddDryRunFlag(cmd)
 	cmd.Flags().StringArrayVar(&o.Users, "user", o.Users, "Usernames to bind to the role")
 	cmd.Flags().StringArrayVar(&o.Groups, "group", o.Groups, "Groups to bind to the role")
 	cmd.Flags().StringArrayVar(&o.ServiceAccounts, "serviceaccount", o.ServiceAccounts, "Service accounts to bind to the role")
+	cmdutil.AddFieldManagerFlagVar(cmd, &o.fieldManager, "kubectl-set")
 	return cmd
 }
 
@@ -126,15 +129,6 @@ func (o *SubjectOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []
 	if err != nil {
 		return err
 	}
-	dynamicClient, err := f.DynamicClient()
-	if err != nil {
-		return err
-	}
-	discoveryClient, err := f.ToDiscoveryClient()
-	if err != nil {
-		return err
-	}
-	o.DryRunVerifier = resource.NewDryRunVerifier(dynamicClient, discoveryClient)
 
 	cmdutil.PrintFlagsWithDryRunStrategy(o.PrintFlags, o.DryRunStrategy)
 	printer, err := o.PrintFlags.ToPrinter()
@@ -145,7 +139,7 @@ func (o *SubjectOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []
 
 	var enforceNamespace bool
 	o.namespace, enforceNamespace, err = f.ToRawKubeConfigLoader().Namespace()
-	if err != nil {
+	if err != nil && !(o.Local && clientcmd.IsEmptyConfig(err)) {
 		return err
 	}
 
@@ -212,7 +206,7 @@ func (o *SubjectOptions) Validate() error {
 func (o *SubjectOptions) Run(fn updateSubjects) error {
 	patches := CalculatePatches(o.Infos, scheme.DefaultJSONEncoder(), func(obj runtime.Object) ([]byte, error) {
 		subjects := []rbacv1.Subject{}
-		for _, user := range sets.NewString(o.Users...).List() {
+		for _, user := range sets.List(sets.New[string](o.Users...)) {
 			subject := rbacv1.Subject{
 				Kind:     rbacv1.UserKind,
 				APIGroup: rbacv1.GroupName,
@@ -220,7 +214,7 @@ func (o *SubjectOptions) Run(fn updateSubjects) error {
 			}
 			subjects = append(subjects, subject)
 		}
-		for _, group := range sets.NewString(o.Groups...).List() {
+		for _, group := range sets.List(sets.New[string](o.Groups...)) {
 			subject := rbacv1.Subject{
 				Kind:     rbacv1.GroupKind,
 				APIGroup: rbacv1.GroupName,
@@ -228,7 +222,7 @@ func (o *SubjectOptions) Run(fn updateSubjects) error {
 			}
 			subjects = append(subjects, subject)
 		}
-		for _, sa := range sets.NewString(o.ServiceAccounts...).List() {
+		for _, sa := range sets.List(sets.New[string](o.ServiceAccounts...)) {
 			tokens := strings.Split(sa, ":")
 			namespace := tokens[0]
 			name := tokens[1]
@@ -272,15 +266,10 @@ func (o *SubjectOptions) Run(fn updateSubjects) error {
 			continue
 		}
 
-		if o.DryRunStrategy == cmdutil.DryRunServer {
-			if err := o.DryRunVerifier.HasSupport(info.Mapping.GroupVersionKind); err != nil {
-				allErrs = append(allErrs, err)
-				continue
-			}
-		}
 		actual, err := resource.
 			NewHelper(info.Client, info.Mapping).
 			DryRun(o.DryRunStrategy == cmdutil.DryRunServer).
+			WithFieldManager(o.fieldManager).
 			Patch(info.Namespace, info.Name, types.StrategicMergePatchType, patch.Patch, nil)
 		if err != nil {
 			allErrs = append(allErrs, fmt.Errorf("failed to patch subjects to rolebinding: %v", err))
@@ -294,7 +283,7 @@ func (o *SubjectOptions) Run(fn updateSubjects) error {
 	return utilerrors.NewAggregate(allErrs)
 }
 
-//Note: the obj mutates in the function
+// Note: the obj mutates in the function
 func updateSubjectForObject(obj runtime.Object, subjects []rbacv1.Subject, fn updateSubjects) (bool, error) {
 	switch t := obj.(type) {
 	case *rbacv1.RoleBinding:

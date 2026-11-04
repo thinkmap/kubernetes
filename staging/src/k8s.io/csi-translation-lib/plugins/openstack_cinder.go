@@ -18,10 +18,12 @@ package plugins
 
 import (
 	"fmt"
+	"strings"
 
 	v1 "k8s.io/api/core/v1"
 	storage "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -43,14 +45,38 @@ func NewOpenStackCinderCSITranslator() InTreePlugin {
 	return &osCinderCSITranslator{}
 }
 
-// TranslateInTreeStorageClassParametersToCSI translates InTree Cinder storage class parameters to CSI storage class
-func (t *osCinderCSITranslator) TranslateInTreeStorageClassToCSI(sc *storage.StorageClass) (*storage.StorageClass, error) {
+// TranslateInTreeStorageClassToCSI translates InTree Cinder storage class parameters to CSI storage class
+func (t *osCinderCSITranslator) TranslateInTreeStorageClassToCSI(logger klog.Logger, sc *storage.StorageClass) (*storage.StorageClass, error) {
+	var (
+		params = map[string]string{}
+	)
+	for k, v := range sc.Parameters {
+		switch strings.ToLower(k) {
+		case fsTypeKey:
+			params[csiFsTypeKey] = v
+		default:
+			// All other parameters are supported by the CSI driver.
+			// This includes also "availability", therefore do not translate it to sc.AllowedTopologies
+			params[k] = v
+		}
+	}
+
+	if len(sc.AllowedTopologies) > 0 {
+		newTopologies, err := translateAllowedTopologies(sc.AllowedTopologies, CinderTopologyKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed translating allowed topologies: %v", err)
+		}
+		sc.AllowedTopologies = newTopologies
+	}
+
+	sc.Parameters = params
+
 	return sc, nil
 }
 
 // TranslateInTreeInlineVolumeToCSI takes a Volume with Cinder set from in-tree
 // and converts the Cinder source to a CSIPersistentVolumeSource
-func (t *osCinderCSITranslator) TranslateInTreeInlineVolumeToCSI(volume *v1.Volume) (*v1.PersistentVolume, error) {
+func (t *osCinderCSITranslator) TranslateInTreeInlineVolumeToCSI(logger klog.Logger, volume *v1.Volume, podNamespace string) (*v1.PersistentVolume, error) {
 	if volume == nil || volume.Cinder == nil {
 		return nil, fmt.Errorf("volume is nil or Cinder not defined on volume")
 	}
@@ -80,7 +106,7 @@ func (t *osCinderCSITranslator) TranslateInTreeInlineVolumeToCSI(volume *v1.Volu
 
 // TranslateInTreePVToCSI takes a PV with Cinder set from in-tree
 // and converts the Cinder source to a CSIPersistentVolumeSource
-func (t *osCinderCSITranslator) TranslateInTreePVToCSI(pv *v1.PersistentVolume) (*v1.PersistentVolume, error) {
+func (t *osCinderCSITranslator) TranslateInTreePVToCSI(logger klog.Logger, pv *v1.PersistentVolume) (*v1.PersistentVolume, error) {
 	if pv == nil || pv.Spec.Cinder == nil {
 		return nil, fmt.Errorf("pv is nil or Cinder not defined on pv")
 	}
@@ -95,7 +121,7 @@ func (t *osCinderCSITranslator) TranslateInTreePVToCSI(pv *v1.PersistentVolume) 
 		VolumeAttributes: map[string]string{},
 	}
 
-	if err := translateTopology(pv, CinderTopologyKey); err != nil {
+	if err := translateTopologyFromInTreeToCSI(pv, CinderTopologyKey); err != nil {
 		return nil, fmt.Errorf("failed to translate topology: %v", err)
 	}
 
@@ -117,6 +143,12 @@ func (t *osCinderCSITranslator) TranslateCSIPVToInTree(pv *v1.PersistentVolume) 
 		VolumeID: csiSource.VolumeHandle,
 		FSType:   csiSource.FSType,
 		ReadOnly: csiSource.ReadOnly,
+	}
+
+	// translate CSI topology to In-tree topology for rollback compatibility.
+	// It is not possible to guess Cinder Region from the Zone, therefore leave it empty.
+	if err := translateTopologyFromCSIToInTree(pv, CinderTopologyKey, nil); err != nil {
+		return nil, fmt.Errorf("failed to translate topology. PV:%+v. Error:%v", *pv, err)
 	}
 
 	pv.Spec.CSI = nil

@@ -17,7 +17,9 @@ limitations under the License.
 package lifecycle
 
 import (
-	"k8s.io/api/core/v1"
+	"context"
+
+	v1 "k8s.io/api/core/v1"
 )
 
 // AdmissionFailureHandlerStub is an AdmissionFailureHandler that does not perform any handling of admission failure.
@@ -26,10 +28,12 @@ type AdmissionFailureHandlerStub struct{}
 
 var _ AdmissionFailureHandler = &AdmissionFailureHandlerStub{}
 
+// NewAdmissionFailureHandlerStub returns an instance of AdmissionFailureHandlerStub.
 func NewAdmissionFailureHandlerStub() *AdmissionFailureHandlerStub {
 	return &AdmissionFailureHandlerStub{}
 }
 
-func (n *AdmissionFailureHandlerStub) HandleAdmissionFailure(admitPod *v1.Pod, failureReasons []PredicateFailureReason) ([]PredicateFailureReason, error) {
+// HandleAdmissionFailure simply passes admission rejection on, with no special handling.
+func (n *AdmissionFailureHandlerStub) HandleAdmissionFailure(ctx context.Context, admitPod *v1.Pod, failureReasons []PredicateFailureReason, operation Operation) ([]PredicateFailureReason, error) {
 	return failureReasons, nil
 }

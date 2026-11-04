@@ -20,7 +20,7 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	utilpointer "k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 // RecommendedDefaultLeaderElectionConfiguration defaults a pointer to a
@@ -44,11 +44,12 @@ func RecommendedDefaultLeaderElectionConfiguration(obj *LeaderElectionConfigurat
 		obj.RetryPeriod = metav1.Duration{Duration: 2 * time.Second}
 	}
 	if obj.ResourceLock == "" {
-		// TODO: Migrate to LeaseLock.
+		// TODO(#80289): Figure out how to migrate to LeaseLock at this point.
+		//   This will most probably require going through EndpointsLease first.
 		obj.ResourceLock = EndpointsResourceLock
 	}
 	if obj.LeaderElect == nil {
-		obj.LeaderElect = utilpointer.BoolPtr(true)
+		obj.LeaderElect = ptr.To(true)
 	}
 }
 
@@ -84,7 +85,7 @@ func RecommendedDefaultClientConnectionConfiguration(obj *ClientConnectionConfig
 // run it in your wrapper struct of this type in its `SetDefaults_` method.
 func RecommendedDebuggingConfiguration(obj *DebuggingConfiguration) {
 	if obj.EnableProfiling == nil {
-		obj.EnableProfiling = utilpointer.BoolPtr(true) // profile debugging is cheap to have exposed and standard on kube binaries
+		obj.EnableProfiling = ptr.To(true) // profile debugging is cheap to have exposed and standard on kube binaries
 	}
 }
 

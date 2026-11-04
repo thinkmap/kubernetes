@@ -17,11 +17,10 @@ limitations under the License.
 package util
 
 import (
-	"io/ioutil"
 	"os"
 	"reflect"
 	"runtime"
-	"strings"
+	"slices"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
@@ -32,203 +31,9 @@ import (
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	_ "k8s.io/kubernetes/pkg/apis/core/install"
 	"k8s.io/kubernetes/pkg/features"
-	"k8s.io/kubernetes/pkg/util/slice"
 	"k8s.io/kubernetes/pkg/volume"
-	utilptr "k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
-
-var nodeLabels = map[string]string{
-	"test-key1": "test-value1",
-	"test-key2": "test-value2",
-}
-
-func TestCheckVolumeNodeAffinity(t *testing.T) {
-	type affinityTest struct {
-		name          string
-		expectSuccess bool
-		pv            *v1.PersistentVolume
-	}
-
-	cases := []affinityTest{
-		{
-			name:          "valid-nil",
-			expectSuccess: true,
-			pv:            testVolumeWithNodeAffinity(t, nil),
-		},
-		{
-			name:          "valid-no-constraints",
-			expectSuccess: true,
-			pv:            testVolumeWithNodeAffinity(t, &v1.VolumeNodeAffinity{}),
-		},
-		{
-			name:          "select-nothing",
-			expectSuccess: false,
-			pv:            testVolumeWithNodeAffinity(t, &v1.VolumeNodeAffinity{Required: &v1.NodeSelector{}}),
-		},
-		{
-			name:          "select-nothing-empty-terms",
-			expectSuccess: false,
-			pv: testVolumeWithNodeAffinity(t, &v1.VolumeNodeAffinity{
-				Required: &v1.NodeSelector{
-					NodeSelectorTerms: []v1.NodeSelectorTerm{
-						{
-							MatchExpressions: []v1.NodeSelectorRequirement{},
-						},
-					},
-				},
-			}),
-		},
-		{
-			name:          "valid-multiple-terms",
-			expectSuccess: true,
-			pv: testVolumeWithNodeAffinity(t, &v1.VolumeNodeAffinity{
-				Required: &v1.NodeSelector{
-					NodeSelectorTerms: []v1.NodeSelectorTerm{
-						{
-							MatchExpressions: []v1.NodeSelectorRequirement{
-								{
-									Key:      "test-key3",
-									Operator: v1.NodeSelectorOpIn,
-									Values:   []string{"test-value1", "test-value3"},
-								},
-							},
-						},
-						{
-							MatchExpressions: []v1.NodeSelectorRequirement{
-								{
-									Key:      "test-key2",
-									Operator: v1.NodeSelectorOpIn,
-									Values:   []string{"test-value0", "test-value2"},
-								},
-							},
-						},
-					},
-				},
-			}),
-		},
-		{
-			name:          "valid-multiple-match-expressions",
-			expectSuccess: true,
-			pv: testVolumeWithNodeAffinity(t, &v1.VolumeNodeAffinity{
-				Required: &v1.NodeSelector{
-					NodeSelectorTerms: []v1.NodeSelectorTerm{
-						{
-							MatchExpressions: []v1.NodeSelectorRequirement{
-								{
-									Key:      "test-key1",
-									Operator: v1.NodeSelectorOpIn,
-									Values:   []string{"test-value1", "test-value3"},
-								},
-								{
-									Key:      "test-key2",
-									Operator: v1.NodeSelectorOpIn,
-									Values:   []string{"test-value0", "test-value2"},
-								},
-							},
-						},
-					},
-				},
-			}),
-		},
-		{
-			name:          "invalid-multiple-match-expressions-key",
-			expectSuccess: false,
-			pv: testVolumeWithNodeAffinity(t, &v1.VolumeNodeAffinity{
-				Required: &v1.NodeSelector{
-					NodeSelectorTerms: []v1.NodeSelectorTerm{
-						{
-							MatchExpressions: []v1.NodeSelectorRequirement{
-								{
-									Key:      "test-key1",
-									Operator: v1.NodeSelectorOpIn,
-									Values:   []string{"test-value1", "test-value3"},
-								},
-								{
-									Key:      "test-key3",
-									Operator: v1.NodeSelectorOpIn,
-									Values:   []string{"test-value0", "test-value2"},
-								},
-							},
-						},
-					},
-				},
-			}),
-		},
-		{
-			name:          "invalid-multiple-match-expressions-values",
-			expectSuccess: false,
-			pv: testVolumeWithNodeAffinity(t, &v1.VolumeNodeAffinity{
-				Required: &v1.NodeSelector{
-					NodeSelectorTerms: []v1.NodeSelectorTerm{
-						{
-							MatchExpressions: []v1.NodeSelectorRequirement{
-								{
-									Key:      "test-key1",
-									Operator: v1.NodeSelectorOpIn,
-									Values:   []string{"test-value3", "test-value4"},
-								},
-								{
-									Key:      "test-key2",
-									Operator: v1.NodeSelectorOpIn,
-									Values:   []string{"test-value0", "test-value2"},
-								},
-							},
-						},
-					},
-				},
-			}),
-		},
-		{
-			name:          "invalid-multiple-terms",
-			expectSuccess: false,
-			pv: testVolumeWithNodeAffinity(t, &v1.VolumeNodeAffinity{
-				Required: &v1.NodeSelector{
-					NodeSelectorTerms: []v1.NodeSelectorTerm{
-						{
-							MatchExpressions: []v1.NodeSelectorRequirement{
-								{
-									Key:      "test-key3",
-									Operator: v1.NodeSelectorOpIn,
-									Values:   []string{"test-value1", "test-value3"},
-								},
-							},
-						},
-						{
-							MatchExpressions: []v1.NodeSelectorRequirement{
-								{
-									Key:      "test-key2",
-									Operator: v1.NodeSelectorOpIn,
-									Values:   []string{"test-value0", "test-value1"},
-								},
-							},
-						},
-					},
-				},
-			}),
-		},
-	}
-
-	for _, c := range cases {
-		err := CheckNodeAffinity(c.pv, nodeLabels)
-
-		if err != nil && c.expectSuccess {
-			t.Errorf("CheckTopology %v returned error: %v", c.name, err)
-		}
-		if err == nil && !c.expectSuccess {
-			t.Errorf("CheckTopology %v returned success, expected error", c.name)
-		}
-	}
-}
-
-func testVolumeWithNodeAffinity(t *testing.T, affinity *v1.VolumeNodeAffinity) *v1.PersistentVolume {
-	objMeta := metav1.ObjectMeta{Name: "test-constraints"}
-	return &v1.PersistentVolume{
-		ObjectMeta: objMeta,
-		Spec: v1.PersistentVolumeSpec{
-			NodeAffinity: affinity,
-		},
-	}
-}
 
 func TestLoadPodFromFile(t *testing.T) {
 	tests := []struct {
@@ -245,7 +50,7 @@ metadata:
   name: testpod
 spec:
   containers:
-    - image: k8s.gcr.io/busybox
+    - image: registry.k8s.io/busybox
 `,
 			false,
 		},
@@ -262,7 +67,7 @@ spec:
   "spec": {
     "containers": [
       {
-        "image": "k8s.gcr.io/busybox"
+        "image": "registry.k8s.io/busybox"
       }
     ]
   }
@@ -278,14 +83,14 @@ kind: Pod
 metadata:
   name: testpod
 spec:
-  - image: k8s.gcr.io/busybox
+  - image: registry.k8s.io/busybox
 `,
 			true,
 		},
 	}
 
 	for _, test := range tests {
-		tempFile, err := ioutil.TempFile("", "podfile")
+		tempFile, err := os.CreateTemp("", "podfile")
 		defer os.Remove(tempFile.Name())
 		if err != nil {
 			t.Fatalf("cannot create temporary file: %v", err)
@@ -339,6 +144,34 @@ func TestCalculateTimeoutForVolume(t *testing.T) {
 	if timeout != 4500 {
 		t.Errorf("Expected 4500 for timeout but got %v", timeout)
 	}
+
+	// Largest size whose timeout fits the activeDeadlineSeconds ceiling.
+	pv.Spec.Capacity[v1.ResourceStorage] = resource.MustParse("71582788Gi")
+	timeout = CalculateTimeoutForVolume(50, 30, pv)
+	if timeout != 2147483640 {
+		t.Errorf("Expected 2147483640 for timeout but got %v", timeout)
+	}
+
+	// TODO(#141166): The size fits int64 but the product does not fit int32; the timeout must be at most math.MaxInt32.
+	pv.Spec.Capacity[v1.ResourceStorage] = resource.MustParse("71582789Gi")
+	timeout = CalculateTimeoutForVolume(50, 30, pv)
+	if timeout != 2147483670 {
+		t.Errorf("Expected 2147483670 for timeout but got %v", timeout)
+	}
+
+	// TODO(#141166): The timeout must be at most math.MaxInt32.
+	pv.Spec.Capacity[v1.ResourceStorage] = resource.MustParse("100E")
+	timeout = CalculateTimeoutForVolume(50, 30, pv)
+	if timeout != 257698037730 {
+		t.Errorf("Expected 257698037730 for timeout but got %v", timeout)
+	}
+
+	// TODO(#141166): The timeout must be at most math.MaxInt32.
+	pv.Spec.Capacity[v1.ResourceStorage] = resource.MustParse("18446744073709551616")
+	timeout = CalculateTimeoutForVolume(50, 30, pv)
+	if timeout != 257698037730 {
+		t.Errorf("Expected 257698037730 for timeout but got %v", timeout)
+	}
 }
 
 func TestFsUserFrom(t *testing.T) {
@@ -362,14 +195,14 @@ func TestFsUserFrom(t *testing.T) {
 					InitContainers: []v1.Container{
 						{
 							SecurityContext: &v1.SecurityContext{
-								RunAsUser: utilptr.Int64Ptr(1000),
+								RunAsUser: ptr.To[int64](1000),
 							},
 						},
 					},
 					Containers: []v1.Container{
 						{
 							SecurityContext: &v1.SecurityContext{
-								RunAsUser: utilptr.Int64Ptr(1000),
+								RunAsUser: ptr.To[int64](1000),
 							},
 						},
 						{
@@ -388,25 +221,62 @@ func TestFsUserFrom(t *testing.T) {
 					InitContainers: []v1.Container{
 						{
 							SecurityContext: &v1.SecurityContext{
-								RunAsUser: utilptr.Int64Ptr(999),
+								RunAsUser: ptr.To[int64](999),
 							},
 						},
 					},
 					Containers: []v1.Container{
 						{
 							SecurityContext: &v1.SecurityContext{
-								RunAsUser: utilptr.Int64Ptr(1000),
+								RunAsUser: ptr.To[int64](1000),
 							},
 						},
 						{
 							SecurityContext: &v1.SecurityContext{
-								RunAsUser: utilptr.Int64Ptr(1000),
+								RunAsUser: ptr.To[int64](1000),
+							},
+						},
+					},
+					EphemeralContainers: []v1.EphemeralContainer{
+						{
+							EphemeralContainerCommon: v1.EphemeralContainerCommon{
+								SecurityContext: &v1.SecurityContext{
+									RunAsUser: ptr.To[int64](1001),
+								},
 							},
 						},
 					},
 				},
 			},
 			wantFsUser: nil,
+		},
+		{
+			desc: "init and regular containers have runAsUser specified and the same",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					SecurityContext: &v1.PodSecurityContext{},
+					InitContainers: []v1.Container{
+						{
+							SecurityContext: &v1.SecurityContext{
+								RunAsUser: ptr.To[int64](1000),
+							},
+						},
+					},
+					Containers: []v1.Container{
+						{
+							SecurityContext: &v1.SecurityContext{
+								RunAsUser: ptr.To[int64](1000),
+							},
+						},
+						{
+							SecurityContext: &v1.SecurityContext{
+								RunAsUser: ptr.To[int64](1000),
+							},
+						},
+					},
+				},
+			},
+			wantFsUser: ptr.To[int64](1000),
 		},
 		{
 			desc: "all have runAsUser specified and the same",
@@ -416,25 +286,34 @@ func TestFsUserFrom(t *testing.T) {
 					InitContainers: []v1.Container{
 						{
 							SecurityContext: &v1.SecurityContext{
-								RunAsUser: utilptr.Int64Ptr(1000),
+								RunAsUser: ptr.To[int64](1000),
 							},
 						},
 					},
 					Containers: []v1.Container{
 						{
 							SecurityContext: &v1.SecurityContext{
-								RunAsUser: utilptr.Int64Ptr(1000),
+								RunAsUser: ptr.To[int64](1000),
 							},
 						},
 						{
 							SecurityContext: &v1.SecurityContext{
-								RunAsUser: utilptr.Int64Ptr(1000),
+								RunAsUser: ptr.To[int64](1000),
+							},
+						},
+					},
+					EphemeralContainers: []v1.EphemeralContainer{
+						{
+							EphemeralContainerCommon: v1.EphemeralContainerCommon{
+								SecurityContext: &v1.SecurityContext{
+									RunAsUser: ptr.To[int64](1000),
+								},
 							},
 						},
 					},
 				},
 			},
-			wantFsUser: utilptr.Int64Ptr(1000),
+			wantFsUser: ptr.To[int64](1000),
 		},
 	}
 
@@ -454,27 +333,38 @@ func TestFsUserFrom(t *testing.T) {
 	}
 }
 
-func TestGenerateVolumeName(t *testing.T) {
-
-	// Normal operation, no truncate
-	v1 := GenerateVolumeName("kubernetes", "pv-cinder-abcde", 255)
-	if v1 != "kubernetes-dynamic-pv-cinder-abcde" {
-		t.Errorf("Expected kubernetes-dynamic-pv-cinder-abcde, got %s", v1)
+func TestHasMountRefs(t *testing.T) {
+	testCases := map[string]struct {
+		mountPath string
+		mountRefs []string
+		expected  bool
+	}{
+		"plugin mounts only": {
+			mountPath: "/var/lib/kubelet/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+			mountRefs: []string{
+				"/home/somewhere/var/lib/kubelet/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+				"/var/lib/kubelet/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+				"/mnt/kubelet/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+				"/mnt/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+			},
+			expected: false,
+		},
+		"extra local mount": {
+			mountPath: "/var/lib/kubelet/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+			mountRefs: []string{
+				"/home/somewhere/var/lib/kubelet/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+				"/local/data/kubernetes.io/some-plugin/mounts/volume-XXXX",
+				"/mnt/kubelet/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+				"/mnt/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+			},
+			expected: true,
+		},
 	}
-
-	// Truncate trailing "6789-dynamic"
-	prefix := strings.Repeat("0123456789", 9) // 90 characters prefix + 8 chars. of "-dynamic"
-	v2 := GenerateVolumeName(prefix, "pv-cinder-abcde", 100)
-	expect := prefix[:84] + "-pv-cinder-abcde"
-	if v2 != expect {
-		t.Errorf("Expected %s, got %s", expect, v2)
-	}
-
-	// Truncate really long cluster name
-	prefix = strings.Repeat("0123456789", 1000) // 10000 characters prefix
-	v3 := GenerateVolumeName(prefix, "pv-cinder-abcde", 100)
-	if v3 != expect {
-		t.Errorf("Expected %s, got %s", expect, v3)
+	for name, test := range testCases {
+		actual := HasMountRefs(test.mountPath, test.mountRefs)
+		if actual != test.expected {
+			t.Errorf("for %s expected %v but got %v", name, test.expected, actual)
+		}
 	}
 }
 
@@ -524,7 +414,9 @@ func TestMountOptionFromSpec(t *testing.T) {
 
 	for name, scenario := range scenarios {
 		mountOptions := MountOptionFromSpec(scenario.volume, scenario.systemOptions...)
-		if !reflect.DeepEqual(slice.SortStrings(mountOptions), slice.SortStrings(scenario.expectedMountList)) {
+		slices.Sort(mountOptions)
+		slices.Sort(scenario.expectedMountList)
+		if !reflect.DeepEqual(mountOptions, scenario.expectedMountList) {
 			t.Errorf("for %s expected mount options : %v got %v", name, scenario.expectedMountList, mountOptions)
 		}
 	}
@@ -774,20 +666,21 @@ func TestMakeAbsolutePath(t *testing.T) {
 }
 
 func TestGetPodVolumeNames(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.EphemeralContainers, true)()
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SELinuxMountReadWriteOncePod, true)
 	tests := []struct {
-		name            string
-		pod             *v1.Pod
-		expectedMounts  sets.String
-		expectedDevices sets.String
+		name                    string
+		pod                     *v1.Pod
+		expectedMounts          sets.Set[string]
+		expectedDevices         sets.Set[string]
+		expectedSELinuxContexts map[string][]*v1.SELinuxOptions
 	}{
 		{
 			name: "empty pod",
 			pod: &v1.Pod{
 				Spec: v1.PodSpec{},
 			},
-			expectedMounts:  sets.NewString(),
-			expectedDevices: sets.NewString(),
+			expectedMounts:  sets.New[string](),
+			expectedDevices: sets.New[string](),
 		},
 		{
 			name: "pod with volumes",
@@ -830,8 +723,8 @@ func TestGetPodVolumeNames(t *testing.T) {
 					},
 				},
 			},
-			expectedMounts:  sets.NewString("vol1", "vol2"),
-			expectedDevices: sets.NewString("vol3", "vol4"),
+			expectedMounts:  sets.New[string]("vol1", "vol2"),
+			expectedDevices: sets.New[string]("vol3", "vol4"),
 		},
 		{
 			name: "pod with init containers",
@@ -874,8 +767,8 @@ func TestGetPodVolumeNames(t *testing.T) {
 					},
 				},
 			},
-			expectedMounts:  sets.NewString("vol1", "vol2"),
-			expectedDevices: sets.NewString("vol3", "vol4"),
+			expectedMounts:  sets.New[string]("vol1", "vol2"),
+			expectedDevices: sets.New[string]("vol3", "vol4"),
 		},
 		{
 			name: "pod with multiple containers",
@@ -933,8 +826,8 @@ func TestGetPodVolumeNames(t *testing.T) {
 					},
 				},
 			},
-			expectedMounts:  sets.NewString("vol1", "vol3"),
-			expectedDevices: sets.NewString("vol2", "vol4"),
+			expectedMounts:  sets.New[string]("vol1", "vol3"),
+			expectedDevices: sets.New[string]("vol2", "vol4"),
 		},
 		{
 			name: "pod with ephemeral containers",
@@ -975,20 +868,247 @@ func TestGetPodVolumeNames(t *testing.T) {
 					},
 				},
 			},
-			expectedMounts:  sets.NewString("vol1", "vol2"),
-			expectedDevices: sets.NewString(),
+			expectedMounts:  sets.New[string]("vol1", "vol2"),
+			expectedDevices: sets.New[string](),
+		},
+		{
+			name: "pod with SELinuxOptions",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					SecurityContext: &v1.PodSecurityContext{
+						SELinuxOptions: &v1.SELinuxOptions{
+							Type:  "global_context_t",
+							Level: "s0:c1,c2",
+						},
+					},
+					InitContainers: []v1.Container{
+						{
+							Name: "initContainer1",
+							SecurityContext: &v1.SecurityContext{
+								SELinuxOptions: &v1.SELinuxOptions{
+									Type:  "initcontainer1_context_t",
+									Level: "s0:c3,c4",
+								},
+							},
+							VolumeMounts: []v1.VolumeMount{
+								{
+									Name: "vol1",
+								},
+							},
+						},
+					},
+					Containers: []v1.Container{
+						{
+							Name: "container1",
+							SecurityContext: &v1.SecurityContext{
+								SELinuxOptions: &v1.SELinuxOptions{
+									Type:  "container1_context_t",
+									Level: "s0:c5,c6",
+								},
+							},
+							VolumeMounts: []v1.VolumeMount{
+								{
+									Name: "vol1",
+								},
+								{
+									Name: "vol2",
+								},
+							},
+						},
+						{
+							Name: "container2",
+							// No SELinux context, will be inherited from PodSecurityContext
+							VolumeMounts: []v1.VolumeMount{
+								{
+									Name: "vol2",
+								},
+								{
+									Name: "vol3",
+								},
+							},
+						},
+					},
+					Volumes: []v1.Volume{
+						{
+							Name: "vol1",
+						},
+						{
+							Name: "vol2",
+						},
+						{
+							Name: "vol3",
+						},
+					},
+				},
+			},
+			expectedMounts: sets.New[string]("vol1", "vol2", "vol3"),
+			expectedSELinuxContexts: map[string][]*v1.SELinuxOptions{
+				"vol1": {
+					{
+						Type:  "initcontainer1_context_t",
+						Level: "s0:c3,c4",
+					},
+					{
+						Type:  "container1_context_t",
+						Level: "s0:c5,c6",
+					},
+				},
+				"vol2": {
+					{
+						Type:  "container1_context_t",
+						Level: "s0:c5,c6",
+					},
+					{
+						Type:  "global_context_t",
+						Level: "s0:c1,c2",
+					},
+				},
+				"vol3": {
+					{
+						Type:  "global_context_t",
+						Level: "s0:c1,c2",
+					},
+				},
+			},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			mounts, devices := GetPodVolumeNames(test.pod)
+			mounts, devices, contexts := GetPodVolumeNames(test.pod, true /* collectSELinuxOptions */)
 			if !mounts.Equal(test.expectedMounts) {
-				t.Errorf("Expected mounts: %q, got %q", mounts.List(), test.expectedMounts.List())
+				t.Errorf("Expected mounts: %q, got %q", sets.List[string](mounts), sets.List[string](test.expectedMounts))
 			}
 			if !devices.Equal(test.expectedDevices) {
-				t.Errorf("Expected devices: %q, got %q", devices.List(), test.expectedDevices.List())
+				t.Errorf("Expected devices: %q, got %q", sets.List[string](devices), sets.List[string](test.expectedDevices))
+			}
+			if len(contexts) == 0 {
+				contexts = nil
+			}
+			if !reflect.DeepEqual(test.expectedSELinuxContexts, contexts) {
+				t.Errorf("Expected SELinuxContexts: %+v\ngot: %+v", test.expectedSELinuxContexts, contexts)
 			}
 		})
+	}
+}
+
+func TestVolumeHealthConditionSetsEqual(t *testing.T) {
+	tests := []struct {
+		name string
+		a    []v1.VolumeHealthCondition
+		b    []v1.VolumeHealthCondition
+		want bool
+	}{
+		{
+			name: "nil and empty are equal",
+			a:    nil,
+			b:    []v1.VolumeHealthCondition{},
+			want: true,
+		},
+		{
+			name: "same condition different message is equal",
+			a: []v1.VolumeHealthCondition{{
+				Status:  v1.VolumeHealthInaccessible,
+				Reason:  "TargetPathNotFound",
+				Message: "old message",
+			}},
+			b: []v1.VolumeHealthCondition{{
+				Status:  v1.VolumeHealthInaccessible,
+				Reason:  "TargetPathNotFound",
+				Message: "new message",
+			}},
+			want: true,
+		},
+		{
+			name: "same set different order is equal",
+			a: []v1.VolumeHealthCondition{
+				{
+					Status: v1.VolumeHealthInaccessible,
+					Reason: "TargetPathNotFound",
+				},
+				{
+					Status: v1.VolumeHealthDegraded,
+					Reason: "DiskSlow",
+				},
+			},
+			b: []v1.VolumeHealthCondition{
+				{
+					Status: v1.VolumeHealthDegraded,
+					Reason: "DiskSlow",
+				},
+				{
+					Status: v1.VolumeHealthInaccessible,
+					Reason: "TargetPathNotFound",
+				},
+			},
+			want: true,
+		},
+		{
+			name: "duplicates do not change set equality",
+			a: []v1.VolumeHealthCondition{
+				{
+					Status: v1.VolumeHealthDegraded,
+					Reason: "DiskSlow",
+				},
+				{
+					Status: v1.VolumeHealthDegraded,
+					Reason: "DiskSlow",
+				},
+			},
+			b: []v1.VolumeHealthCondition{{
+				Status: v1.VolumeHealthDegraded,
+				Reason: "DiskSlow",
+			}},
+			want: true,
+		},
+		{
+			name: "different status is not equal",
+			a: []v1.VolumeHealthCondition{{
+				Status: v1.VolumeHealthDegraded,
+				Reason: "DiskSlow",
+			}},
+			b: []v1.VolumeHealthCondition{{
+				Status: v1.VolumeHealthDataLoss,
+				Reason: "DiskSlow",
+			}},
+			want: false,
+		},
+		{
+			name: "different reason is not equal",
+			a: []v1.VolumeHealthCondition{{
+				Status: v1.VolumeHealthDegraded,
+				Reason: "DiskSlow",
+			}},
+			b: []v1.VolumeHealthCondition{{
+				Status: v1.VolumeHealthDegraded,
+				Reason: "TargetPathNotFound",
+			}},
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := VolumeHealthConditionSetsEqual(tc.a, tc.b); got != tc.want {
+				t.Fatalf("VolumeHealthConditionSetsEqual() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestVolumeHealthConditionSetsEqual_IgnoresMessageChanges(t *testing.T) {
+	a := []v1.VolumeHealthCondition{{
+		Status:  v1.VolumeHealthInaccessible,
+		Reason:  "TargetPathNotFound",
+		Message: "first message",
+	}}
+	b := []v1.VolumeHealthCondition{{
+		Status:  v1.VolumeHealthInaccessible,
+		Reason:  "TargetPathNotFound",
+		Message: "second message",
+	}}
+
+	if !VolumeHealthConditionSetsEqual(a, b) {
+		t.Fatal("expected same status/reason with different message to be equal")
 	}
 }

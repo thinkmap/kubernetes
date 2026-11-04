@@ -1,14 +1,8 @@
 # See the OWNERS docs at https://go.k8s.io/owners
 
-reviewers:
-  - mtaufen
-  - pjh
-  - yujuhong
+emeritus_approvers:
   - yliaog
-approvers:
-  - mtaufen
   - pjh
+  - ibabou
+  - mtaufen
   - yujuhong
-  - yliaog
-labels:
-- area/provider/gcp

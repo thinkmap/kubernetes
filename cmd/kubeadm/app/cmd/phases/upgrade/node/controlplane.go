@@ -14,32 +14,33 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package node implements phases of 'kubeadm upgrade node'.
 package node
 
 import (
 	"fmt"
 	"os"
 
-	"github.com/pkg/errors"
-
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/upgrade"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 )
 
-// NewControlPlane creates a kubeadm workflow phase that implements handling of control-plane upgrade.
+// NewControlPlane returns a new control-plane phase.
 func NewControlPlane() workflow.Phase {
 	phase := workflow.Phase{
 		Name:  "control-plane",
 		Short: "Upgrade the control plane instance deployed on this node, if any",
 		Run:   runControlPlane(),
 		InheritFlags: []string{
+			options.CfgPath,
 			options.DryRun,
 			options.KubeconfigPath,
 			options.CertificateRenewal,
 			options.EtcdUpgrade,
-			options.Kustomize,
+			options.Patches,
 		},
 	}
 	return phase
@@ -54,31 +55,32 @@ func runControlPlane() func(c workflow.RunData) error {
 
 		// if this is not a control-plane node, this phase should not be executed
 		if !data.IsControlPlaneNode() {
-			fmt.Println("[upgrade] Skipping phase. Not a control plane node.")
+			fmt.Println("[upgrade/control-plane] Skipping phase. Not a control plane node.")
 			return nil
 		}
 
 		// otherwise, retrieve all the info required for control plane upgrade
-		cfg := data.Cfg()
+		cfg := data.InitCfg()
 		client := data.Client()
 		dryRun := data.DryRun()
 		etcdUpgrade := data.EtcdUpgrade()
 		renewCerts := data.RenewCerts()
-		kustomizeDir := data.KustomizeDir()
+		patchesDir := data.PatchesDir()
 
 		// Upgrade the control plane and etcd if installed on this node
-		fmt.Printf("[upgrade] Upgrading your Static Pod-hosted control plane instance to version %q...\n", cfg.KubernetesVersion)
+		fmt.Printf("[upgrade/control-plane] Upgrading your Static Pod-hosted control plane instance to version %q...\n", cfg.KubernetesVersion)
 		if dryRun {
-			return upgrade.DryRunStaticPodUpgrade(kustomizeDir, cfg)
+			fmt.Printf("[dryrun] Would upgrade your static Pod-hosted control plane to version %q", cfg.KubernetesVersion)
+			return upgrade.DryRunStaticPodUpgrade(patchesDir, cfg)
 		}
 
-		waiter := apiclient.NewKubeWaiter(data.Client(), upgrade.UpgradeManifestTimeout, os.Stdout)
+		waiter := apiclient.NewKubeWaiter(data.Client(), data.Cfg().Timeouts.UpgradeManifests.Duration, os.Stdout)
 
-		if err := upgrade.PerformStaticPodUpgrade(client, waiter, cfg, etcdUpgrade, renewCerts, kustomizeDir); err != nil {
+		if err := upgrade.PerformStaticPodUpgrade(client, waiter, cfg, etcdUpgrade, renewCerts, patchesDir); err != nil {
 			return errors.Wrap(err, "couldn't complete the static pod upgrade")
 		}
 
-		fmt.Println("[upgrade] The control plane instance for this node was successfully updated!")
+		fmt.Println("[upgrade/control-plane] The control plane instance for this node was successfully upgraded!")
 
 		return nil
 	}

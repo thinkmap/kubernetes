@@ -1,4 +1,4 @@
-// +build !windows
+//go:build !windows
 
 /*
 Copyright 2017 The Kubernetes Authors.
@@ -21,7 +21,7 @@ package preflight
 import (
 	"os"
 
-	"github.com/pkg/errors"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 )
 
 // Check validates if an user has elevated (root) privileges.

@@ -17,7 +17,10 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/spf13/cobra/doc"
@@ -43,6 +46,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	ctx := context.Background()
 	outDir, err := genutils.OutDir(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to get output directory: %v\n", err)
@@ -68,7 +72,7 @@ func main() {
 		doc.GenMarkdownTree(scheduler, outDir)
 	case "kubelet":
 		// generate docs for kubelet
-		kubelet := kubeletapp.NewKubeletCommand()
+		kubelet := kubeletapp.NewKubeletCommand(ctx)
 		doc.GenMarkdownTree(kubelet, outDir)
 	case "kubeadm":
 		// resets global flags created by kubelet or other commands e.g.
@@ -77,7 +81,7 @@ func main() {
 		pflag.CommandLine = pflag.NewFlagSet(os.Args[0], pflag.ExitOnError)
 
 		// generate docs for kubeadm
-		kubeadm := kubeadmapp.NewKubeadmCommand(os.Stdin, os.Stdout, os.Stderr)
+		kubeadm := kubeadmapp.NewKubeadmCommand(bytes.NewReader(nil), io.Discard, io.Discard)
 		doc.GenMarkdownTree(kubeadm, outDir)
 
 		// cleanup generated code for usage as include in the website

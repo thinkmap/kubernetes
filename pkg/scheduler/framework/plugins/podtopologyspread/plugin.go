@@ -17,61 +17,93 @@ limitations under the License.
 package podtopologyspread
 
 import (
+	"context"
 	"fmt"
 
 	v1 "k8s.io/api/core/v1"
-	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
+	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/informers"
 	appslisters "k8s.io/client-go/listers/apps/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/klog/v2"
+	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
-	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
+	"k8s.io/kubernetes/pkg/scheduler/apis/config/validation"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
+	"k8s.io/kubernetes/pkg/scheduler/util"
 )
 
 const (
 	// ErrReasonConstraintsNotMatch is used for PodTopologySpread filter error.
 	ErrReasonConstraintsNotMatch = "node(s) didn't match pod topology spread constraints"
+	// ErrReasonNodeLabelNotMatch is used when the node doesn't hold the required label.
+	ErrReasonNodeLabelNotMatch = ErrReasonConstraintsNotMatch + " (missing required label)"
 )
 
-var (
-	supportedScheduleActions = sets.NewString(string(v1.DoNotSchedule), string(v1.ScheduleAnyway))
-)
+var systemDefaultConstraints = []v1.TopologySpreadConstraint{
+	{
+		TopologyKey:       v1.LabelHostname,
+		WhenUnsatisfiable: v1.ScheduleAnyway,
+		MaxSkew:           3,
+	},
+	{
+		TopologyKey:       v1.LabelTopologyZone,
+		WhenUnsatisfiable: v1.ScheduleAnyway,
+		MaxSkew:           5,
+	},
+}
 
 // PodTopologySpread is a plugin that ensures pod's topologySpreadConstraints is satisfied.
 type PodTopologySpread struct {
-	args             config.PodTopologySpreadArgs
-	sharedLister     framework.SharedLister
-	services         corelisters.ServiceLister
-	replicationCtrls corelisters.ReplicationControllerLister
-	replicaSets      appslisters.ReplicaSetLister
-	statefulSets     appslisters.StatefulSetLister
+	systemDefaulted                                    bool
+	parallelizer                                       fwk.Parallelizer
+	defaultConstraints                                 []v1.TopologySpreadConstraint
+	sharedLister                                       fwk.SharedLister
+	services                                           corelisters.ServiceLister
+	replicationCtrls                                   corelisters.ReplicationControllerLister
+	replicaSets                                        appslisters.ReplicaSetLister
+	statefulSets                                       appslisters.StatefulSetLister
+	enableNodeInclusionPolicyInPodTopologySpread       bool
+	enableMatchLabelKeysInPodTopologySpread            bool
+	enableTaintTolerationComparisonOperators           bool
+	enableInPlacePodVerticalScalingSchedulerPreemption bool
 }
 
-var _ framework.PreFilterPlugin = &PodTopologySpread{}
-var _ framework.FilterPlugin = &PodTopologySpread{}
-var _ framework.PreScorePlugin = &PodTopologySpread{}
-var _ framework.ScorePlugin = &PodTopologySpread{}
+var _ fwk.PreFilterPlugin = &PodTopologySpread{}
+var _ fwk.FilterPlugin = &PodTopologySpread{}
+var _ fwk.PreScorePlugin = &PodTopologySpread{}
+var _ fwk.ScorePlugin = &PodTopologySpread{}
+var _ fwk.EnqueueExtensions = &PodTopologySpread{}
+var _ fwk.SignPlugin = &PodTopologySpread{}
 
-const (
-	// Name is the name of the plugin used in the plugin registry and configurations.
-	Name = "PodTopologySpread"
-)
+// Name is the name of the plugin used in the plugin registry and configurations.
+const Name = names.PodTopologySpread
 
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *PodTopologySpread) Name() string {
 	return Name
 }
 
-// BuildArgs returns the arguments used to build the plugin.
-func (pl *PodTopologySpread) BuildArgs() interface{} {
-	return pl.args
+// Pod topology spread is not localized to a pod and node, so we cannot
+// sign pods that have topology spread constraints, either explicit or
+// defaulted.
+func (pl *PodTopologySpread) SignPod(ctx context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
+	if len(pod.Spec.TopologySpreadConstraints) > 0 {
+		return nil, fwk.NewStatus(fwk.Unschedulable, "pods with topology constraints are not signable")
+	}
+
+	if len(pl.defaultConstraints) > 0 {
+		return nil, fwk.NewStatus(fwk.Unschedulable, "pods with default topology constraints are not signable")
+	}
+
+	return nil, nil
 }
 
 // New initializes a new plugin and returns it.
-func New(plArgs runtime.Object, h framework.FrameworkHandle) (framework.Plugin, error) {
+func New(_ context.Context, plArgs runtime.Object, h fwk.Handle, fts feature.Features) (fwk.Plugin, error) {
 	if h.SnapshotSharedLister() == nil {
 		return nil, fmt.Errorf("SnapshotSharedlister is nil")
 	}
@@ -79,14 +111,23 @@ func New(plArgs runtime.Object, h framework.FrameworkHandle) (framework.Plugin, 
 	if err != nil {
 		return nil, err
 	}
-	if err := validateArgs(&args); err != nil {
+	if err := validation.ValidatePodTopologySpreadArgs(nil, &args); err != nil {
 		return nil, err
 	}
 	pl := &PodTopologySpread{
-		sharedLister: h.SnapshotSharedLister(),
-		args:         args,
+		parallelizer:       h.Parallelizer(),
+		sharedLister:       h.SnapshotSharedLister(),
+		defaultConstraints: args.DefaultConstraints,
+		enableNodeInclusionPolicyInPodTopologySpread:       fts.EnableNodeInclusionPolicyInPodTopologySpread,
+		enableMatchLabelKeysInPodTopologySpread:            fts.EnableMatchLabelKeysInPodTopologySpread,
+		enableTaintTolerationComparisonOperators:           fts.EnableTaintTolerationComparisonOperators,
+		enableInPlacePodVerticalScalingSchedulerPreemption: fts.EnableInPlacePodVerticalScalingSchedulerPreemption,
 	}
-	if len(pl.args.DefaultConstraints) != 0 {
+	if args.DefaultingType == config.SystemDefaulting {
+		pl.defaultConstraints = systemDefaultConstraints
+		pl.systemDefaulted = true
+	}
+	if len(pl.defaultConstraints) != 0 {
 		if h.SharedInformerFactory() == nil {
 			return nil, fmt.Errorf("SharedInformerFactory is nil")
 		}
@@ -96,9 +137,6 @@ func New(plArgs runtime.Object, h framework.FrameworkHandle) (framework.Plugin, 
 }
 
 func getArgs(obj runtime.Object) (config.PodTopologySpreadArgs, error) {
-	if obj == nil {
-		return config.PodTopologySpreadArgs{}, nil
-	}
 	ptr, ok := obj.(*config.PodTopologySpreadArgs)
 	if !ok {
 		return config.PodTopologySpreadArgs{}, fmt.Errorf("want args to be of type PodTopologySpreadArgs, got %T", obj)
@@ -113,63 +151,231 @@ func (pl *PodTopologySpread) setListers(factory informers.SharedInformerFactory)
 	pl.statefulSets = factory.Apps().V1().StatefulSets().Lister()
 }
 
-// validateArgs replicates the validation from
-// pkg/apis/core/validation.validateTopologySpreadConstraints.
-// This has the additional check for .labelSelector to be nil.
-func validateArgs(args *config.PodTopologySpreadArgs) error {
-	var allErrs field.ErrorList
-	path := field.NewPath("defaultConstraints")
-	for i, c := range args.DefaultConstraints {
-		p := path.Index(i)
-		if c.MaxSkew <= 0 {
-			f := p.Child("maxSkew")
-			allErrs = append(allErrs, field.Invalid(f, c.MaxSkew, "must be greater than zero"))
-		}
-		allErrs = append(allErrs, validateTopologyKey(p.Child("topologyKey"), c.TopologyKey)...)
-		if err := validateWhenUnsatisfiable(p.Child("whenUnsatisfiable"), c.WhenUnsatisfiable); err != nil {
-			allErrs = append(allErrs, err)
-		}
-		if c.LabelSelector != nil {
-			f := field.Forbidden(p.Child("labelSelector"), "constraint must not define a selector, as they deduced for each pod")
-			allErrs = append(allErrs, f)
-		}
-		if err := validateConstraintNotRepeat(path, args.DefaultConstraints, i); err != nil {
-			allErrs = append(allErrs, err)
-		}
-	}
-	if len(allErrs) == 0 {
-		return nil
-	}
-	return allErrs.ToAggregate()
+// EventsToRegister returns the possible events that may make a Pod
+// failed by this plugin schedulable.
+func (pl *PodTopologySpread) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithHint, error) {
+	return []fwk.ClusterEventWithHint{
+		// AssignedPod includes the following events:
+		// - Add. An unschedulable Pod may fail due to violating topology spread constraints,
+		// adding an assigned Pod may make it schedulable.
+		// - UpdatePodLabel. Updating on an existing Pod's labels (e.g., removal) may make
+		// an unschedulable Pod schedulable.
+		// - Delete. An unschedulable Pod may fail due to violating an existing Pod's topology spread constraints,
+		// deleting an existing Pod may make it schedulable.
+		{Event: fwk.ClusterEvent{Resource: fwk.AssignedPod, ActionType: fwk.Add | fwk.UpdatePodLabel | fwk.Delete}, QueueingHintFn: pl.isSchedulableAfterAssignedPodChange},
+		// TargetPod includes the following events:
+		// - UpdatePodLabel. Updating on an existing Pod's labels (e.g., removal) may make
+		// an unschedulable Pod schedulable.
+		// - UpdatePodToleration. The Pod rejected by this plugin can be schedulable when the Pod has a spread constraint with NodeTaintsPolicy:Honor
+		// and has got a new toleration.
+		{Event: fwk.ClusterEvent{Resource: fwk.TargetPod, ActionType: fwk.UpdatePodToleration | fwk.UpdatePodLabel}, QueueingHintFn: pl.isSchedulableAfterTargetPodChange},
+		// Node add|delete|update maybe lead an topology key changed,
+		// and make these pod in scheduling schedulable or unschedulable.
+		{Event: fwk.ClusterEvent{Resource: fwk.Node, ActionType: fwk.Add | fwk.Delete | fwk.UpdateNodeLabel | fwk.UpdateNodeTaint}, QueueingHintFn: pl.isSchedulableAfterNodeChange},
+	}, nil
 }
 
-func validateTopologyKey(p *field.Path, v string) field.ErrorList {
-	var allErrs field.ErrorList
-	if len(v) == 0 {
-		allErrs = append(allErrs, field.Required(p, "can not be empty"))
+// involvedInTopologySpreading returns true if the incomingPod is involved in the topology spreading of podWithSpreading.
+func involvedInTopologySpreading(incomingPod, podWithSpreading *v1.Pod) bool {
+	if incomingPod.Spec.NodeName == "" && incomingPod.Status.NominatedNodeName == "" {
+		return false
+	}
+	return incomingPod.Namespace == podWithSpreading.Namespace
+}
+
+// hasConstraintWithNodeTaintsPolicyHonor returns true if any constraint has `NodeTaintsPolicy: Honor`.
+func hasConstraintWithNodeTaintsPolicyHonor(constraints []topologySpreadConstraint) bool {
+	for _, c := range constraints {
+		if c.NodeTaintsPolicy == v1.NodeInclusionPolicyHonor {
+			return true
+		}
+	}
+	return false
+}
+
+func (pl *PodTopologySpread) isSchedulableAfterTargetPodChange(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (fwk.QueueingHint, error) {
+	originalPod, modifiedPod, err := util.As[*v1.Pod](oldObj, newObj)
+	if err != nil {
+		return fwk.Queue, err
+	}
+
+	constraints, err := pl.getConstraints(pod)
+	if err != nil {
+		return fwk.Queue, err
+	}
+
+	if !equality.Semantic.DeepEqual(modifiedPod.Spec.Tolerations, originalPod.Spec.Tolerations) && hasConstraintWithNodeTaintsPolicyHonor(constraints) {
+		// If any constraint has `NodeTaintsPolicy: Honor`, we can return Queue when the target Pod has got a new toleration.
+		logger.V(5).Info("the unschedulable pod has got a new toleration, which could make it schedulable",
+			"pod", klog.KObj(pod), "modifiedPod", klog.KObj(modifiedPod))
+		return fwk.Queue, nil
+	}
+
+	return pl.isSchedulableAfterPodLabelChange(logger, originalPod, modifiedPod, constraints)
+}
+
+func (pl *PodTopologySpread) isSchedulableAfterAssignedPodChange(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (fwk.QueueingHint, error) {
+	originalPod, modifiedPod, err := util.As[*v1.Pod](oldObj, newObj)
+	if err != nil {
+		return fwk.Queue, err
+	}
+
+	if (modifiedPod != nil && !involvedInTopologySpreading(modifiedPod, pod)) || (originalPod != nil && !involvedInTopologySpreading(originalPod, pod)) {
+		logger.V(5).Info("the added/updated/deleted pod is unscheduled or has different namespace with target pod, so it doesn't make the target pod schedulable",
+			"pod", klog.KObj(pod), "originalPod", klog.KObj(originalPod))
+		return fwk.QueueSkip, nil
+	}
+
+	constraints, err := pl.getConstraints(pod)
+	if err != nil {
+		return fwk.Queue, err
+	}
+
+	// Pod is modified. Return Queue when the label(s) matching topologySpread's selector is added, changed, or deleted.
+	if modifiedPod != nil && originalPod != nil {
+		return pl.isSchedulableAfterPodLabelChange(logger, originalPod, modifiedPod, constraints)
+	}
+
+	// Pod is added. Return Queue when the added Pod has a label that matches with topologySpread's selector.
+	if modifiedPod != nil {
+		if podLabelsMatchSpreadConstraints(constraints, modifiedPod.Labels) {
+			logger.V(5).Info("a scheduled pod was created and it matches with the pod's topology spread constraints",
+				"pod", klog.KObj(pod), "createdPod", klog.KObj(modifiedPod))
+			return fwk.Queue, nil
+		}
+		logger.V(5).Info("a scheduled pod was created, but it doesn't matches with the pod's topology spread constraints",
+			"pod", klog.KObj(pod), "createdPod", klog.KObj(modifiedPod))
+		return fwk.QueueSkip, nil
+	}
+
+	// Pod is deleted. Return Queue when the deleted Pod has a label that matches with topologySpread's selector.
+	if podLabelsMatchSpreadConstraints(constraints, originalPod.Labels) {
+		logger.V(5).Info("a scheduled pod which matches with the pod's topology spread constraints was deleted, and the pod may be schedulable now",
+			"pod", klog.KObj(pod), "deletedPod", klog.KObj(originalPod))
+		return fwk.Queue, nil
+	}
+	logger.V(5).Info("a scheduled pod was deleted, but it's unrelated to the pod's topology spread constraints",
+		"pod", klog.KObj(pod), "deletedPod", klog.KObj(originalPod))
+
+	return fwk.QueueSkip, nil
+}
+
+func (pl *PodTopologySpread) isSchedulableAfterPodLabelChange(logger klog.Logger, originalPod, modifiedPod *v1.Pod, constraints []topologySpreadConstraint) (fwk.QueueingHint, error) {
+	if equality.Semantic.DeepEqual(modifiedPod.Labels, originalPod.Labels) {
+		logger.V(5).Info("the pod's update doesn't include the label update, which doesn't make the target pod schedulable",
+			"pod", klog.KObj(originalPod), "modifiedPod", klog.KObj(modifiedPod))
+		return fwk.QueueSkip, nil
+	}
+	for _, c := range constraints {
+		if c.Selector.Matches(labels.Set(originalPod.Labels)) != c.Selector.Matches(labels.Set(modifiedPod.Labels)) {
+			// This modification makes this Pod match (or not match) with this constraint.
+			// Maybe now the scheduling result of topology spread gets changed by this change.
+			logger.V(5).Info("a scheduled or target pod's label was updated and it makes the updated pod match or unmatch the pod's topology spread constraints",
+				"pod", klog.KObj(originalPod), "modifiedPod", klog.KObj(modifiedPod))
+			return fwk.Queue, nil
+		}
+	}
+	// This modification of labels doesn't change whether this Pod would match selector or not in any constraints.
+	logger.V(5).Info("a scheduled or target pod's label was updated, but it's a change unrelated to the pod's topology spread constraints",
+		"pod", klog.KObj(originalPod), "modifiedPod", klog.KObj(modifiedPod))
+	return fwk.QueueSkip, nil
+}
+
+// getConstraints extracts topologySpreadConstraint(s) from the Pod spec.
+// If the Pod doesn't have any topologySpreadConstraint, it returns default constraints.
+func (pl *PodTopologySpread) getConstraints(pod *v1.Pod) ([]topologySpreadConstraint, error) {
+	var constraints []topologySpreadConstraint
+	var err error
+	if len(pod.Spec.TopologySpreadConstraints) > 0 {
+		// We have feature gating in APIServer to strip the spec
+		// so don't need to re-check feature gate, just check length of Constraints.
+		constraints, err = pl.filterTopologySpreadConstraints(
+			pod.Spec.TopologySpreadConstraints,
+			pod.Labels,
+			v1.DoNotSchedule,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("obtaining pod's hard topology spread constraints: %w", err)
+		}
 	} else {
-		allErrs = append(allErrs, metav1validation.ValidateLabelName(v, p)...)
-	}
-	return allErrs
-}
-
-func validateWhenUnsatisfiable(p *field.Path, v v1.UnsatisfiableConstraintAction) *field.Error {
-	if len(v) == 0 {
-		return field.Required(p, "can not be empty")
-	}
-	if !supportedScheduleActions.Has(string(v)) {
-		return field.NotSupported(p, v, supportedScheduleActions.List())
-	}
-	return nil
-}
-
-func validateConstraintNotRepeat(path *field.Path, constraints []v1.TopologySpreadConstraint, idx int) *field.Error {
-	c := &constraints[idx]
-	for i := range constraints[:idx] {
-		other := &constraints[i]
-		if c.TopologyKey == other.TopologyKey && c.WhenUnsatisfiable == other.WhenUnsatisfiable {
-			return field.Duplicate(path.Index(idx), fmt.Sprintf("{%v, %v}", c.TopologyKey, c.WhenUnsatisfiable))
+		constraints, err = pl.buildDefaultConstraints(pod, v1.DoNotSchedule)
+		if err != nil {
+			return nil, fmt.Errorf("setting default hard topology spread constraints: %w", err)
 		}
 	}
-	return nil
+	return constraints, nil
+}
+
+// isSchedulableAfterNodeChange returns Queue when node has topologyKey in its labels, else return QueueSkip.
+func (pl *PodTopologySpread) isSchedulableAfterNodeChange(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (fwk.QueueingHint, error) {
+	originalNode, modifiedNode, err := util.As[*v1.Node](oldObj, newObj)
+	if err != nil {
+		return fwk.Queue, err
+	}
+
+	constraints, err := pl.getConstraints(pod)
+	if err != nil {
+		return fwk.Queue, err
+	}
+
+	var originalNodeMatching, modifiedNodeMatching bool
+	if originalNode != nil {
+		originalNodeMatching = nodeLabelsMatchSpreadConstraints(originalNode.Labels, constraints)
+	}
+	if modifiedNode != nil {
+		modifiedNodeMatching = nodeLabelsMatchSpreadConstraints(modifiedNode.Labels, constraints)
+	}
+
+	// We return Queue in the following cases:
+	// 1. Node/UpdateNodeLabel:
+	// - The original node matched the pod's topology spread constraints, but the modified node does not.
+	// - The modified node matches the pod's topology spread constraints, but the original node does not.
+	// - The modified node matches the pod's topology spread constraints, and the original node and the modified node have different label values for any topologyKey.
+	// 2. Node/UpdateNodeTaint:
+	//  - The modified node match the pod's topology spread constraints, and the original node and the modified node have different taints.
+	// 3. Node/Add: The created node matches the pod's topology spread constraints.
+	// 4. Node/Delete: The original node matched the pod's topology spread constraints.
+	if originalNode != nil && modifiedNode != nil {
+		if originalNodeMatching != modifiedNodeMatching {
+			logger.V(5).Info("the node is updated and now pod topology spread constraints has changed, and the pod may be schedulable now",
+				"pod", klog.KObj(pod), "node", klog.KObj(modifiedNode), "originalMatching", originalNodeMatching, "newMatching", modifiedNodeMatching)
+			return fwk.Queue, nil
+		}
+		if modifiedNodeMatching && (checkTopologyKeyLabelsChanged(originalNode.Labels, modifiedNode.Labels, constraints) || !equality.Semantic.DeepEqual(originalNode.Spec.Taints, modifiedNode.Spec.Taints)) {
+			logger.V(5).Info("the node is updated and now has different taints or labels, and the pod may be schedulable now",
+				"pod", klog.KObj(pod), "node", klog.KObj(modifiedNode))
+			return fwk.Queue, nil
+		}
+		return fwk.QueueSkip, nil
+	}
+
+	if modifiedNode != nil {
+		if !modifiedNodeMatching {
+			logger.V(5).Info("the created node doesn't match pod topology spread constraints",
+				"pod", klog.KObj(pod), "node", klog.KObj(modifiedNode))
+			return fwk.QueueSkip, nil
+		}
+		logger.V(5).Info("the created node matches topology spread constraints, and the pod may be schedulable now",
+			"pod", klog.KObj(pod), "node", klog.KObj(modifiedNode))
+		return fwk.Queue, nil
+	}
+
+	if !originalNodeMatching {
+		logger.V(5).Info("the deleted node doesn't match pod topology spread constraints", "pod", klog.KObj(pod), "node", klog.KObj(originalNode))
+		return fwk.QueueSkip, nil
+	}
+	logger.V(5).Info("the deleted node matches topology spread constraints, and the pod may be schedulable now",
+		"pod", klog.KObj(pod), "node", klog.KObj(originalNode))
+	return fwk.Queue, nil
+}
+
+// checkTopologyKeyLabelsChanged checks if any of the labels specified as topologyKey in the constraints have changed.
+func checkTopologyKeyLabelsChanged(originalLabels, modifiedLabels map[string]string, constraints []topologySpreadConstraint) bool {
+	for _, constraint := range constraints {
+		topologyKey := constraint.TopologyKey
+		if originalLabels[topologyKey] != modifiedLabels[topologyKey] {
+			return true
+		}
+	}
+	return false
 }

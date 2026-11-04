@@ -22,11 +22,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"testing"
 
-	jsonpatch "github.com/evanphx/json-patch"
+	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -46,7 +45,7 @@ import (
 )
 
 func bytesBody(bodyBytes []byte) io.ReadCloser {
-	return ioutil.NopCloser(bytes.NewReader(bodyBytes))
+	return io.NopCloser(bytes.NewReader(bodyBytes))
 }
 
 func defaultHeaders() http.Header {
@@ -98,10 +97,12 @@ func fakeScaleClient(t *testing.T) (ScalesGetter, []schema.GroupResource) {
 		},
 	}
 
+	//nolint:logcheck // scale.New below requires a PreferredResourceMapper, which is the older, non-contextual interface, so building it from discovery has no context to thread through here.
 	restMapperRes, err := restmapper.GetAPIGroupResources(fakeDiscoveryClient)
 	if err != nil {
 		t.Fatalf("unexpected error while constructing resource list from fake discovery client: %v", err)
 	}
+	//nolint:logcheck // scale.New below requires a PreferredResourceMapper, which is the older, non-contextual interface, so building it from discovery has no context to thread through here.
 	restMapper := restmapper.NewDiscoveryRESTMapper(restMapperRes)
 
 	autoscalingScale := &autoscalingv1.Scale{
@@ -184,7 +185,7 @@ func fakeScaleClient(t *testing.T) (ScalesGetter, []schema.GroupResource) {
 			return &http.Response{StatusCode: http.StatusOK, Header: defaultHeaders(), Body: bytesBody(res)}, nil
 		case "PUT":
 			decoder := codecs.UniversalDeserializer()
-			body, err := ioutil.ReadAll(req.Body)
+			body, err := io.ReadAll(req.Body)
 			if err != nil {
 				return nil, err
 			}
@@ -201,7 +202,7 @@ func fakeScaleClient(t *testing.T) (ScalesGetter, []schema.GroupResource) {
 			}
 			return &http.Response{StatusCode: http.StatusOK, Header: defaultHeaders(), Body: bytesBody(res)}, nil
 		case "PATCH":
-			body, err := ioutil.ReadAll(req.Body)
+			body, err := io.ReadAll(req.Body)
 			if err != nil {
 				return nil, err
 			}

@@ -20,11 +20,9 @@ import (
 	"errors"
 	"fmt"
 
-	"k8s.io/api/core/v1"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/component-base/featuregate"
+	v1 "k8s.io/api/core/v1"
 	csilibplugins "k8s.io/csi-translation-lib/plugins"
-	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/volume"
 )
 
@@ -48,26 +46,31 @@ func NewPluginManager(m PluginNameMapper) PluginManager {
 }
 
 // IsMigrationCompleteForPlugin indicates whether CSI migration has been completed
-// for a particular storage plugin
+// for a particular storage plugin. A complete migration will need to:
+// 1. Enable CSIMigrationXX for the plugin
+// 2. Unregister the in-tree plugin by setting the InTreePluginXXUnregister feature gate
 func (pm PluginManager) IsMigrationCompleteForPlugin(pluginName string) bool {
-	// CSIMigration feature and plugin specific migration feature flags should
-	// be enabled for plugin specific migration completion feature flags to be
-	// take effect
+	// CSIMigration feature and plugin specific InTreePluginUnregister feature flags should
+	// be enabled for plugin specific migration completion to be take effect
 	if !pm.IsMigrationEnabledForPlugin(pluginName) {
 		return false
 	}
 
 	switch pluginName {
 	case csilibplugins.AWSEBSInTreePluginName:
-		return utilfeature.DefaultFeatureGate.Enabled(features.CSIMigrationAWSComplete)
+		return true
 	case csilibplugins.GCEPDInTreePluginName:
-		return utilfeature.DefaultFeatureGate.Enabled(features.CSIMigrationGCEComplete)
+		return true
 	case csilibplugins.AzureFileInTreePluginName:
-		return utilfeature.DefaultFeatureGate.Enabled(features.CSIMigrationAzureFileComplete)
+		return true
 	case csilibplugins.AzureDiskInTreePluginName:
-		return utilfeature.DefaultFeatureGate.Enabled(features.CSIMigrationAzureDiskComplete)
+		return true
 	case csilibplugins.CinderInTreePluginName:
-		return utilfeature.DefaultFeatureGate.Enabled(features.CSIMigrationOpenStackComplete)
+		return true
+	case csilibplugins.VSphereInTreePluginName:
+		return true
+	case csilibplugins.PortworxVolumePluginName:
+		return true
 	default:
 		return false
 	}
@@ -77,21 +80,23 @@ func (pm PluginManager) IsMigrationCompleteForPlugin(pluginName string) bool {
 // for a particular storage plugin
 func (pm PluginManager) IsMigrationEnabledForPlugin(pluginName string) bool {
 	// CSIMigration feature should be enabled along with the plugin-specific one
-	if !utilfeature.DefaultFeatureGate.Enabled(features.CSIMigration) {
-		return false
-	}
+	// CSIMigration has been GA. It will be enabled by default.
 
 	switch pluginName {
 	case csilibplugins.AWSEBSInTreePluginName:
-		return utilfeature.DefaultFeatureGate.Enabled(features.CSIMigrationAWS)
+		return true
 	case csilibplugins.GCEPDInTreePluginName:
-		return utilfeature.DefaultFeatureGate.Enabled(features.CSIMigrationGCE)
+		return true
 	case csilibplugins.AzureFileInTreePluginName:
-		return utilfeature.DefaultFeatureGate.Enabled(features.CSIMigrationAzureFile)
+		return true
 	case csilibplugins.AzureDiskInTreePluginName:
-		return utilfeature.DefaultFeatureGate.Enabled(features.CSIMigrationAzureDisk)
+		return true
 	case csilibplugins.CinderInTreePluginName:
-		return utilfeature.DefaultFeatureGate.Enabled(features.CSIMigrationOpenStack)
+		return true
+	case csilibplugins.VSphereInTreePluginName:
+		return true
+	case csilibplugins.PortworxVolumePluginName:
+		return true
 	default:
 		return false
 	}
@@ -115,20 +120,20 @@ func (pm PluginManager) IsMigratable(spec *volume.Spec) (bool, error) {
 // InTreeToCSITranslator performs translation of Volume sources for PV and Volume objects
 // from references to in-tree plugins to migrated CSI plugins
 type InTreeToCSITranslator interface {
-	TranslateInTreePVToCSI(pv *v1.PersistentVolume) (*v1.PersistentVolume, error)
-	TranslateInTreeInlineVolumeToCSI(volume *v1.Volume) (*v1.PersistentVolume, error)
+	TranslateInTreePVToCSI(logger klog.Logger, pv *v1.PersistentVolume) (*v1.PersistentVolume, error)
+	TranslateInTreeInlineVolumeToCSI(logger klog.Logger, volume *v1.Volume, podNamespace string) (*v1.PersistentVolume, error)
 }
 
 // TranslateInTreeSpecToCSI translates a volume spec (either PV or inline volume)
 // supported by an in-tree plugin to CSI
-func TranslateInTreeSpecToCSI(spec *volume.Spec, translator InTreeToCSITranslator) (*volume.Spec, error) {
+func TranslateInTreeSpecToCSI(logger klog.Logger, spec *volume.Spec, podNamespace string, translator InTreeToCSITranslator) (*volume.Spec, error) {
 	var csiPV *v1.PersistentVolume
 	var err error
 	inlineVolume := false
 	if spec.PersistentVolume != nil {
-		csiPV, err = translator.TranslateInTreePVToCSI(spec.PersistentVolume)
+		csiPV, err = translator.TranslateInTreePVToCSI(logger, spec.PersistentVolume)
 	} else if spec.Volume != nil {
-		csiPV, err = translator.TranslateInTreeInlineVolumeToCSI(spec.Volume)
+		csiPV, err = translator.TranslateInTreeInlineVolumeToCSI(logger, spec.Volume, podNamespace)
 		inlineVolume = true
 	} else {
 		err = errors.New("not a valid volume spec")
@@ -137,20 +142,9 @@ func TranslateInTreeSpecToCSI(spec *volume.Spec, translator InTreeToCSITranslato
 		return nil, fmt.Errorf("failed to translate in-tree pv to CSI: %v", err)
 	}
 	return &volume.Spec{
+		Migrated:                        true,
 		PersistentVolume:                csiPV,
 		ReadOnly:                        spec.ReadOnly,
 		InlineVolumeSpecForCSIMigration: inlineVolume,
 	}, nil
-}
-
-// CheckMigrationFeatureFlags checks the configuration of feature flags related
-// to CSI Migration is valid
-func CheckMigrationFeatureFlags(f featuregate.FeatureGate, pluginMigration, pluginMigrationComplete featuregate.Feature) error {
-	if f.Enabled(pluginMigration) && !f.Enabled(features.CSIMigration) {
-		return fmt.Errorf("enabling %q requires CSIMigration to be enabled", pluginMigration)
-	}
-	if f.Enabled(pluginMigrationComplete) && !f.Enabled(pluginMigration) {
-		return fmt.Errorf("enabling %q requires %q to be enabled", pluginMigrationComplete, pluginMigration)
-	}
-	return nil
 }

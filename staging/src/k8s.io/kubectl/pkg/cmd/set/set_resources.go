@@ -18,19 +18,22 @@ package set
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
-	"k8s.io/klog"
 
 	v1 "k8s.io/api/core/v1"
+	apiresource "k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/cli-runtime/pkg/printers"
 	"k8s.io/cli-runtime/pkg/resource"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/klog/v2"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
-	generateversioned "k8s.io/kubectl/pkg/generate/versioned"
 	"k8s.io/kubectl/pkg/polymorphichelpers"
 	"k8s.io/kubectl/pkg/scheme"
 	"k8s.io/kubectl/pkg/util/i18n"
@@ -38,12 +41,12 @@ import (
 )
 
 var (
-	resourcesLong = templates.LongDesc(`
-		Specify compute resource requirements (cpu, memory) for any resource that defines a pod template.  If a pod is successfully scheduled, it is guaranteed the amount of resource requested, but may burst up to its specified limits.
+	resourcesLong = templates.LongDesc(i18n.T(`
+		Specify compute resource requirements (CPU, memory) for any resource that defines a pod template.  If a pod is successfully scheduled, it is guaranteed the amount of resource requested, but may burst up to its specified limits.
 
-		for each compute resource, if a limit is specified and a request is omitted, the request will default to the limit.
+		For each compute resource, if a limit is specified and a request is omitted, the request will default to the limit.
 
-		Possible resources include (case insensitive): %s.`)
+		Possible resources include (case insensitive): %s.`))
 
 	resourcesExample = templates.Examples(`
 		# Set a deployments nginx container cpu limits to "200m" and memory to "512Mi"
@@ -73,6 +76,7 @@ type SetResourcesOptions struct {
 	Output            string
 	All               bool
 	Local             bool
+	fieldManager      string
 
 	DryRunStrategy cmdutil.DryRunStrategy
 
@@ -85,14 +89,13 @@ type SetResourcesOptions struct {
 
 	UpdatePodSpecForObject polymorphichelpers.UpdatePodSpecForObjectFunc
 	Resources              []string
-	DryRunVerifier         *resource.DryRunVerifier
 
-	genericclioptions.IOStreams
+	genericiooptions.IOStreams
 }
 
 // NewResourcesOptions returns a ResourcesOptions indicating all containers in the selected
 // pod templates are selected by default.
-func NewResourcesOptions(streams genericclioptions.IOStreams) *SetResourcesOptions {
+func NewResourcesOptions(streams genericiooptions.IOStreams) *SetResourcesOptions {
 	return &SetResourcesOptions{
 		PrintFlags:  genericclioptions.NewPrintFlags("resource requirements updated").WithTypeSetter(scheme.Scheme),
 		RecordFlags: genericclioptions.NewRecordFlags(),
@@ -106,7 +109,7 @@ func NewResourcesOptions(streams genericclioptions.IOStreams) *SetResourcesOptio
 }
 
 // NewCmdResources returns initialized Command instance for the 'set resources' sub command
-func NewCmdResources(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.Command {
+func NewCmdResources(f cmdutil.Factory, streams genericiooptions.IOStreams) *cobra.Command {
 	o := NewResourcesOptions(streams)
 
 	cmd := &cobra.Command{
@@ -129,13 +132,14 @@ func NewCmdResources(f cmdutil.Factory, streams genericclioptions.IOStreams) *co
 	//kubectl.AddJsonFilenameFlag(cmd, &options.Filenames, usage)
 	usage := "identifying the resource to get from a server."
 	cmdutil.AddFilenameOptionFlags(cmd, &o.FilenameOptions, usage)
-	cmd.Flags().BoolVar(&o.All, "all", o.All, "Select all resources, including uninitialized ones, in the namespace of the specified resource types")
-	cmd.Flags().StringVarP(&o.Selector, "selector", "l", o.Selector, "Selector (label query) to filter on, not including uninitialized ones,supports '=', '==', and '!='.(e.g. -l key1=value1,key2=value2)")
+	cmd.Flags().BoolVar(&o.All, "all", o.All, "Select all resources, in the namespace of the specified resource types")
+	cmdutil.AddLabelSelectorFlagVar(cmd, &o.Selector)
 	cmd.Flags().StringVarP(&o.ContainerSelector, "containers", "c", o.ContainerSelector, "The names of containers in the selected pod templates to change, all containers are selected by default - may use wildcards")
 	cmd.Flags().BoolVar(&o.Local, "local", o.Local, "If true, set resources will NOT contact api-server but run locally.")
 	cmdutil.AddDryRunFlag(cmd)
 	cmd.Flags().StringVar(&o.Limits, "limits", o.Limits, "The resource requirement requests for this container.  For example, 'cpu=100m,memory=256Mi'.  Note that server side components may assign requests depending on the server configuration, such as limit ranges.")
 	cmd.Flags().StringVar(&o.Requests, "requests", o.Requests, "The resource requirement requests for this container.  For example, 'cpu=100m,memory=256Mi'.  Note that server side components may assign requests depending on the server configuration, such as limit ranges.")
+	cmdutil.AddFieldManagerFlagVar(cmd, &o.fieldManager, "kubectl-set")
 	return cmd
 }
 
@@ -155,15 +159,6 @@ func (o *SetResourcesOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, ar
 	if err != nil {
 		return err
 	}
-	dynamicClient, err := f.DynamicClient()
-	if err != nil {
-		return err
-	}
-	discoveryClient, err := f.ToDiscoveryClient()
-	if err != nil {
-		return err
-	}
-	o.DryRunVerifier = resource.NewDryRunVerifier(dynamicClient, discoveryClient)
 
 	cmdutil.PrintFlagsWithDryRunStrategy(o.PrintFlags, o.DryRunStrategy)
 	printer, err := o.PrintFlags.ToPrinter()
@@ -173,7 +168,7 @@ func (o *SetResourcesOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, ar
 	o.PrintObj = printer.PrintObj
 
 	cmdNamespace, enforceNamespace, err := f.ToRawKubeConfigLoader().Namespace()
-	if err != nil {
+	if err != nil && !(o.Local && clientcmd.IsEmptyConfig(err)) {
 		return err
 	}
 
@@ -201,10 +196,7 @@ func (o *SetResourcesOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, ar
 	}
 
 	o.Infos, err = builder.Do().Infos()
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 
 // Validate makes sure that provided values in ResourcesOptions are valid
@@ -220,10 +212,17 @@ func (o *SetResourcesOptions) Validate() error {
 		return fmt.Errorf("you must specify an update to requests or limits (in the form of --requests/--limits)")
 	}
 
-	o.ResourceRequirements, err = generateversioned.HandleResourceRequirementsV1(map[string]string{"limits": o.Limits, "requests": o.Requests})
+	o.ResourceRequirements = v1.ResourceRequirements{}
+	limits, err := parseResourceList(o.Limits)
 	if err != nil {
 		return err
 	}
+	o.ResourceRequirements.Limits = limits
+	requests, err := parseResourceList(o.Requests)
+	if err != nil {
+		return err
+	}
+	o.ResourceRequirements.Requests = requests
 
 	return nil
 }
@@ -234,7 +233,9 @@ func (o *SetResourcesOptions) Run() error {
 	patches := CalculatePatches(o.Infos, scheme.DefaultJSONEncoder(), func(obj runtime.Object) ([]byte, error) {
 		transformed := false
 		_, err := o.UpdatePodSpecForObject(obj, func(spec *v1.PodSpec) error {
+			initContainers, _ := selectContainers(spec.InitContainers, o.ContainerSelector)
 			containers, _ := selectContainers(spec.Containers, o.ContainerSelector)
+			containers = append(containers, initContainers...)
 			if len(containers) != 0 {
 				for i := range containers {
 					if len(o.Limits) != 0 && len(containers[i].Resources.Limits) == 0 {
@@ -291,16 +292,10 @@ func (o *SetResourcesOptions) Run() error {
 			continue
 		}
 
-		if o.DryRunStrategy == cmdutil.DryRunServer {
-			if err := o.DryRunVerifier.HasSupport(info.Mapping.GroupVersionKind); err != nil {
-				allErrs = append(allErrs, fmt.Errorf("failed to patch resources update to pod template %v", err))
-				continue
-			}
-		}
-
 		actual, err := resource.
 			NewHelper(info.Client, info.Mapping).
 			DryRun(o.DryRunStrategy == cmdutil.DryRunServer).
+			WithFieldManager(o.fieldManager).
 			Patch(info.Namespace, info.Name, types.StrategicMergePatchType, patch.Patch, nil)
 		if err != nil {
 			allErrs = append(allErrs, fmt.Errorf("failed to patch resources update to pod template %v", err))
@@ -312,4 +307,25 @@ func (o *SetResourcesOptions) Run() error {
 		}
 	}
 	return utilerrors.NewAggregate(allErrs)
+}
+
+func parseResourceList(spec string) (v1.ResourceList, error) {
+	if spec == "" {
+		return nil, nil
+	}
+
+	result := v1.ResourceList{}
+	for resourceStatement := range strings.SplitSeq(spec, ",") {
+		parts := strings.Split(resourceStatement, "=")
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid argument syntax %v, expected <resource>=<value>", resourceStatement)
+		}
+		resourceName := v1.ResourceName(parts[0])
+		resourceQuantity, err := apiresource.ParseQuantity(parts[1])
+		if err != nil {
+			return nil, err
+		}
+		result[resourceName] = resourceQuantity
+	}
+	return result, nil
 }

@@ -17,11 +17,10 @@ limitations under the License.
 package metrics
 
 import (
-	"fmt"
+	"strings"
 	"sync"
-	"sync/atomic"
 
-	"github.com/blang/semver"
+	"github.com/blang/semver/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 
@@ -30,56 +29,71 @@ import (
 )
 
 var (
-	showHiddenOnce sync.Once
-	showHidden     atomic.Value
 	registries     []*kubeRegistry // stores all registries created by NewKubeRegistry()
 	registriesLock sync.RWMutex
+
+	registeredMetricsTotal = NewCounterVec(
+		&CounterOpts{
+			Name:           "registered_metrics_total",
+			Help:           "The count of registered metrics broken by stability level and deprecation version.",
+			StabilityLevel: BETA,
+		},
+		[]string{"stability_level", "deprecated_version"},
+	)
 )
 
-// shouldHide be used to check if a specific metric with deprecated version should be hidden
+// shouldHide is used to check if a specific metric with deprecated version should be hidden
 // according to metrics deprecation lifecycle.
-func shouldHide(currentVersion *semver.Version, deprecatedVersion *semver.Version) bool {
-	guardVersion, err := semver.Make(fmt.Sprintf("%d.%d.0", currentVersion.Major, currentVersion.Minor))
-	if err != nil {
-		panic("failed to make version from current version")
-	}
+func shouldHide(stabilityLevel StabilityLevel, currentVersion *semver.Version, deprecatedVersion *semver.Version) bool {
+	hiddenMinor := deprecatedVersion.Minor + deprecationPeriodMinorVersions(stabilityLevel)
 
-	if deprecatedVersion.LT(guardVersion) {
+	switch {
+	case deprecatedVersion.Major < currentVersion.Major:
+		return true
+	case deprecatedVersion.Major > currentVersion.Major:
+		return false
+
+	// deprecatedVersion.Major == currentVersion.Major
+	case hiddenMinor < currentVersion.Minor:
+		return true
+	case hiddenMinor > currentVersion.Minor:
+		return false
+
+	// deprecatedVersion.Minor == currentVersion.Minor
+	case strings.Contains(currentVersion.String(), "alpha.0"):
+		// Wait until we're past the alpha.0 period of a minor development cycle to hide metrics whose deprecation period ends in that minor version.
+		// See discussion in https://github.com/kubernetes/kubernetes/issues/133429#issuecomment-3165551443
+		return false
+	default:
+		return true
+	}
+}
+
+// getDeprecationReleaseWindow returns the number of minor releases a metric should be served
+// after its deprecated version, based on its stability level.
+func deprecationPeriodMinorVersions(stabilityLevel StabilityLevel) uint64 {
+	switch stabilityLevel {
+	case STABLE:
+		return 3
+	case BETA:
+		return 1
+	default: // ALPHA, INTERNAL
+		return 0
+	}
+}
+
+// isDeprecated returns true if the current version, ignoring pre-release tags,
+// is greater than or equal to the deprecated version.
+func isDeprecated(currentVersion, deprecatedVersion semver.Version) bool {
+	switch {
+	case currentVersion.Major < deprecatedVersion.Major:
+		return false
+	case currentVersion.Major > deprecatedVersion.Major:
 		return true
 	}
 
-	return false
-}
-
-// ValidateShowHiddenMetricsVersion checks invalid version for which show hidden metrics.
-func ValidateShowHiddenMetricsVersion(v string) []error {
-	err := validateShowHiddenMetricsVersion(parseVersion(version.Get()), v)
-	if err != nil {
-		return []error{err}
-	}
-
-	return nil
-}
-
-// SetShowHidden will enable showing hidden metrics. This will no-opt
-// after the initial call
-func SetShowHidden() {
-	showHiddenOnce.Do(func() {
-		showHidden.Store(true)
-
-		// re-register collectors that has been hidden in phase of last registry.
-		for _, r := range registries {
-			r.enableHiddenCollectors()
-			r.enableHiddenStableCollectors()
-		}
-	})
-}
-
-// ShouldShowHidden returns whether showing hidden deprecated metrics
-// is enabled. While the primary usecase for this is internal (to determine
-// registration behavior) this can also be used to introspect
-func ShouldShowHidden() bool {
-	return showHidden.Load() != nil && showHidden.Load().(bool)
+	// currentVersion.Major == deprecatedVersion.Major
+	return currentVersion.Minor >= deprecatedVersion.Minor
 }
 
 // Registerable is an interface for a collector metric which we
@@ -97,17 +111,36 @@ type Registerable interface {
 	FQName() string
 }
 
+type resettable interface {
+	Reset()
+}
+
 // KubeRegistry is an interface which implements a subset of prometheus.Registerer and
 // prometheus.Gatherer interfaces
 type KubeRegistry interface {
 	// Deprecated
 	RawMustRegister(...prometheus.Collector)
+	// CustomRegister is our internal variant of Prometheus registry.Register
 	CustomRegister(c StableCollector) error
+	// CustomMustRegister is our internal variant of Prometheus registry.MustRegister
 	CustomMustRegister(cs ...StableCollector)
+	// Register conforms to Prometheus registry.Register
 	Register(Registerable) error
+	// MustRegister conforms to Prometheus registry.MustRegister
 	MustRegister(...Registerable)
+	// Unregister conforms to Prometheus registry.Unregister
 	Unregister(collector Collector) bool
+	// Gather conforms to Prometheus gatherer.Gather
 	Gather() ([]*dto.MetricFamily, error)
+	// Reset invokes the Reset() function on all items in the registry
+	// which are added as resettables.
+	Reset()
+	// RegisterMetaMetrics registers metrics about the number of registered metrics.
+	RegisterMetaMetrics()
+	// Registerer exposes the underlying prometheus registerer
+	Registerer() prometheus.Registerer
+	// Gatherer exposes the underlying prometheus gatherer
+	Gatherer() prometheus.Gatherer
 }
 
 // kubeRegistry is a wrapper around a prometheus registry-type object. Upon initialization
@@ -120,6 +153,8 @@ type kubeRegistry struct {
 	stableCollectors     []StableCollector       // stores all stable collector
 	hiddenCollectorsLock sync.RWMutex
 	stableCollectorsLock sync.RWMutex
+	resetLock            sync.RWMutex
+	resettables          []resettable
 }
 
 // Register registers a new Collector to be included in metrics
@@ -129,12 +164,22 @@ type kubeRegistry struct {
 // uniqueness criteria described in the documentation of metric.Desc.
 func (kr *kubeRegistry) Register(c Registerable) error {
 	if c.Create(&kr.version) {
+		defer kr.addResettable(c)
 		return kr.PromRegistry.Register(c)
 	}
 
 	kr.trackHiddenCollector(c)
-
 	return nil
+}
+
+// Registerer exposes the underlying prometheus.Registerer
+func (kr *kubeRegistry) Registerer() prometheus.Registerer {
+	return kr.PromRegistry
+}
+
+// Gatherer exposes the underlying prometheus.Gatherer
+func (kr *kubeRegistry) Gatherer() prometheus.Gatherer {
+	return kr.PromRegistry
 }
 
 // MustRegister works like Register but registers any number of
@@ -145,6 +190,7 @@ func (kr *kubeRegistry) MustRegister(cs ...Registerable) {
 	for _, c := range cs {
 		if c.Create(&kr.version) {
 			metrics = append(metrics, c)
+			kr.addResettable(c)
 		} else {
 			kr.trackHiddenCollector(c)
 		}
@@ -155,7 +201,7 @@ func (kr *kubeRegistry) MustRegister(cs ...Registerable) {
 // CustomRegister registers a new custom collector.
 func (kr *kubeRegistry) CustomRegister(c StableCollector) error {
 	kr.trackStableCollectors(c)
-
+	defer kr.addResettable(c)
 	if c.Create(&kr.version, c) {
 		return kr.PromRegistry.Register(c)
 	}
@@ -167,14 +213,13 @@ func (kr *kubeRegistry) CustomRegister(c StableCollector) error {
 // error.
 func (kr *kubeRegistry) CustomMustRegister(cs ...StableCollector) {
 	kr.trackStableCollectors(cs...)
-
 	collectors := make([]prometheus.Collector, 0, len(cs))
 	for _, c := range cs {
 		if c.Create(&kr.version, c) {
+			kr.addResettable(c)
 			collectors = append(collectors, c)
 		}
 	}
-
 	kr.PromRegistry.MustRegister(collectors...)
 }
 
@@ -185,6 +230,19 @@ func (kr *kubeRegistry) CustomMustRegister(cs ...StableCollector) {
 // Deprecated
 func (kr *kubeRegistry) RawMustRegister(cs ...prometheus.Collector) {
 	kr.PromRegistry.MustRegister(cs...)
+	for _, c := range cs {
+		kr.addResettable(c)
+	}
+}
+
+// addResettable will automatically add our metric to our reset
+// list if it satisfies the interface
+func (kr *kubeRegistry) addResettable(i interface{}) {
+	kr.resetLock.Lock()
+	defer kr.resetLock.Unlock()
+	if resettable, ok := i.(resettable); ok {
+		kr.resettables = append(kr.resettables, resettable)
+	}
 }
 
 // Unregister unregisters the Collector that equals the Collector passed
@@ -214,6 +272,7 @@ func (kr *kubeRegistry) trackHiddenCollector(c Registerable) {
 	defer kr.hiddenCollectorsLock.Unlock()
 
 	kr.hiddenCollectors[c.FQName()] = c
+	hiddenMetricsTotal.Inc()
 }
 
 // trackStableCollectors stores all custom collectors.
@@ -224,7 +283,7 @@ func (kr *kubeRegistry) trackStableCollectors(cs ...StableCollector) {
 	kr.stableCollectors = append(kr.stableCollectors, cs...)
 }
 
-// enableHiddenCollectors will re-register all of the hidden collectors.
+// enableHiddenCollectors will re-register all the hidden collectors.
 func (kr *kubeRegistry) enableHiddenCollectors() {
 	if len(kr.hiddenCollectors) == 0 {
 		return
@@ -238,7 +297,7 @@ func (kr *kubeRegistry) enableHiddenCollectors() {
 		cs = append(cs, c)
 	}
 
-	kr.hiddenCollectors = nil
+	kr.hiddenCollectors = make(map[string]Registerable)
 	kr.hiddenCollectorsLock.Unlock()
 	kr.MustRegister(cs...)
 }
@@ -266,6 +325,15 @@ func (kr *kubeRegistry) enableHiddenStableCollectors() {
 	kr.CustomMustRegister(cs...)
 }
 
+// Reset invokes Reset on all metrics that are resettable.
+func (kr *kubeRegistry) Reset() {
+	kr.resetLock.RLock()
+	defer kr.resetLock.RUnlock()
+	for _, r := range kr.resettables {
+		r.Reset()
+	}
+}
+
 // BuildVersion is a helper function that can be easily mocked.
 var BuildVersion = version.Get
 
@@ -274,6 +342,7 @@ func newKubeRegistry(v apimachineryversion.Info) *kubeRegistry {
 		PromRegistry:     prometheus.NewRegistry(),
 		version:          parseVersion(v),
 		hiddenCollectors: make(map[string]Registerable),
+		resettables:      make([]resettable, 0),
 	}
 
 	registriesLock.Lock()
@@ -283,10 +352,15 @@ func newKubeRegistry(v apimachineryversion.Info) *kubeRegistry {
 	return r
 }
 
-// NewKubeRegistry creates a new vanilla Registry without any Collectors
-// pre-registered.
+// NewKubeRegistry creates a new vanilla Registry
 func NewKubeRegistry() KubeRegistry {
 	r := newKubeRegistry(BuildVersion())
-
 	return r
+}
+
+func (r *kubeRegistry) RegisterMetaMetrics() {
+	r.MustRegister(registeredMetricsTotal)
+	r.MustRegister(disabledMetricsTotal)
+	r.MustRegister(hiddenMetricsTotal)
+	r.MustRegister(cardinalityEnforcementUnexpectedCategorizationsTotal)
 }

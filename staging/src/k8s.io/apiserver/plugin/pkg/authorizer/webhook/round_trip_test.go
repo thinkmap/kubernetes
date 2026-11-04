@@ -23,23 +23,28 @@ import (
 	"testing"
 	"time"
 
-	fuzz "github.com/google/gofuzz"
+	"github.com/google/go-cmp/cmp"
+	"sigs.k8s.io/randfill"
 
 	authorizationv1 "k8s.io/api/authorization/v1"
 	authorizationv1beta1 "k8s.io/api/authorization/v1beta1"
-	"k8s.io/apimachinery/pkg/util/diff"
 )
 
 func TestRoundTrip(t *testing.T) {
-	f := fuzz.New()
+	f := randfill.New()
 	seed := time.Now().UnixNano()
 	t.Logf("seed = %v", seed)
 	f.RandSource(rand.New(rand.NewSource(seed)))
+	f.MaxDepth(3)
 
 	for i := 0; i < 1000; i++ {
 		original := &authorizationv1.SubjectAccessReview{}
-		f.Fuzz(&original.Spec)
-		f.Fuzz(&original.Status)
+		f.Fill(&original.Spec)
+		f.Fill(&original.Status)
+
+		original.Spec.AuthorizationOptions = nil  // does not roundtrip
+		original.Status.ConditionalDecision = nil // does not roundtrip
+
 		converted := &authorizationv1beta1.SubjectAccessReview{
 			Spec:   v1SpecToV1beta1Spec(&original.Spec),
 			Status: v1StatusToV1beta1Status(original.Status),
@@ -49,7 +54,7 @@ func TestRoundTrip(t *testing.T) {
 			Status: v1beta1StatusToV1Status(&converted.Status),
 		}
 		if !reflect.DeepEqual(original, roundtripped) {
-			t.Errorf("diff %s", diff.ObjectReflectDiff(original, roundtripped))
+			t.Errorf("diff %s", cmp.Diff(original, roundtripped))
 		}
 	}
 }
@@ -61,6 +66,7 @@ func v1StatusToV1beta1Status(in authorizationv1.SubjectAccessReviewStatus) autho
 		Denied:          in.Denied,
 		Reason:          in.Reason,
 		EvaluationError: in.EvaluationError,
+		// ConditionalDecision is not expressible in v1beta1, and thus cleared as exception above to make roundtrips work
 	}
 }
 
@@ -73,6 +79,7 @@ func v1beta1SpecToV1Spec(in authorizationv1beta1.SubjectAccessReviewSpec) author
 		Groups:                in.Groups,
 		Extra:                 v1beta1ExtraToV1Extra(in.Extra),
 		UID:                   in.UID,
+		// AuthorizationOptions is not expressible in v1beta1, and thus cleared as exception above to make roundtrips work
 	}
 }
 
@@ -81,13 +88,15 @@ func v1beta1ResourceAttributesToV1ResourceAttributes(in *authorizationv1beta1.Re
 		return nil
 	}
 	return &authorizationv1.ResourceAttributes{
-		Namespace:   in.Namespace,
-		Verb:        in.Verb,
-		Group:       in.Group,
-		Version:     in.Version,
-		Resource:    in.Resource,
-		Subresource: in.Subresource,
-		Name:        in.Name,
+		Namespace:     in.Namespace,
+		Verb:          in.Verb,
+		Group:         in.Group,
+		Version:       in.Version,
+		Resource:      in.Resource,
+		Subresource:   in.Subresource,
+		Name:          in.Name,
+		FieldSelector: in.FieldSelector,
+		LabelSelector: in.LabelSelector,
 	}
 }
 

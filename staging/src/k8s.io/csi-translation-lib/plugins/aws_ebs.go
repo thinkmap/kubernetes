@@ -26,6 +26,8 @@ import (
 	v1 "k8s.io/api/core/v1"
 	storage "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -35,6 +37,14 @@ const (
 	AWSEBSInTreePluginName = "kubernetes.io/aws-ebs"
 	// AWSEBSTopologyKey is the zonal topology key for AWS EBS CSI driver
 	AWSEBSTopologyKey = "topology." + AWSEBSDriverName + "/zone"
+	// iopsPerGBKey is StorageClass parameter name that specifies IOPS
+	// Per GB.
+	iopsPerGBKey = "iopspergb"
+	// allowIncreaseIOPSKey is parameter name that allows the CSI driver
+	// to increase IOPS to the minimum value supported by AWS when IOPS
+	// Per GB is too low for a given volume size. This preserves current
+	// in-tree volume plugin behavior.
+	allowIncreaseIOPSKey = "allowautoiopspergbincrease"
 )
 
 var _ InTreePlugin = &awsElasticBlockStoreCSITranslator{}
@@ -48,7 +58,7 @@ func NewAWSElasticBlockStoreCSITranslator() InTreePlugin {
 }
 
 // TranslateInTreeStorageClassToCSI translates InTree EBS storage class parameters to CSI storage class
-func (t *awsElasticBlockStoreCSITranslator) TranslateInTreeStorageClassToCSI(sc *storage.StorageClass) (*storage.StorageClass, error) {
+func (t *awsElasticBlockStoreCSITranslator) TranslateInTreeStorageClassToCSI(logger klog.Logger, sc *storage.StorageClass) (*storage.StorageClass, error) {
 	var (
 		generatedTopologies []v1.TopologySelectorTerm
 		params              = map[string]string{}
@@ -61,6 +71,12 @@ func (t *awsElasticBlockStoreCSITranslator) TranslateInTreeStorageClassToCSI(sc 
 			generatedTopologies = generateToplogySelectors(AWSEBSTopologyKey, []string{v})
 		case zonesKey:
 			generatedTopologies = generateToplogySelectors(AWSEBSTopologyKey, strings.Split(v, ","))
+		case iopsPerGBKey:
+			// Keep iopsPerGBKey
+			params[k] = v
+			// Preserve current in-tree volume plugin behavior and allow the CSI
+			// driver to bump volume IOPS when volume size * iopsPerGB is too low.
+			params[allowIncreaseIOPSKey] = "true"
 		default:
 			params[k] = v
 		}
@@ -85,7 +101,7 @@ func (t *awsElasticBlockStoreCSITranslator) TranslateInTreeStorageClassToCSI(sc 
 
 // TranslateInTreeInlineVolumeToCSI takes a Volume with AWSElasticBlockStore set from in-tree
 // and converts the AWSElasticBlockStore source to a CSIPersistentVolumeSource
-func (t *awsElasticBlockStoreCSITranslator) TranslateInTreeInlineVolumeToCSI(volume *v1.Volume) (*v1.PersistentVolume, error) {
+func (t *awsElasticBlockStoreCSITranslator) TranslateInTreeInlineVolumeToCSI(logger klog.Logger, volume *v1.Volume, podNamespace string) (*v1.PersistentVolume, error) {
 	if volume == nil || volume.AWSElasticBlockStore == nil {
 		return nil, fmt.Errorf("volume is nil or AWS EBS not defined on volume")
 	}
@@ -98,7 +114,7 @@ func (t *awsElasticBlockStoreCSITranslator) TranslateInTreeInlineVolumeToCSI(vol
 		ObjectMeta: metav1.ObjectMeta{
 			// Must be unique per disk as it is used as the unique part of the
 			// staging path
-			Name: fmt.Sprintf("%s-%s", AWSEBSDriverName, ebsSource.VolumeID),
+			Name: fmt.Sprintf("%s-%s", AWSEBSDriverName, volumeHandle),
 		},
 		Spec: v1.PersistentVolumeSpec{
 			PersistentVolumeSource: v1.PersistentVolumeSource{
@@ -120,7 +136,7 @@ func (t *awsElasticBlockStoreCSITranslator) TranslateInTreeInlineVolumeToCSI(vol
 
 // TranslateInTreePVToCSI takes a PV with AWSElasticBlockStore set from in-tree
 // and converts the AWSElasticBlockStore source to a CSIPersistentVolumeSource
-func (t *awsElasticBlockStoreCSITranslator) TranslateInTreePVToCSI(pv *v1.PersistentVolume) (*v1.PersistentVolume, error) {
+func (t *awsElasticBlockStoreCSITranslator) TranslateInTreePVToCSI(logger klog.Logger, pv *v1.PersistentVolume) (*v1.PersistentVolume, error) {
 	if pv == nil || pv.Spec.AWSElasticBlockStore == nil {
 		return nil, fmt.Errorf("pv is nil or AWS EBS not defined on pv")
 	}
@@ -142,7 +158,7 @@ func (t *awsElasticBlockStoreCSITranslator) TranslateInTreePVToCSI(pv *v1.Persis
 		},
 	}
 
-	if err := translateTopology(pv, AWSEBSTopologyKey); err != nil {
+	if err := translateTopologyFromInTreeToCSI(pv, AWSEBSTopologyKey); err != nil {
 		return nil, fmt.Errorf("failed to translate topology: %v", err)
 	}
 
@@ -172,6 +188,11 @@ func (t *awsElasticBlockStoreCSITranslator) TranslateCSIPVToInTree(pv *v1.Persis
 			return nil, fmt.Errorf("failed to convert partition %v to integer: %v", partition, err)
 		}
 		ebsSource.Partition = int32(partValue)
+	}
+
+	// translate CSI topology to In-tree topology for rollback compatibility
+	if err := translateTopologyFromCSIToInTree(pv, AWSEBSTopologyKey, getAwsRegionFromZones); err != nil {
+		return nil, fmt.Errorf("failed to translate topology. PV:%+v. Error:%v", *pv, err)
 	}
 
 	pv.Spec.CSI = nil
@@ -211,12 +232,14 @@ func (t *awsElasticBlockStoreCSITranslator) RepairVolumeHandle(volumeHandle, nod
 var awsVolumeRegMatch = regexp.MustCompile("^vol-[^/]*$")
 
 // KubernetesVolumeIDToEBSVolumeID translates Kubernetes volume ID to EBS volume ID
-// KubernetsVolumeID forms:
-//  * aws://<zone>/<awsVolumeId>
-//  * aws:///<awsVolumeId>
-//  * <awsVolumeId>
+// KubernetesVolumeID forms:
+//   - aws://<zone>/<awsVolumeId>
+//   - aws:///<awsVolumeId>
+//   - <awsVolumeId>
+//
 // EBS Volume ID form:
-//  * vol-<alphanumberic>
+//   - vol-<alphanumberic>
+//
 // This translation shouldn't be needed and should be fixed in long run
 // See https://github.com/kubernetes/kubernetes/issues/73730
 func KubernetesVolumeIDToEBSVolumeID(kubernetesID string) (string, error) {
@@ -252,4 +275,31 @@ func KubernetesVolumeIDToEBSVolumeID(kubernetesID string) (string, error) {
 	}
 
 	return awsID, nil
+}
+
+func getAwsRegionFromZones(zones []string) (string, error) {
+	regions := sets.String{}
+	if len(zones) < 1 {
+		return "", fmt.Errorf("no zones specified")
+	}
+
+	// AWS zones can be in four forms:
+	// us-west-2a, us-gov-east-1a, us-west-2-lax-1a (local zone) and us-east-1-wl1-bos-wlz-1 (wavelength).
+	for _, zone := range zones {
+		splitZone := strings.Split(zone, "-")
+		if (len(splitZone) == 3 || len(splitZone) == 4) && len(splitZone[len(splitZone)-1]) == 2 {
+			// this would break if we ever have a location with more than 9 regions, ie us-west-10.
+			splitZone[len(splitZone)-1] = splitZone[len(splitZone)-1][:1]
+			regions.Insert(strings.Join(splitZone, "-"))
+		} else if len(splitZone) == 5 || len(splitZone) == 7 {
+			// local zone or wavelength
+			regions.Insert(strings.Join(splitZone[:3], "-"))
+		} else {
+			return "", fmt.Errorf("Unexpected zone format: %v is not a valid AWS zone", zone)
+		}
+	}
+	if regions.Len() != 1 {
+		return "", fmt.Errorf("multiple or no regions gotten from zones, got: %v", regions)
+	}
+	return regions.UnsortedList()[0], nil
 }

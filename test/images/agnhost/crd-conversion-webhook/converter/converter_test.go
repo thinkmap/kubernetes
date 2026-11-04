@@ -24,7 +24,7 @@ import (
 	"strings"
 	"testing"
 
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -92,7 +92,7 @@ request:
 				return
 			}
 
-			yamlSerializer := json.NewYAMLSerializer(json.DefaultMetaFactory, scheme, scheme)
+			yamlSerializer := json.NewSerializerWithOptions(json.DefaultMetaFactory, scheme, scheme, json.SerializerOptions{Yaml: true})
 			if _, _, err := yamlSerializer.Decode(response.Body.Bytes(), nil, &convertReview); err != nil {
 				t.Fatalf("cannot decode data: \n %v\n Error: %v", response.Body, err)
 			}

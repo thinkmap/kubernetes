@@ -19,6 +19,8 @@ package ingressclass
 import (
 	"context"
 
+	"k8s.io/apiserver/pkg/registry/rest"
+
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -31,13 +33,13 @@ import (
 // ingressClassStrategy implements verification logic for IngressClass
 // resources.
 type ingressClassStrategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating
 // IngressClass objects.
-var Strategy = ingressClassStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = ingressClassStrategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
 // NamespaceScoped returns false because IngressClass is a non-namespaced
 // resource.
@@ -62,7 +64,6 @@ func (ingressClassStrategy) PrepareForUpdate(ctx context.Context, obj, old runti
 	if !apiequality.Semantic.DeepEqual(oldIngressClass.Spec, newIngressClass.Spec) {
 		newIngressClass.Generation = oldIngressClass.Generation + 1
 	}
-
 }
 
 // Validate validates a new IngressClass.
@@ -71,13 +72,18 @@ func (ingressClassStrategy) Validate(ctx context.Context, obj runtime.Object) fi
 	return validation.ValidateIngressClass(ingressClass)
 }
 
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (ingressClassStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string {
+	return nil
+}
+
 // Canonicalize normalizes the object after validation.
 func (ingressClassStrategy) Canonicalize(obj runtime.Object) {
 }
 
 // AllowCreateOnUpdate is false for IngressClass; this means POST is needed to
 // create one.
-func (ingressClassStrategy) AllowCreateOnUpdate() bool {
+func (ingressClassStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
@@ -89,8 +95,13 @@ func (ingressClassStrategy) ValidateUpdate(ctx context.Context, obj, old runtime
 	return validation.ValidateIngressClassUpdate(newIngressClass, oldIngressClass)
 }
 
+// WarningsOnUpdate returns warnings for the given update.
+func (ingressClassStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
+}
+
 // AllowUnconditionalUpdate is the default update policy for IngressClass
 // objects.
-func (ingressClassStrategy) AllowUnconditionalUpdate() bool {
+func (ingressClassStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return true
 }

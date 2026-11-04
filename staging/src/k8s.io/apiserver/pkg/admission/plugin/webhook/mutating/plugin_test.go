@@ -30,8 +30,12 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/admission"
+	admissionmetrics "k8s.io/apiserver/pkg/admission/metrics"
 	webhooktesting "k8s.io/apiserver/pkg/admission/plugin/webhook/testing"
 	auditinternal "k8s.io/apiserver/pkg/apis/audit"
+	"k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/component-base/metrics/testutil"
+	clocktesting "k8s.io/utils/clock/testing"
 )
 
 // BenchmarkAdmit tests the performance cost of invoking a mutating webhook
@@ -40,7 +44,7 @@ func BenchmarkAdmit(b *testing.B) {
 	if len(testServerURL) == 0 {
 		b.Log("warning, WEBHOOK_TEST_SERVER_URL not set, starting in-process server, benchmarks will include webhook cost.")
 		b.Log("to run a standalone server, run:")
-		b.Log("go run ./vendor/k8s.io/apiserver/pkg/admission/plugin/webhook/testing/main/main.go")
+		b.Log("go run k8s.io/apiserver/pkg/admission/plugin/webhook/testing/main/main.go")
 		testServer := webhooktesting.NewTestServer(b)
 		testServer.StartTLS()
 		defer testServer.Close()
@@ -80,13 +84,13 @@ func BenchmarkAdmit(b *testing.B) {
 			wh.SetExternalKubeClientSet(client)
 			wh.SetExternalKubeInformerFactory(informer)
 
-			informer.Start(stopCh)
-			informer.WaitForCacheSync(stopCh)
-
 			if err = wh.ValidateInitialization(); err != nil {
 				b.Errorf("failed to validate initialization: %v", err)
 				return
 			}
+
+			informer.Start(stopCh)
+			informer.WaitForCacheSync(stopCh)
 
 			var attr admission.Attributes
 			if tt.IsCRD {
@@ -139,13 +143,13 @@ func TestAdmit(t *testing.T) {
 			wh.SetExternalKubeClientSet(client)
 			wh.SetExternalKubeInformerFactory(informer)
 
-			informer.Start(stopCh)
-			informer.WaitForCacheSync(stopCh)
-
 			if err = wh.ValidateInitialization(); err != nil {
 				t.Errorf("failed to validate initialization: %v", err)
 				return
 			}
+
+			informer.Start(stopCh)
+			informer.WaitForCacheSync(stopCh)
 
 			var attr admission.Attributes
 			if tt.IsCRD {
@@ -154,6 +158,9 @@ func TestAdmit(t *testing.T) {
 				attr = webhooktesting.NewAttribute(ns, tt.AdditionalLabels, tt.IsDryRun)
 			}
 
+			if len(tt.ExpectRejectionMetrics) > 0 {
+				admissionmetrics.Metrics.WebhookRejectionGathererForTest().Reset()
+			}
 			err = wh.Admit(context.TODO(), attr, objectInterfaces)
 			if tt.ExpectAllow != (err == nil) {
 				t.Errorf("expected allowed=%v, but got err=%v", tt.ExpectAllow, err)
@@ -174,6 +181,15 @@ func TestAdmit(t *testing.T) {
 			} else if isStatusErr {
 				if statusErr.ErrStatus.Code != tt.ExpectStatusCode {
 					t.Errorf("expected status code %d, got %d", tt.ExpectStatusCode, statusErr.ErrStatus.Code)
+				}
+			}
+			if len(tt.ExpectRejectionMetrics) > 0 {
+				expectedMetrics := `
+# HELP apiserver_admission_webhook_rejection_count [ALPHA] Admission webhook rejection count, identified by name and broken out for each admission type (validating or admit) and operation. Additional labels specify an error type (calling_webhook_error or apiserver_internal_error if an error occurred; no_error otherwise) and optionally a non-zero rejection code if the webhook rejects the request with an HTTP status code (honored by the apiserver when the code is greater or equal to 400). Codes greater than 600 are truncated to 600, to keep the metrics cardinality bounded.
+# TYPE apiserver_admission_webhook_rejection_count counter
+` + tt.ExpectRejectionMetrics + "\n"
+				if err := testutil.CollectAndCompare(admissionmetrics.Metrics.WebhookRejectionGathererForTest(), strings.NewReader(expectedMetrics), "apiserver_admission_webhook_rejection_count"); err != nil {
+					t.Errorf("unexpected collecting result:\n%s", err)
 				}
 			}
 			fakeAttr, ok := attr.(*webhooktesting.FakeAttributes)
@@ -229,13 +245,13 @@ func TestAdmitCachedClient(t *testing.T) {
 		wh.SetExternalKubeClientSet(client)
 		wh.SetExternalKubeInformerFactory(informer)
 
-		informer.Start(stopCh)
-		informer.WaitForCacheSync(stopCh)
-
 		if err = wh.ValidateInitialization(); err != nil {
 			t.Errorf("%s: failed to validate initialization: %v", tt.Name, err)
 			continue
 		}
+
+		informer.Start(stopCh)
+		informer.WaitForCacheSync(stopCh)
 
 		err = wh.Admit(context.TODO(), webhooktesting.NewAttribute(ns, nil, false), objectInterfaces)
 		if tt.ExpectAllow != (err == nil) {
@@ -249,5 +265,71 @@ func TestAdmitCachedClient(t *testing.T) {
 		if !tt.ExpectCacheMiss && *cacheMisses > 0 {
 			t.Errorf("%s: expected client to be cached, but got %d AuthenticationInfoResolver calls", tt.Name, *cacheMisses)
 		}
+	}
+}
+
+// TestWebhookDuration tests that MutatingWebhook#Admit sets webhook duration in context correctly
+func TestWebhookDuration(ts *testing.T) {
+	clk := clocktesting.FakeClock{}
+	testServer := webhooktesting.NewTestServerWithHandler(ts, webhooktesting.ClockSteppingWebhookHandler(ts, &clk))
+	testServer.StartTLS()
+	defer testServer.Close()
+	serverURL, err := url.ParseRequestURI(testServer.URL)
+	if err != nil {
+		ts.Fatalf("this should never happen? %v", err)
+	}
+
+	objectInterfaces := webhooktesting.NewObjectInterfacesForTest()
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	for _, test := range webhooktesting.NewValidationDurationTestCases(serverURL) {
+		ts.Run(test.Name, func(t *testing.T) {
+			ctx := context.TODO()
+			if test.InitContext {
+				ctx = request.WithLatencyTrackersAndCustomClock(ctx, &clk)
+			}
+			wh, err := NewMutatingWebhook(nil)
+			if err != nil {
+				t.Errorf("failed to create mutating webhook: %v", err)
+				return
+			}
+
+			ns := "webhook-test"
+			client, informer := webhooktesting.NewFakeMutatingDataSource(ns, webhooktesting.ConvertToMutatingWebhooks(test.Webhooks), stopCh)
+
+			wh.SetAuthenticationInfoResolverWrapper(webhooktesting.Wrapper(webhooktesting.NewAuthenticationInfoResolver(new(int32))))
+			wh.SetServiceResolver(webhooktesting.NewServiceResolver(*serverURL))
+			wh.SetExternalKubeClientSet(client)
+			wh.SetExternalKubeInformerFactory(informer)
+
+			if err = wh.ValidateInitialization(); err != nil {
+				t.Errorf("failed to validate initialization: %v", err)
+				return
+			}
+
+			informer.Start(stopCh)
+			informer.WaitForCacheSync(stopCh)
+
+			_ = wh.Admit(ctx, webhooktesting.NewAttribute(ns, nil, test.IsDryRun), objectInterfaces)
+			wd, ok := request.LatencyTrackersFrom(ctx)
+			if !ok {
+				if test.InitContext {
+					t.Errorf("expected webhook duration to be initialized")
+				}
+				return
+			}
+			if !test.InitContext {
+				t.Errorf("expected webhook duration to not be initialized")
+				return
+			}
+			if wd.MutatingWebhookTracker.GetLatency() != test.ExpectedDurationSum {
+				t.Errorf("expected admit duration %q got %q", test.ExpectedDurationSum, wd.MutatingWebhookTracker.GetLatency())
+			}
+			if wd.ValidatingWebhookTracker.GetLatency() != 0 {
+				t.Errorf("expected validate duraion to be equal to 0 got %q", wd.ValidatingWebhookTracker.GetLatency())
+			}
+		})
 	}
 }

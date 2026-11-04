@@ -17,13 +17,17 @@ limitations under the License.
 package nodename
 
 import (
-	"context"
-	"reflect"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+
 	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/ktesting"
+	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	st "k8s.io/kubernetes/pkg/scheduler/testing"
 )
 
 func TestNodeName(t *testing.T) {
@@ -31,7 +35,7 @@ func TestNodeName(t *testing.T) {
 		pod        *v1.Pod
 		node       *v1.Node
 		name       string
-		wantStatus *framework.Status
+		wantStatus *fwk.Status
 	}{
 		{
 			pod:  &v1.Pod{},
@@ -39,31 +43,15 @@ func TestNodeName(t *testing.T) {
 			name: "no host specified",
 		},
 		{
-			pod: &v1.Pod{
-				Spec: v1.PodSpec{
-					NodeName: "foo",
-				},
-			},
-			node: &v1.Node{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "foo",
-				},
-			},
+			pod:  st.MakePod().Node("foo").Obj(),
+			node: st.MakeNode().Name("foo").Obj(),
 			name: "host matches",
 		},
 		{
-			pod: &v1.Pod{
-				Spec: v1.PodSpec{
-					NodeName: "bar",
-				},
-			},
-			node: &v1.Node{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "foo",
-				},
-			},
+			pod:        st.MakePod().Node("bar").Obj(),
+			node:       st.MakeNode().Name("foo").Obj(),
 			name:       "host doesn't match",
-			wantStatus: framework.NewStatus(framework.UnschedulableAndUnresolvable, ErrReason),
+			wantStatus: fwk.NewStatus(fwk.UnschedulableAndUnresolvable, ErrReason),
 		},
 	}
 
@@ -71,11 +59,51 @@ func TestNodeName(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			nodeInfo := framework.NewNodeInfo()
 			nodeInfo.SetNode(test.node)
+			_, ctx := ktesting.NewTestContext(t)
+			p, err := New(ctx, nil, nil, feature.Features{})
+			if err != nil {
+				t.Fatalf("creating plugin: %v", err)
+			}
+			gotStatus := p.(fwk.FilterPlugin).Filter(ctx, nil, test.pod, nodeInfo)
+			if diff := cmp.Diff(test.wantStatus, gotStatus); diff != "" {
+				t.Errorf("status does not match (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
 
-			p, _ := New(nil, nil)
-			gotStatus := p.(framework.FilterPlugin).Filter(context.Background(), nil, test.pod, nodeInfo)
-			if !reflect.DeepEqual(gotStatus, test.wantStatus) {
-				t.Errorf("status does not match: %v, want: %v", gotStatus, test.wantStatus)
+func TestNodeName_PreFilter(t *testing.T) {
+	tests := []struct {
+		name       string
+		pod        *v1.Pod
+		wantResult *fwk.PreFilterResult
+	}{
+		{
+			name: "assigned pod with nodeName set, prefilter restricts to assigned node",
+			pod:  st.MakePod().Node("foo").Obj(),
+			wantResult: &fwk.PreFilterResult{
+				NodeNames: sets.New("foo"),
+			},
+		},
+		{
+			name: "unassigned pod without nodeName set, prefilter returns nil",
+			pod:  st.MakePod().Obj(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
+			p, err := New(ctx, nil, nil, feature.Features{})
+			if err != nil {
+				t.Fatalf("creating plugin: %v", err)
+			}
+			gotResult, gotStatus := p.(fwk.PreFilterPlugin).PreFilter(ctx, nil, tt.pod, nil)
+			if gotStatus != nil && !gotStatus.IsSuccess() {
+				t.Errorf("status does not match (-want,+got):\n-nil\n+%v", gotStatus)
+			}
+			if diff := cmp.Diff(tt.wantResult, gotResult); diff != "" {
+				t.Errorf("result does not match (-want,+got):\n%s", diff)
 			}
 		})
 	}

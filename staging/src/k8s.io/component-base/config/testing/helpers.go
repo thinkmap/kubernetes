@@ -19,8 +19,8 @@ package testing
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -46,7 +46,7 @@ func RunTestsOnYAMLData(t *testing.T, tests []TestCase) {
 }
 
 func decodeYAML(t *testing.T, path string, codec runtime.Codec) runtime.Object {
-	content, err := ioutil.ReadFile(path)
+	content, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func getCodecForGV(codecs serializer.CodecFactory, gv schema.GroupVersion) (runt
 }
 
 func matchOutputFile(t *testing.T, actual []byte, expectedFilePath string) {
-	expected, err := ioutil.ReadFile(expectedFilePath)
+	expected, err := os.ReadFile(expectedFilePath)
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("couldn't read test data: %v", err)
 	}
@@ -93,7 +93,10 @@ func matchOutputFile(t *testing.T, actual []byte, expectedFilePath string) {
 	}
 	if needsUpdate {
 		if os.Getenv(updateEnvVar) == "true" {
-			if err := ioutil.WriteFile(expectedFilePath, actual, 0644); err != nil {
+			if err := os.MkdirAll(filepath.Dir(expectedFilePath), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(expectedFilePath, actual, 0644); err != nil {
 				t.Fatal(err)
 			}
 			t.Error("wrote expected test data... verify, commit, and rerun tests")

@@ -19,52 +19,59 @@ package top
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/client-go/discovery"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/metricsutil"
+	"k8s.io/kubectl/pkg/util/completion"
 	"k8s.io/kubectl/pkg/util/i18n"
 	"k8s.io/kubectl/pkg/util/templates"
 	metricsapi "k8s.io/metrics/pkg/apis/metrics"
+	metricsV1api "k8s.io/metrics/pkg/apis/metrics/v1"
 	metricsV1beta1api "k8s.io/metrics/pkg/apis/metrics/v1beta1"
 	metricsclientset "k8s.io/metrics/pkg/client/clientset/versioned"
 )
 
+// TopNodeFlags directly reflect the information that CLI is gathering via flags.
+type TopNodeFlags struct {
+	Selector           string
+	SortBy             string
+	NoHeaders          bool
+	UseProtocolBuffers bool
+	ShowCapacity       bool
+	ShowSwap           bool
+
+	genericiooptions.IOStreams
+}
+
 // TopNodeOptions contains all the options for running the top-node cli command.
 type TopNodeOptions struct {
-	ResourceName    string
-	Selector        string
-	SortBy          string
-	NoHeaders       bool
+	ResourceName string
+	Selector     string
+	SortBy       string
+	NoHeaders    bool
+	ShowCapacity bool
+	ShowSwap     bool
+
 	NodeClient      corev1client.CoreV1Interface
 	Printer         *metricsutil.TopCmdPrinter
 	DiscoveryClient discovery.DiscoveryInterface
 	MetricsClient   metricsclientset.Interface
 
-	genericclioptions.IOStreams
-}
-
-func heapsterTopOptions(flags *pflag.FlagSet) {
-	flags.String("heapster-namespace", "kube-system", "Namespace Heapster service is located in")
-	flags.MarkDeprecated("heapster-namespace", "This flag is currently no-op and will be deleted.")
-	flags.String("heapster-service", "heapster", "Name of Heapster service")
-	flags.MarkDeprecated("heapster-service", "This flag is currently no-op and will be deleted.")
-	flags.String("heapster-scheme", "http", "Scheme (http or https) to connect to Heapster as")
-	flags.MarkDeprecated("heapster-scheme", "This flag is currently no-op and will be deleted.")
-	flags.String("heapster-port", "", "Port name in service to use")
-	flags.MarkDeprecated("heapster-port", "This flag is currently no-op and will be deleted.")
+	genericiooptions.IOStreams
 }
 
 var (
 	topNodeLong = templates.LongDesc(i18n.T(`
-		Display Resource (CPU/Memory/Storage) usage of nodes.
+		Display resource (CPU/memory) usage of nodes.
 
 		The top-node command allows you to see the resource consumption of nodes.`))
 
@@ -76,61 +83,86 @@ var (
 		  kubectl top node NODE_NAME`))
 )
 
-func NewCmdTopNode(f cmdutil.Factory, o *TopNodeOptions, streams genericclioptions.IOStreams) *cobra.Command {
-	if o == nil {
-		o = &TopNodeOptions{
-			IOStreams: streams,
-		}
+func NewTopNodeFlags(streams genericiooptions.IOStreams) *TopNodeFlags {
+	return &TopNodeFlags{
+		IOStreams:          streams,
+		UseProtocolBuffers: true,
 	}
+}
+
+func NewCmdTopNode(f cmdutil.Factory, streams genericiooptions.IOStreams) *cobra.Command {
+	flags := NewTopNodeFlags(streams)
 
 	cmd := &cobra.Command{
 		Use:                   "node [NAME | -l label]",
 		DisableFlagsInUseLine: true,
-		Short:                 i18n.T("Display Resource (CPU/Memory/Storage) usage of nodes"),
+		Short:                 i18n.T("Display resource (CPU/memory) usage of nodes"),
 		Long:                  topNodeLong,
 		Example:               topNodeExample,
+		ValidArgsFunction:     completion.ResourceNameCompletionFunc(f, "node"),
 		Run: func(cmd *cobra.Command, args []string) {
-			cmdutil.CheckErr(o.Complete(f, cmd, args))
+			o, err := flags.ToOptions(f, args)
+			cmdutil.CheckErr(err)
 			cmdutil.CheckErr(o.Validate())
 			cmdutil.CheckErr(o.RunTopNode())
 		},
 		Aliases: []string{"nodes", "no"},
 	}
-	cmd.Flags().StringVarP(&o.Selector, "selector", "l", o.Selector, "Selector (label query) to filter on, supports '=', '==', and '!='.(e.g. -l key1=value1,key2=value2)")
-	cmd.Flags().StringVar(&o.SortBy, "sort-by", o.Selector, "If non-empty, sort nodes list using specified field. The field can be either 'cpu' or 'memory'.")
-	cmd.Flags().BoolVar(&o.NoHeaders, "no-headers", o.NoHeaders, "If present, print output without headers")
-	heapsterTopOptions(cmd.Flags())
+	flags.AddFlags(cmd)
 
 	return cmd
 }
 
-func (o *TopNodeOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []string) error {
+// AddFlags registers flags for a cli
+func (flags *TopNodeFlags) AddFlags(cmd *cobra.Command) {
+	cmdutil.AddLabelSelectorFlagVar(cmd, &flags.Selector)
+	cmd.Flags().StringVar(&flags.SortBy, "sort-by", flags.SortBy, "If non-empty, sort nodes list using specified field. The field can be either 'cpu' or 'memory'.")
+	cmd.Flags().BoolVar(&flags.NoHeaders, "no-headers", flags.NoHeaders, "If present, print output without headers")
+	cmd.Flags().BoolVar(&flags.UseProtocolBuffers, "use-protocol-buffers", flags.UseProtocolBuffers, "Enables using protocol-buffers to access Metrics API.")
+	cmd.Flags().BoolVar(&flags.ShowCapacity, "show-capacity", flags.ShowCapacity, "Print node resources based on Capacity instead of Allocatable(default) of the nodes.")
+	cmd.Flags().BoolVar(&flags.ShowSwap, "show-swap", flags.ShowSwap, "Print node resources related to swap memory.")
+}
+
+// ToOptions converts from CLI inputs to runtime inputs
+func (flags *TopNodeFlags) ToOptions(f cmdutil.Factory, args []string) (*TopNodeOptions, error) {
+	o := &TopNodeOptions{
+		Selector:     flags.Selector,
+		SortBy:       flags.SortBy,
+		NoHeaders:    flags.NoHeaders,
+		ShowCapacity: flags.ShowCapacity,
+		ShowSwap:     flags.ShowSwap,
+		IOStreams:    flags.IOStreams,
+	}
+
 	if len(args) == 1 {
 		o.ResourceName = args[0]
 	} else if len(args) > 1 {
-		return cmdutil.UsageErrorf(cmd, "%s", cmd.Use)
+		return nil, fmt.Errorf("unexpected arguments: %v", args[1:])
 	}
 
 	clientset, err := f.KubernetesClientSet()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	o.DiscoveryClient = clientset.DiscoveryClient
 
 	config, err := f.ToRESTConfig()
 	if err != nil {
-		return err
+		return nil, err
+	}
+	if flags.UseProtocolBuffers {
+		config.ContentType = "application/vnd.kubernetes.protobuf"
 	}
 	o.MetricsClient, err = metricsclientset.NewForConfig(config)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	o.NodeClient = clientset.CoreV1()
 
-	o.Printer = metricsutil.NewTopCmdPrinter(o.Out)
-	return nil
+	o.Printer = metricsutil.NewTopCmdPrinter(o.Out, o.ShowSwap)
+	return o, nil
 }
 
 func (o *TopNodeOptions) Validate() error {
@@ -162,11 +194,11 @@ func (o TopNodeOptions) RunTopNode() error {
 
 	metricsAPIAvailable := SupportedMetricsAPIVersionAvailable(apiGroups)
 
-	if !metricsAPIAvailable {
+	if metricsAPIAvailable == "" {
 		return errors.New("Metrics API not available")
 	}
 
-	metrics, err := getNodeMetricsFromMetricsAPI(o.MetricsClient, o.ResourceName, selector)
+	metrics, err := getNodeMetricsFromMetricsAPI(o.MetricsClient, o.ResourceName, selector, metricsAPIAvailable)
 	if err != nil {
 		return err
 	}
@@ -192,17 +224,53 @@ func (o TopNodeOptions) RunTopNode() error {
 		nodes = append(nodes, nodeList.Items...)
 	}
 
-	allocatable := make(map[string]v1.ResourceList)
+	availableResources := make(map[string]v1.ResourceList)
 
 	for _, n := range nodes {
-		allocatable[n.Name] = n.Status.Allocatable
+		if !o.ShowCapacity {
+			availableResources[n.Name] = n.Status.Allocatable
+		} else {
+			availableResources[n.Name] = n.Status.Capacity
+		}
+
+		if n.Status.NodeInfo.Swap != nil && n.Status.NodeInfo.Swap.Capacity != nil {
+			swapCapacity := *n.Status.NodeInfo.Swap.Capacity
+			availableResources[n.Name]["swap"] = *resource.NewQuantity(swapCapacity, resource.BinarySI)
+		} else {
+			o.Printer.RegisterMissingResource(n.Name, metricsutil.ResourceSwap)
+		}
+
 	}
 
-	return o.Printer.PrintNodeMetrics(metrics.Items, allocatable, o.NoHeaders, o.SortBy)
+	return o.Printer.PrintNodeMetrics(metrics.Items, availableResources, o.NoHeaders, o.SortBy)
 }
 
-func getNodeMetricsFromMetricsAPI(metricsClient metricsclientset.Interface, resourceName string, selector labels.Selector) (*metricsapi.NodeMetricsList, error) {
+func getNodeMetricsFromMetricsAPI(metricsClient metricsclientset.Interface, resourceName string, selector labels.Selector, metricsVersion string) (*metricsapi.NodeMetricsList, error) {
 	var err error
+	if metricsVersion == "v1" {
+		versionedMetrics := &metricsV1api.NodeMetricsList{}
+		mc := metricsClient.MetricsV1()
+		nm := mc.NodeMetricses()
+		if resourceName != "" {
+			m, err := nm.Get(context.TODO(), resourceName, metav1.GetOptions{})
+			if err != nil {
+				return nil, err
+			}
+			versionedMetrics.Items = []metricsV1api.NodeMetrics{*m}
+		} else {
+			versionedMetrics, err = nm.List(context.TODO(), metav1.ListOptions{LabelSelector: selector.String()})
+			if err != nil {
+				return nil, err
+			}
+		}
+		metrics := &metricsapi.NodeMetricsList{}
+		err = metricsV1api.Convert_v1_NodeMetricsList_To_metrics_NodeMetricsList(versionedMetrics, metrics, nil)
+		if err != nil {
+			return nil, err
+		}
+		return metrics, nil
+	}
+	// fallback to metric v1beta1
 	versionedMetrics := &metricsV1beta1api.NodeMetricsList{}
 	mc := metricsClient.MetricsV1beta1()
 	nm := mc.NodeMetricses()

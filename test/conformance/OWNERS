@@ -2,15 +2,16 @@
 
 # This is the owner of the test code.  The test data itself is owned by sig-architecture.
 reviewers:
+  - BenTheElder
   - cheftako
   - oomichi
   - johnbelamaric
 approvers:
+  - BenTheElder
   - cheftako
-  - spiffxp
   - johnbelamaric
 emeritus_approvers:
-  - mml
+  - spiffxp
 labels:
   - area/conformance
   - sig/architecture

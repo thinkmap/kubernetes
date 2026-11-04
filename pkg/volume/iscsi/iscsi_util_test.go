@@ -1,3 +1,5 @@
+//go:build !windows
+
 /*
 Copyright 2015 The Kubernetes Authors.
 
@@ -17,15 +19,16 @@ limitations under the License.
 package iscsi
 
 import (
-	"io/ioutil"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
 
+	utiltesting "k8s.io/client-go/util/testing"
 	testingexec "k8s.io/utils/exec/testing"
 
-	"k8s.io/kubernetes/pkg/kubelet/config"
+	"k8s.io/kubernetes/pkg/kubelet/kubeletconfig"
 	"k8s.io/kubernetes/pkg/volume"
 	volumetest "k8s.io/kubernetes/pkg/volume/testing"
 )
@@ -66,6 +69,11 @@ func TestExtractPortalAndIqn(t *testing.T) {
 	devicePath = "127.0.0.1:3260-eui.02004567A425678D-lun-0"
 	portal, iqn, err = extractPortalAndIqn(devicePath)
 	if err != nil || portal != "127.0.0.1:3260" || iqn != "eui.02004567A425678D" {
+		t.Errorf("extractPortalAndIqn: got %v %s %s", err, portal, iqn)
+	}
+	devicePath = "[2001:db8:0:f101::1]:3260-iqn.2014-12.com.example:test.tgt00-lun-0"
+	portal, iqn, err = extractPortalAndIqn(devicePath)
+	if err != nil || portal != "[2001:db8:0:f101::1]:3260" || iqn != "iqn.2014-12.com.example:test.tgt00" {
 		t.Errorf("extractPortalAndIqn: got %v %s %s", err, portal, iqn)
 	}
 }
@@ -406,7 +414,7 @@ func TestGetVolCount(t *testing.T) {
 		},
 		{
 			name:    "volumeDevices (block) volume",
-			baseDir: filepath.Join(baseDir, config.DefaultKubeletVolumeDevicesDirName),
+			baseDir: filepath.Join(baseDir, kubeletconfig.DefaultKubeletVolumeDevicesDirName),
 			portal:  "192.168.0.2:3260",
 			iqn:     "iqn.2003-01.io.k8s:e2e.volume-1-lun-4",
 			count:   1,
@@ -434,7 +442,7 @@ func TestGetVolCount(t *testing.T) {
 }
 
 func createFakePluginDirs() (string, error) {
-	dir, err := ioutil.TempDir("", "refcounter")
+	dir, err := os.MkdirTemp("", "refcounter")
 	if err != nil {
 		return "", err
 	}
@@ -443,8 +451,8 @@ func createFakePluginDirs() (string, error) {
 		"iface-127.0.0.1:3260:pv1/127.0.0.1:3260-iqn.2003-01.io.k8s:e2e.volume-1-lun-3",
 		"iface-127.0.0.1:3260:pv2/127.0.0.1:3260-iqn.2003-01.io.k8s:e2e.volume-1-lun-2",
 		"iface-127.0.0.1:3260:pv2/192.168.0.1:3260-iqn.2003-01.io.k8s:e2e.volume-1-lun-1",
-		filepath.Join(config.DefaultKubeletVolumeDevicesDirName, "iface-127.0.0.1:3260/192.168.0.2:3260-iqn.2003-01.io.k8s:e2e.volume-1-lun-4"),
-		filepath.Join(config.DefaultKubeletVolumeDevicesDirName, "iface-127.0.0.1:3260/192.168.0.3:3260-iqn.2003-01.io.k8s:e2e.volume-1-lun-5"),
+		filepath.Join(kubeletconfig.DefaultKubeletVolumeDevicesDirName, "iface-127.0.0.1:3260/192.168.0.2:3260-iqn.2003-01.io.k8s:e2e.volume-1-lun-4"),
+		filepath.Join(kubeletconfig.DefaultKubeletVolumeDevicesDirName, "iface-127.0.0.1:3260/192.168.0.3:3260-iqn.2003-01.io.k8s:e2e.volume-1-lun-5"),
 	}
 
 	for _, d := range subdirs {
@@ -454,4 +462,86 @@ func createFakePluginDirs() (string, error) {
 	}
 
 	return dir, err
+}
+
+// TestDetachBlockISCSIDiskMissingDevicePath verifies that DetachBlockISCSIDisk
+// completes when the /dev/disk/by-path link is already gone, e.g. the iSCSI
+// session was lost before teardown ran, instead of failing permanently and
+// stranding the volume in node.status.volumesInUse.
+func TestDetachBlockISCSIDiskMissingDevicePath(t *testing.T) {
+	tmpDir, err := utiltesting.MkTmpdir("iscsi_test")
+	if err != nil {
+		t.Fatalf("error creating temp dir: %v", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(tmpDir); err != nil {
+			t.Errorf("error removing temp dir %s: %v", tmpDir, err)
+		}
+	}()
+
+	plugMgr := volume.VolumePluginMgr{}
+	if err := plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeVolumeHost(t, tmpDir, nil, nil)); err != nil {
+		t.Fatalf("error initializing plugins: %v", err)
+	}
+	plug, err := plugMgr.FindPluginByName(iscsiPluginName)
+	if err != nil {
+		t.Fatalf("can't find the plugin by name: %v", err)
+	}
+
+	portal := "127.0.0.1:3260"
+	iqn := "iqn.2016-01.com.example:test"
+	iface := "default"
+	mapPath := filepath.Join(tmpDir, "plugins", iscsiPluginName, "volumeDevices", "iface-"+iface, portal+"-"+iqn+"-lun-0")
+	if err := os.MkdirAll(mapPath, 0750); err != nil {
+		t.Fatalf("error creating map path %s: %v", mapPath, err)
+	}
+	// Persist the volume config so loadISCSI() succeeds like in production.
+	conf := iscsiDisk{
+		VolName: "vol0",
+		Portals: []string{portal},
+		Iqn:     iqn,
+		Lun:     "0",
+		Iface:   iface,
+	}
+	confData, err := json.Marshal(conf)
+	if err != nil {
+		t.Fatalf("error marshaling iscsi config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mapPath, "iscsi.json"), confData, 0644); err != nil {
+		t.Fatalf("error writing iscsi config: %v", err)
+	}
+
+	fakeExec := &testingexec.FakeExec{}
+	scripts := []volumetest.CommandScript{
+		{
+			Cmd:  "iscsiadm",
+			Args: []string{"-m", "node", "-p", portal, "-T", iqn, "--logout", "-I", iface},
+		},
+		{
+			Cmd:  "iscsiadm",
+			Args: []string{"-m", "node", "-p", portal, "-T", iqn, "-o", "delete", "-I", iface},
+		},
+	}
+	volumetest.ScriptCommands(fakeExec, scripts)
+	fakeExec.ExactOrder = true
+
+	unmapper := &iscsiDiskUnmapper{
+		iscsiDisk: &iscsiDisk{
+			VolName: "vol0",
+			Portals: []string{portal},
+			Iqn:     iqn,
+			Lun:     "0",
+			Iface:   iface,
+			plugin:  plug.(*iscsiPlugin),
+		},
+		exec: fakeExec,
+	}
+	// No /dev/disk/by-path/... link exists in the test environment; detach must
+	// still reach the logout step and complete.
+	if err := (&ISCSIUtil{}).DetachBlockISCSIDisk(*unmapper, mapPath); err != nil {
+		t.Fatalf("DetachBlockISCSIDisk failed: %v", err)
+	}
+	if fakeExec.CommandCalls != len(scripts) {
+		t.Errorf("expected %d iscsiadm calls, got %d", len(scripts), fakeExec.CommandCalls)
+	}
 }

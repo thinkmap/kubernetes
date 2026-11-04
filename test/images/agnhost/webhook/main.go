@@ -19,7 +19,7 @@ package webhook
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 
 	"github.com/spf13/cobra"
@@ -27,7 +27,7 @@ import (
 	v1 "k8s.io/api/admission/v1"
 	"k8s.io/api/admission/v1beta1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	// TODO: try this library to see if it generates correct json patch
 	// https://github.com/mattbaird/jsonpatch
 )
@@ -93,7 +93,7 @@ func delegateV1beta1AdmitToV1(f admitv1Func) admitv1beta1Func {
 func serve(w http.ResponseWriter, r *http.Request, admit admitHandler) {
 	var body []byte
 	if r.Body != nil {
-		if data, err := ioutil.ReadAll(r.Body); err == nil {
+		if data, err := io.ReadAll(r.Body); err == nil {
 			body = data
 		}
 	}

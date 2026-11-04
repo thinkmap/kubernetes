@@ -18,7 +18,7 @@ package testing
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -47,7 +47,7 @@ func GetRoundtripTestCases(t *testing.T, scheme *runtime.Scheme, codecs serializ
 
 	for gk, versions := range versionsForKind {
 		testdir := filepath.Join("testdata", gk.Kind, "roundtrip")
-		dirs, err := ioutil.ReadDir(testdir)
+		dirs, err := os.ReadDir(testdir)
 		if err != nil {
 			t.Fatalf("failed to read testdir %s: %v", testdir, err)
 		}
@@ -63,7 +63,7 @@ func GetRoundtripTestCases(t *testing.T, scheme *runtime.Scheme, codecs serializ
 
 					testname := dir.Name()
 					cases = append(cases, TestCase{
-						name:  fmt.Sprintf("%sTo%s_%s", vin, vout, testname),
+						name:  fmt.Sprintf("%s_%sTo%s_%s", gk.Kind, vin, vout, testname),
 						in:    filepath.Join(testdir, testname, vin+".yaml"),
 						out:   filepath.Join(testdir, testname, vout+".yaml"),
 						codec: codec,

@@ -1,3 +1,8 @@
+> ⚠️ **This is an automatically published [staged repository](https://git.k8s.io/kubernetes/staging#external-repository-staging-area) for Kubernetes**.   
+> Contributions, including issues and pull requests, should be made to the main Kubernetes repository: [https://github.com/kubernetes/kubernetes](https://github.com/kubernetes/kubernetes).  
+> This repository is read-only for importing, and not used for direct contributions.  
+> See [CONTRIBUTING.md](./CONTRIBUTING.md) for more details.
+
 # api
 
 Schema of the external API types that are served by the Kubernetes API server.
@@ -41,3 +46,5 @@ Branches track Kubernetes branches and are compatible with that repo.
 ## Things you should *NOT* do
 
 1. https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/api is synced to k8s.io/api. All changes must be made in the former. The latter is read-only.
+
+

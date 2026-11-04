@@ -18,6 +18,8 @@ package topologymanager
 
 import (
 	"testing"
+
+	"k8s.io/ktesting"
 )
 
 func TestPolicyNoneName(t *testing.T) {
@@ -46,12 +48,12 @@ func TestPolicyNoneCanAdmitPodResult(t *testing.T) {
 	}{
 		{
 			name:     "Preferred is set to false in topology hints",
-			hint:     TopologyHint{nil, false},
+			hint:     TopologyHint{NUMANodeAffinity: nil, Preferred: false},
 			expected: true,
 		},
 		{
 			name:     "Preferred is set to true in topology hints",
-			hint:     TopologyHint{nil, true},
+			hint:     TopologyHint{NUMANodeAffinity: nil, Preferred: true},
 			expected: true,
 		},
 	}
@@ -101,9 +103,11 @@ func TestPolicyNoneMerge(t *testing.T) {
 		},
 	}
 
+	logger, _ := ktesting.NewTestContext(t)
+
 	for _, tc := range tcases {
 		policy := NewNonePolicy()
-		result, admit := policy.Merge(tc.providersHints)
+		result, admit := policy.Merge(logger, tc.providersHints)
 		if !result.IsEqual(tc.expectedHint) || admit != tc.expectedAdmit {
 			t.Errorf("Test Case: %s: Expected merge hint to be %v, got %v", tc.name, tc.expectedHint, result)
 		}

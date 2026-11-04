@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 
@@ -32,7 +31,8 @@ import (
 
 const (
 	// NodePublishTimeOut_VolumeID is volume id that will result in NodePublish operation to timeout
-	NodePublishTimeOut_VolumeID = "node-publish-timeout"
+	NodePublishTimeOut_VolumeID    = "node-publish-timeout"
+	NodePublishFinalError_VolumeID = "node-publish-final-error"
 
 	// NodeStageTimeOut_VolumeID is a volume id that will result in NodeStage operation to timeout
 	NodeStageTimeOut_VolumeID = "node-stage-timeout"
@@ -41,11 +41,6 @@ const (
 // IdentityClient is a CSI identity client used for testing
 type IdentityClient struct {
 	nextErr error
-}
-
-// NewIdentityClient returns a new IdentityClient
-func NewIdentityClient() *IdentityClient {
-	return &IdentityClient{}
 }
 
 // SetNextError injects expected error
@@ -69,24 +64,34 @@ func (f *IdentityClient) Probe(ctx context.Context, in *csipb.ProbeRequest, opts
 }
 
 type CSIVolume struct {
-	VolumeHandle    string
-	VolumeContext   map[string]string
-	Path            string
-	DeviceMountPath string
-	FSType          string
-	MountFlags      []string
+	VolumeHandle     string
+	VolumeContext    map[string]string
+	Path             string
+	DeviceMountPath  string
+	FSType           string
+	MountFlags       []string
+	VolumeMountGroup string
 }
 
 // NodeClient returns CSI node client
 type NodeClient struct {
-	nodePublishedVolumes map[string]CSIVolume
-	nodeStagedVolumes    map[string]CSIVolume
-	stageUnstageSet      bool
-	expansionSet         bool
-	volumeStatsSet       bool
-	nodeGetInfoResp      *csipb.NodeGetInfoResponse
-	nodeVolumeStatsResp  *csipb.NodeGetVolumeStatsResponse
-	nextErr              error
+	nodePublishedVolumes     map[string]CSIVolume
+	nodeStagedVolumes        map[string]CSIVolume
+	stageUnstageSet          bool
+	expansionSet             bool
+	volumeStatsSet           bool
+	volumeHealthSet          bool
+	storageHealthSet         bool
+	SetVolumeStats           bool
+	SetVolumeHealth          bool
+	SetStorageHealth         bool
+	singleNodeMultiWriterSet bool
+	volumeMountGroupSet      bool
+	nodeGetInfoResp          *csipb.NodeGetInfoResponse
+	nodeVolumeStatsResp      *csipb.NodeGetVolumeStatsResponse
+	FakeNodeExpansionRequest *csipb.NodeExpandVolumeRequest
+	nextErr                  error
+	getCapabilitiesErr       error
 }
 
 // NewNodeClient returns fake node client
@@ -111,12 +116,45 @@ func NewNodeClientWithExpansion(stageUnstageSet bool, expansionSet bool) *NodeCl
 func NewNodeClientWithVolumeStats(volumeStatsSet bool) *NodeClient {
 	return &NodeClient{
 		volumeStatsSet: volumeStatsSet,
+		SetVolumeStats: true,
+	}
+}
+
+func NewNodeClientWithVolumeStatsAndHealth(volumeStatsSet, volumeHealth, setVolumeStats, setVolumeHealth bool) *NodeClient {
+	return &NodeClient{
+		volumeStatsSet:  volumeStatsSet,
+		volumeHealthSet: volumeHealth,
+		SetVolumeStats:  setVolumeStats,
+		SetVolumeHealth: setVolumeHealth,
+	}
+}
+
+func NewNodeClientWithSingleNodeMultiWriter(singleNodeMultiWriterSet bool) *NodeClient {
+	return &NodeClient{
+		nodePublishedVolumes:     make(map[string]CSIVolume),
+		nodeStagedVolumes:        make(map[string]CSIVolume),
+		stageUnstageSet:          true,
+		volumeStatsSet:           true,
+		singleNodeMultiWriterSet: singleNodeMultiWriterSet,
+	}
+}
+
+func NewNodeClientWithVolumeMountGroup(stageUnstageSet, volumeMountGroupSet bool) *NodeClient {
+	return &NodeClient{
+		nodePublishedVolumes: make(map[string]CSIVolume),
+		nodeStagedVolumes:    make(map[string]CSIVolume),
+		stageUnstageSet:      stageUnstageSet,
+		volumeMountGroupSet:  volumeMountGroupSet,
 	}
 }
 
 // SetNextError injects next expected error
 func (f *NodeClient) SetNextError(err error) {
 	f.nextErr = err
+}
+
+func (f *NodeClient) SetGetCapabilitiesErr(err error) {
+	f.getCapabilitiesErr = err
 }
 
 func (f *NodeClient) SetNodeGetInfoResp(resp *csipb.NodeGetInfoResponse) {
@@ -176,10 +214,14 @@ func (f *NodeClient) NodePublishVolume(ctx context.Context, req *csipb.NodePubli
 		return nil, timeoutErr
 	}
 
+	if req.GetVolumeId() == NodePublishFinalError_VolumeID {
+		return nil, status.Errorf(codes.Internal, "final error")
+	}
+
 	// "Creation of target_path is the responsibility of the SP."
 	// Our plugin depends on it.
 	if req.VolumeCapability.GetBlock() != nil {
-		if err := ioutil.WriteFile(req.TargetPath, []byte{}, 0644); err != nil {
+		if err := os.WriteFile(req.TargetPath, []byte{}, 0644); err != nil {
 			return nil, fmt.Errorf("cannot create target path %s for block file: %s", req.TargetPath, err)
 		}
 	} else {
@@ -197,6 +239,7 @@ func (f *NodeClient) NodePublishVolume(ctx context.Context, req *csipb.NodePubli
 	if req.GetVolumeCapability().GetMount() != nil {
 		publishedVolume.FSType = req.GetVolumeCapability().GetMount().FsType
 		publishedVolume.MountFlags = req.GetVolumeCapability().GetMount().MountFlags
+		publishedVolume.VolumeMountGroup = req.GetVolumeCapability().GetMount().VolumeMountGroup
 	}
 	f.nodePublishedVolumes[req.GetVolumeId()] = publishedVolume
 	return &csipb.NodePublishVolumeResponse{}, nil
@@ -248,6 +291,7 @@ func (f *NodeClient) NodeStageVolume(ctx context.Context, req *csipb.NodeStageVo
 	if mounted != nil {
 		fsType = mounted.GetFsType()
 		csiVol.MountFlags = mounted.GetMountFlags()
+		csiVol.VolumeMountGroup = mounted.VolumeMountGroup
 	}
 	if !strings.Contains(fsTypes, fsType) {
 		return nil, errors.New("invalid fstype")
@@ -296,6 +340,8 @@ func (f *NodeClient) NodeExpandVolume(ctx context.Context, req *csipb.NodeExpand
 		return nil, errors.New("required bytes should be greater than 0")
 	}
 
+	f.FakeNodeExpansionRequest = req
+
 	resp := &csipb.NodeExpandVolumeResponse{
 		CapacityBytes: req.GetCapacityRange().RequiredBytes,
 	}
@@ -315,6 +361,10 @@ func (f *NodeClient) NodeGetCapabilities(ctx context.Context, in *csipb.NodeGetC
 	resp := &csipb.NodeGetCapabilitiesResponse{
 		Capabilities: []*csipb.NodeServiceCapability{},
 	}
+	if f.getCapabilitiesErr != nil {
+		return resp, f.getCapabilitiesErr
+	}
+
 	if f.stageUnstageSet {
 		resp.Capabilities = append(resp.Capabilities, &csipb.NodeServiceCapability{
 			Type: &csipb.NodeServiceCapability_Rpc{
@@ -339,6 +389,46 @@ func (f *NodeClient) NodeGetCapabilities(ctx context.Context, in *csipb.NodeGetC
 			Type: &csipb.NodeServiceCapability_Rpc{
 				Rpc: &csipb.NodeServiceCapability_RPC{
 					Type: csipb.NodeServiceCapability_RPC_GET_VOLUME_STATS,
+				},
+			},
+		})
+	}
+
+	if f.volumeHealthSet {
+		resp.Capabilities = append(resp.Capabilities, &csipb.NodeServiceCapability{
+			Type: &csipb.NodeServiceCapability_Rpc{
+				Rpc: &csipb.NodeServiceCapability_RPC{
+					Type: csipb.NodeServiceCapability_RPC_GET_VOLUME_HEALTH,
+				},
+			},
+		})
+	}
+
+	if f.storageHealthSet {
+		resp.Capabilities = append(resp.Capabilities, &csipb.NodeServiceCapability{
+			Type: &csipb.NodeServiceCapability_Rpc{
+				Rpc: &csipb.NodeServiceCapability_RPC{
+					Type: csipb.NodeServiceCapability_RPC_GET_STORAGE_HEALTH,
+				},
+			},
+		})
+	}
+
+	if f.singleNodeMultiWriterSet {
+		resp.Capabilities = append(resp.Capabilities, &csipb.NodeServiceCapability{
+			Type: &csipb.NodeServiceCapability_Rpc{
+				Rpc: &csipb.NodeServiceCapability_RPC{
+					Type: csipb.NodeServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
+				},
+			},
+		})
+	}
+
+	if f.volumeMountGroupSet {
+		resp.Capabilities = append(resp.Capabilities, &csipb.NodeServiceCapability{
+			Type: &csipb.NodeServiceCapability_Rpc{
+				Rpc: &csipb.NodeServiceCapability_RPC{
+					Type: csipb.NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP,
 				},
 			},
 		})
@@ -370,15 +460,57 @@ func (f *NodeClient) NodeGetVolumeStats(ctx context.Context, req *csipb.NodeGetV
 	return &csipb.NodeGetVolumeStatsResponse{}, nil
 }
 
+// NodeGetVolumeHealth implements csi method
+func (f *NodeClient) NodeGetVolumeHealth(ctx context.Context, req *csipb.NodeGetVolumeHealthRequest, opts ...grpc.CallOption) (*csipb.NodeGetVolumeHealthResponse, error) {
+	if f.nextErr != nil {
+		return nil, f.nextErr
+	}
+	resp := &csipb.NodeGetVolumeHealthResponse{}
+	if f.SetVolumeHealth {
+		resp.VolumeHealth = &csipb.VolumeHealth{
+			VolumeId: req.GetVolumeId(),
+			HealthStatuses: []*csipb.VolumeHealth_VolumeHealthEntry{
+				{
+					Status:  csipb.VolumeHealthErrorType_DEGRADED,
+					Reason:  "FakeHealthIssue",
+					Message: "fake volume health issue",
+				},
+			},
+		}
+	}
+	return resp, nil
+}
+
+// NodeGetStorageHealth implements csi method
+func (f *NodeClient) NodeGetStorageHealth(ctx context.Context, req *csipb.NodeGetStorageHealthRequest, opts ...grpc.CallOption) (*csipb.NodeGetStorageHealthResponse, error) {
+	if f.nextErr != nil {
+		return nil, f.nextErr
+	}
+	resp := &csipb.NodeGetStorageHealthResponse{}
+	if f.SetStorageHealth {
+		resp.BackendHealth = []*csipb.NodeGetStorageHealthResponse_StorageBackendHealth{
+			{
+				Status:  csipb.StorageHealthErrorType_STORAGE_DEGRADED,
+				Reason:  "FakeStorageHealthIssue",
+				Message: "fake storage backend health issue",
+			},
+		}
+	}
+	return resp, nil
+}
+
+// NewNodeClientWithStorageHealth returns a fake node client with storage health capability.
+func NewNodeClientWithStorageHealth(storageHealth, setStorageHealth bool) *NodeClient {
+	return &NodeClient{
+		storageHealthSet: storageHealth,
+		SetStorageHealth: setStorageHealth,
+	}
+}
+
 // ControllerClient represents a CSI Controller client
 type ControllerClient struct {
 	nextCapabilities []*csipb.ControllerServiceCapability
 	nextErr          error
-}
-
-// NewControllerClient returns a ControllerClient
-func NewControllerClient() *ControllerClient {
-	return &ControllerClient{}
 }
 
 // SetNextError injects next expected error

@@ -18,11 +18,13 @@ package exec
 
 import (
 	"bytes"
+	"errors"
 
+	remote "k8s.io/cri-client/pkg"
 	"k8s.io/kubernetes/pkg/kubelet/util/ioutils"
 	"k8s.io/kubernetes/pkg/probe"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	"k8s.io/utils/exec"
 )
 
@@ -66,6 +68,11 @@ func (pr execProber) Probe(e exec.Cmd) (probe.Result, string, error) {
 			}
 			return probe.Failure, string(data), nil
 		}
+
+		if errors.Is(err, remote.ErrCommandTimedOut) {
+			return probe.Failure, err.Error(), nil
+		}
+
 		return probe.Unknown, "", err
 	}
 	return probe.Success, string(data), nil

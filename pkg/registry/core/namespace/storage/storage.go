@@ -20,10 +20,13 @@ import (
 	"context"
 	"fmt"
 
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
@@ -31,8 +34,6 @@ import (
 	"k8s.io/apiserver/pkg/storage"
 	storageerr "k8s.io/apiserver/pkg/storage/errors"
 	"k8s.io/apiserver/pkg/util/dryrun"
-
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/printers"
 	printersinternal "k8s.io/kubernetes/pkg/printers/internalversion"
@@ -59,14 +60,16 @@ type FinalizeREST struct {
 // NewREST returns a RESTStorage object that will work against namespaces.
 func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST, *FinalizeREST, error) {
 	store := &genericregistry.Store{
-		NewFunc:                  func() runtime.Object { return &api.Namespace{} },
-		NewListFunc:              func() runtime.Object { return &api.NamespaceList{} },
-		PredicateFunc:            namespace.MatchNamespace,
-		DefaultQualifiedResource: api.Resource("namespaces"),
+		NewFunc:                   func() runtime.Object { return &api.Namespace{} },
+		NewListFunc:               func() runtime.Object { return &api.NamespaceList{} },
+		PredicateFunc:             namespace.MatchNamespace,
+		DefaultQualifiedResource:  api.Resource("namespaces"),
+		SingularQualifiedResource: api.Resource("namespace"),
 
 		CreateStrategy:      namespace.Strategy,
 		UpdateStrategy:      namespace.Strategy,
 		DeleteStrategy:      namespace.Strategy,
+		ResetFieldsStrategy: namespace.Strategy,
 		ReturnDeletedObject: true,
 
 		ShouldDeleteDuringUpdate: ShouldDeleteNamespaceDuringUpdate,
@@ -80,9 +83,11 @@ func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST, *Finaliz
 
 	statusStore := *store
 	statusStore.UpdateStrategy = namespace.StatusStrategy
+	statusStore.ResetFieldsStrategy = namespace.StatusStrategy
 
 	finalizeStore := *store
 	finalizeStore.UpdateStrategy = namespace.FinalizeStrategy
+	finalizeStore.ResetFieldsStrategy = namespace.FinalizeStrategy
 
 	return &REST{store: store, status: &statusStore}, &StatusREST{store: &statusStore}, &FinalizeREST{store: &finalizeStore}, nil
 }
@@ -91,8 +96,19 @@ func (r *REST) NamespaceScoped() bool {
 	return r.store.NamespaceScoped()
 }
 
+var _ rest.SingularNameProvider = &REST{}
+
+func (r *REST) GetSingularName() string {
+	return r.store.GetSingularName()
+}
+
 func (r *REST) New() runtime.Object {
 	return r.store.New()
+}
+
+// Destroy cleans up resources on shutdown.
+func (r *REST) Destroy() {
+	r.store.Destroy()
 }
 
 func (r *REST) NewList() runtime.Object {
@@ -117,10 +133,6 @@ func (r *REST) Get(ctx context.Context, name string, options *metav1.GetOptions)
 
 func (r *REST) Watch(ctx context.Context, options *metainternalversion.ListOptions) (watch.Interface, error) {
 	return r.store.Watch(ctx, options)
-}
-
-func (r *REST) Export(ctx context.Context, name string, opts metav1.ExportOptions) (runtime.Object, error) {
-	return r.store.Export(ctx, name, opts)
 }
 
 // Delete enforces life-cycle rules for namespace termination
@@ -221,6 +233,7 @@ func (r *REST) Delete(ctx context.Context, name string, deleteValidation rest.Va
 				return existingNamespace, nil
 			}),
 			dryrun.IsDryRun(options.DryRun),
+			nil,
 		)
 
 		if err != nil {
@@ -253,6 +266,7 @@ func ShouldDeleteNamespaceDuringUpdate(ctx context.Context, key string, obj, exi
 }
 
 func shouldHaveOrphanFinalizer(options *metav1.DeleteOptions, haveOrphanFinalizer bool) bool {
+	//nolint:staticcheck // SA1019 backwards compatibility
 	if options.OrphanDependents != nil {
 		return *options.OrphanDependents
 	}
@@ -263,6 +277,7 @@ func shouldHaveOrphanFinalizer(options *metav1.DeleteOptions, haveOrphanFinalize
 }
 
 func shouldHaveDeleteDependentsFinalizer(options *metav1.DeleteOptions, haveDeleteDependentsFinalizer bool) bool {
+	//nolint:staticcheck // SA1019 backwards compatibility
 	if options.OrphanDependents != nil {
 		return *options.OrphanDependents == false
 	}
@@ -290,8 +305,18 @@ func (r *REST) StorageVersion() runtime.GroupVersioner {
 	return r.store.StorageVersion()
 }
 
+// GetResetFields implements rest.ResetFieldsStrategy
+func (r *REST) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return r.store.GetResetFields()
+}
 func (r *StatusREST) New() runtime.Object {
 	return r.store.New()
+}
+
+// Destroy cleans up resources on shutdown.
+func (r *StatusREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
 }
 
 // Get retrieves the object from the storage. It is required to support Patch.
@@ -306,8 +331,23 @@ func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.Updat
 	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, false, options)
 }
 
+// GetResetFields implements rest.ResetFieldsStrategy
+func (r *StatusREST) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return r.store.GetResetFields()
+}
+
+func (r *StatusREST) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
+	return r.store.ConvertToTable(ctx, object, tableOptions)
+}
+
 func (r *FinalizeREST) New() runtime.Object {
 	return r.store.New()
+}
+
+// Destroy cleans up resources on shutdown.
+func (r *FinalizeREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
 }
 
 // Update alters the status finalizers subset of an object.
@@ -315,4 +355,9 @@ func (r *FinalizeREST) Update(ctx context.Context, name string, objInfo rest.Upd
 	// We are explicitly setting forceAllowCreate to false in the call to the underlying storage because
 	// subresources should never allow create on update.
 	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, false, options)
+}
+
+// GetResetFields implements rest.ResetFieldsStrategy
+func (r *FinalizeREST) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return r.store.GetResetFields()
 }

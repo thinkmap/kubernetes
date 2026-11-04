@@ -29,15 +29,16 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	client "k8s.io/apiextensions-api/pkg/client/clientset/clientset/typed/apiextensions/v1"
+	informers "k8s.io/apiextensions-api/pkg/client/informers/externalversions/apiextensions/v1"
+	listers "k8s.io/apiextensions-api/pkg/client/listers/apiextensions/v1"
 	apiextensionshelpers "k8s.io/apiextensions-apiserver/pkg/apihelpers"
 	apiextensionsinternal "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apiextensionsv1conversion "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
-	client "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/typed/apiextensions/v1"
-	informers "k8s.io/apiextensions-apiserver/pkg/client/informers/externalversions/apiextensions/v1"
-	listers "k8s.io/apiextensions-apiserver/pkg/client/listers/apiextensions/v1"
 )
 
 // ConditionController is maintaining the NonStructuralSchema condition.
@@ -48,9 +49,9 @@ type ConditionController struct {
 	crdSynced cache.InformerSynced
 
 	// To allow injection for testing.
-	syncFn func(key string) error
+	syncFn func(ctx context.Context, key string) error
 
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[string]
 
 	// last generation this controller updated the condition per CRD name (to avoid two
 	// different version of the apiextensions-apiservers in HA to fight for the right message)
@@ -64,10 +65,13 @@ func NewConditionController(
 	crdClient client.CustomResourceDefinitionsGetter,
 ) *ConditionController {
 	c := &ConditionController{
-		crdClient:          crdClient,
-		crdLister:          crdInformer.Lister(),
-		crdSynced:          crdInformer.Informer().HasSynced,
-		queue:              workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "non_structural_schema_condition_controller"),
+		crdClient: crdClient,
+		crdLister: crdInformer.Lister(),
+		crdSynced: crdInformer.Informer().HasSynced,
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "non_structural_schema_condition_controller"},
+		),
 		lastSeenGeneration: map[string]int64{},
 	}
 
@@ -90,13 +94,19 @@ func calculateCondition(in *apiextensionsv1.CustomResourceDefinition) *apiextens
 
 	allErrs := field.ErrorList{}
 
+	if in.Spec.PreserveUnknownFields {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "preserveUnknownFields"),
+			in.Spec.PreserveUnknownFields,
+			fmt.Sprint("must be false")))
+	}
+
 	for i, v := range in.Spec.Versions {
 		if v.Schema == nil || v.Schema.OpenAPIV3Schema == nil {
 			continue
 		}
 
 		internalSchema := &apiextensionsinternal.CustomResourceValidation{}
-		if err := apiextensionsv1.Convert_v1_CustomResourceValidation_To_apiextensions_CustomResourceValidation(v.Schema, internalSchema, nil); err != nil {
+		if err := apiextensionsv1conversion.Convert_v1_CustomResourceValidation_To_apiextensions_CustomResourceValidation(v.Schema, internalSchema, nil); err != nil {
 			klog.Errorf("failed to convert CRD validation to internal version: %v", err)
 			continue
 		}
@@ -123,7 +133,7 @@ func calculateCondition(in *apiextensionsv1.CustomResourceDefinition) *apiextens
 	return cond
 }
 
-func (c *ConditionController) sync(key string) error {
+func (c *ConditionController) sync(ctx context.Context, key string) error {
 	inCustomResourceDefinition, err := c.crdLister.Get(key)
 	if apierrors.IsNotFound(err) {
 		return nil
@@ -160,7 +170,7 @@ func (c *ConditionController) sync(key string) error {
 		apiextensionshelpers.SetCRDCondition(crd, *cond)
 	}
 
-	_, err = c.crdClient.CustomResourceDefinitions().UpdateStatus(context.TODO(), crd, metav1.UpdateOptions{})
+	_, err = c.crdClient.CustomResourceDefinitions().UpdateStatus(ctx, crd, metav1.UpdateOptions{})
 	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
 		// deleted or changed in the meantime, we'll get called again
 		return nil
@@ -179,38 +189,45 @@ func (c *ConditionController) sync(key string) error {
 }
 
 // Run starts the controller.
-func (c *ConditionController) Run(threadiness int, stopCh <-chan struct{}) {
+//
+//logcheck:context // RunWithContext should be used instead of Run in code which supports contextual logging.
+func (c *ConditionController) Run(workers int, stopCh <-chan struct{}) {
+	c.RunWithContext(workers, wait.ContextForChannel(stopCh))
+}
+
+// RunWithContext is a context-aware version of Run.
+func (c *ConditionController) RunWithContext(workers int, ctx context.Context) {
 	defer utilruntime.HandleCrash()
 	defer c.queue.ShutDown()
 
 	klog.Infof("Starting NonStructuralSchemaConditionController")
 	defer klog.Infof("Shutting down NonStructuralSchemaConditionController")
 
-	if !cache.WaitForCacheSync(stopCh, c.crdSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), c.crdSynced) {
 		return
 	}
 
-	for i := 0; i < threadiness; i++ {
-		go wait.Until(c.runWorker, time.Second, stopCh)
+	for i := 0; i < workers; i++ {
+		go wait.UntilWithContext(ctx, c.runWorker, time.Second)
 	}
 
-	<-stopCh
+	<-ctx.Done()
 }
 
-func (c *ConditionController) runWorker() {
-	for c.processNextWorkItem() {
+func (c *ConditionController) runWorker(ctx context.Context) {
+	for c.processNextWorkItem(ctx) {
 	}
 }
 
 // processNextWorkItem deals with one key off the queue.  It returns false when it's time to quit.
-func (c *ConditionController) processNextWorkItem() bool {
+func (c *ConditionController) processNextWorkItem(ctx context.Context) bool {
 	key, quit := c.queue.Get()
 	if quit {
 		return false
 	}
 	defer c.queue.Done(key)
 
-	err := c.syncFn(key.(string))
+	err := c.syncFn(ctx, key)
 	if err == nil {
 		c.queue.Forget(key)
 		return true

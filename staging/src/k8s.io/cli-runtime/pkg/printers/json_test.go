@@ -21,13 +21,12 @@ import (
 	"reflect"
 	"testing"
 
-	"k8s.io/api/core/v1"
+	"github.com/google/go-cmp/cmp"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/client-go/kubernetes/scheme"
-	"sigs.k8s.io/yaml"
 )
 
 var testData = TestStruct{
@@ -39,7 +38,7 @@ var testData = TestStruct{
 }
 
 type TestStruct struct {
-	metav1.TypeMeta   `json:",inline"`
+	metav1.TypeMeta   `json:""`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 	Key               string         `json:"Key"`
 	Map               map[string]int `json:"Map"`
@@ -49,10 +48,6 @@ type TestStruct struct {
 
 func (in *TestStruct) DeepCopyObject() runtime.Object {
 	panic("never called")
-}
-
-func TestYAMLPrinter(t *testing.T) {
-	testPrinter(t, NewTypeSetter(scheme.Scheme).ToPrinter(&YAMLPrinter{}), yamlUnmarshal)
 }
 
 func TestJSONPrinter(t *testing.T) {
@@ -79,7 +74,7 @@ func testPrinter(t *testing.T, printer ResourcePrinter, unmarshalFunc func(data 
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(testData, poutput) {
-		t.Errorf("Test data and unmarshaled data are not equal: %v", diff.ObjectDiff(poutput, testData))
+		t.Errorf("Test data and unmarshaled data are not equal: %v", cmp.Diff(poutput, testData))
 	}
 
 	obj := &v1.Pod{
@@ -102,20 +97,17 @@ func testPrinter(t *testing.T, printer ResourcePrinter, unmarshalFunc func(data 
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(obj, &objOut) {
-		t.Errorf("Unexpected inequality:\n%v", diff.ObjectDiff(obj, &objOut))
+		t.Errorf("Unexpected inequality:\n%v", cmp.Diff(obj, &objOut))
 	}
-}
-
-func yamlUnmarshal(data []byte, v interface{}) error {
-	return yaml.Unmarshal(data, v)
 }
 
 func TestPrintersSuccess(t *testing.T) {
 	om := func(name string) metav1.ObjectMeta { return metav1.ObjectMeta{Name: name} }
 
 	genericPrinters := map[string]ResourcePrinter{
-		"json": NewTypeSetter(scheme.Scheme).ToPrinter(&JSONPrinter{}),
-		"yaml": NewTypeSetter(scheme.Scheme).ToPrinter(&YAMLPrinter{}),
+		"json":  NewTypeSetter(scheme.Scheme).ToPrinter(&JSONPrinter{}),
+		"yaml":  NewTypeSetter(scheme.Scheme).ToPrinter(&YAMLPrinter{}),
+		"kyaml": NewTypeSetter(scheme.Scheme).ToPrinter(&KYAMLPrinter{}),
 	}
 	objects := map[string]runtime.Object{
 		"pod":             &v1.Pod{ObjectMeta: om("pod")},

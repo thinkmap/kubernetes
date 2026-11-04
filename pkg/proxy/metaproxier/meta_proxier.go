@@ -17,23 +17,17 @@ limitations under the License.
 package metaproxier
 
 import (
-	"fmt"
-
-	"k8s.io/api/core/v1"
-	"k8s.io/klog"
+	v1 "k8s.io/api/core/v1"
+	discovery "k8s.io/api/discovery/v1"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/proxy"
-	"k8s.io/kubernetes/pkg/proxy/config"
-
-	utilnet "k8s.io/utils/net"
-
-	discovery "k8s.io/api/discovery/v1beta1"
 )
 
 type metaProxier struct {
+	// actual, wrapped
 	ipv4Proxier proxy.Provider
+	// actual, wrapped
 	ipv6Proxier proxy.Provider
-	// TODO(imroc): implement node handler for meta proxier.
-	config.NoopNodeHandler
 }
 
 // NewMetaProxier returns a dual-stack "meta-proxier". Proxier API
@@ -62,33 +56,23 @@ func (proxier *metaProxier) SyncLoop() {
 
 // OnServiceAdd is called whenever creation of new service object is observed.
 func (proxier *metaProxier) OnServiceAdd(service *v1.Service) {
-	if *(service.Spec.IPFamily) == v1.IPv4Protocol {
-		proxier.ipv4Proxier.OnServiceAdd(service)
-		return
-	}
+	proxier.ipv4Proxier.OnServiceAdd(service)
 	proxier.ipv6Proxier.OnServiceAdd(service)
 }
 
 // OnServiceUpdate is called whenever modification of an existing
 // service object is observed.
 func (proxier *metaProxier) OnServiceUpdate(oldService, service *v1.Service) {
-	// IPFamily is immutable, hence we only need to check on the new service
-	if *(service.Spec.IPFamily) == v1.IPv4Protocol {
-		proxier.ipv4Proxier.OnServiceUpdate(oldService, service)
-		return
-	}
-
+	proxier.ipv4Proxier.OnServiceUpdate(oldService, service)
 	proxier.ipv6Proxier.OnServiceUpdate(oldService, service)
 }
 
 // OnServiceDelete is called whenever deletion of an existing service
 // object is observed.
 func (proxier *metaProxier) OnServiceDelete(service *v1.Service) {
-	if *(service.Spec.IPFamily) == v1.IPv4Protocol {
-		proxier.ipv4Proxier.OnServiceDelete(service)
-		return
-	}
+	proxier.ipv4Proxier.OnServiceDelete(service)
 	proxier.ipv6Proxier.OnServiceDelete(service)
+
 }
 
 // OnServiceSynced is called once all the initial event handlers were
@@ -97,62 +81,6 @@ func (proxier *metaProxier) OnServiceSynced() {
 	proxier.ipv4Proxier.OnServiceSynced()
 	proxier.ipv6Proxier.OnServiceSynced()
 }
-
-// OnEndpointsAdd is called whenever creation of new endpoints object
-// is observed.
-func (proxier *metaProxier) OnEndpointsAdd(endpoints *v1.Endpoints) {
-	ipFamily, err := endpointsIPFamily(endpoints)
-	if err != nil {
-		klog.V(4).Infof("failed to add endpoints %s/%s with error %v", endpoints.ObjectMeta.Namespace, endpoints.ObjectMeta.Name, err)
-		return
-	}
-	if *ipFamily == v1.IPv4Protocol {
-		proxier.ipv4Proxier.OnEndpointsAdd(endpoints)
-		return
-	}
-	proxier.ipv6Proxier.OnEndpointsAdd(endpoints)
-}
-
-// OnEndpointsUpdate is called whenever modification of an existing
-// endpoints object is observed.
-func (proxier *metaProxier) OnEndpointsUpdate(oldEndpoints, endpoints *v1.Endpoints) {
-	ipFamily, err := endpointsIPFamily(endpoints)
-	if err != nil {
-		klog.V(4).Infof("failed to update endpoints %s/%s with error %v", endpoints.ObjectMeta.Namespace, endpoints.ObjectMeta.Name, err)
-		return
-	}
-
-	if *ipFamily == v1.IPv4Protocol {
-		proxier.ipv4Proxier.OnEndpointsUpdate(oldEndpoints, endpoints)
-		return
-	}
-	proxier.ipv6Proxier.OnEndpointsUpdate(oldEndpoints, endpoints)
-}
-
-// OnEndpointsDelete is called whenever deletion of an existing
-// endpoints object is observed.
-func (proxier *metaProxier) OnEndpointsDelete(endpoints *v1.Endpoints) {
-	ipFamily, err := endpointsIPFamily(endpoints)
-	if err != nil {
-		klog.V(4).Infof("failed to delete endpoints %s/%s with error %v", endpoints.ObjectMeta.Namespace, endpoints.ObjectMeta.Name, err)
-		return
-	}
-
-	if *ipFamily == v1.IPv4Protocol {
-		proxier.ipv4Proxier.OnEndpointsDelete(endpoints)
-		return
-	}
-	proxier.ipv6Proxier.OnEndpointsDelete(endpoints)
-}
-
-// OnEndpointsSynced is called once all the initial event handlers
-// were called and the state is fully propagated to local cache.
-func (proxier *metaProxier) OnEndpointsSynced() {
-	proxier.ipv4Proxier.OnEndpointsSynced()
-	proxier.ipv6Proxier.OnEndpointsSynced()
-}
-
-// TODO: (khenidak) implement EndpointSlice handling
 
 // OnEndpointSliceAdd is called whenever creation of a new endpoint slice object
 // is observed.
@@ -163,7 +91,7 @@ func (proxier *metaProxier) OnEndpointSliceAdd(endpointSlice *discovery.Endpoint
 	case discovery.AddressTypeIPv6:
 		proxier.ipv6Proxier.OnEndpointSliceAdd(endpointSlice)
 	default:
-		klog.V(4).Infof("EndpointSlice address type not supported by kube-proxy: %s", endpointSlice.AddressType)
+		klog.ErrorS(nil, "EndpointSlice address type not supported", "addressType", endpointSlice.AddressType)
 	}
 }
 
@@ -176,7 +104,7 @@ func (proxier *metaProxier) OnEndpointSliceUpdate(oldEndpointSlice, newEndpointS
 	case discovery.AddressTypeIPv6:
 		proxier.ipv6Proxier.OnEndpointSliceUpdate(oldEndpointSlice, newEndpointSlice)
 	default:
-		klog.V(4).Infof("EndpointSlice address type not supported by kube-proxy: %s", newEndpointSlice.AddressType)
+		klog.ErrorS(nil, "EndpointSlice address type not supported", "addressType", newEndpointSlice.AddressType)
 	}
 }
 
@@ -189,7 +117,7 @@ func (proxier *metaProxier) OnEndpointSliceDelete(endpointSlice *discovery.Endpo
 	case discovery.AddressTypeIPv6:
 		proxier.ipv6Proxier.OnEndpointSliceDelete(endpointSlice)
 	default:
-		klog.V(4).Infof("EndpointSlice address type not supported by kube-proxy: %s", endpointSlice.AddressType)
+		klog.ErrorS(nil, "EndpointSlice address type not supported", "addressType", endpointSlice.AddressType)
 	}
 }
 
@@ -200,30 +128,15 @@ func (proxier *metaProxier) OnEndpointSlicesSynced() {
 	proxier.ipv6Proxier.OnEndpointSlicesSynced()
 }
 
-// endpointsIPFamily that returns IPFamily of endpoints or error if
-// failed to identify the IP family.
-func endpointsIPFamily(endpoints *v1.Endpoints) (*v1.IPFamily, error) {
-	if len(endpoints.Subsets) == 0 {
-		return nil, fmt.Errorf("failed to identify ipfamily for endpoints (no subsets)")
-	}
+// OnTopologyChange is called whenever change in proxy relevant topology labels is observed.
+func (proxier *metaProxier) OnTopologyChange(topologyLabels map[string]string) {
+	proxier.ipv4Proxier.OnTopologyChange(topologyLabels)
+	proxier.ipv6Proxier.OnTopologyChange(topologyLabels)
+}
 
-	// we only need to work with subset [0],endpoint controller
-	// ensures that endpoints selected are of the same family.
-	subset := endpoints.Subsets[0]
-	if len(subset.Addresses) == 0 {
-		return nil, fmt.Errorf("failed to identify ipfamily for endpoints (no addresses)")
-	}
-	// same apply on addresses
-	address := subset.Addresses[0]
-	if len(address.IP) == 0 {
-		return nil, fmt.Errorf("failed to identify ipfamily for endpoints (address has no ip)")
-	}
-
-	ipv4 := v1.IPv4Protocol
-	ipv6 := v1.IPv6Protocol
-	if utilnet.IsIPv6String(address.IP) {
-		return &ipv6, nil
-	}
-
-	return &ipv4, nil
+// OnServiceCIDRsChanged is called whenever a change is observed
+// in any of the ServiceCIDRs, and provides complete list of service cidrs.
+func (proxier *metaProxier) OnServiceCIDRsChanged(cidrs []string) {
+	proxier.ipv4Proxier.OnServiceCIDRsChanged(cidrs)
+	proxier.ipv6Proxier.OnServiceCIDRsChanged(cidrs)
 }

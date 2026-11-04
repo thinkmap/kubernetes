@@ -16,13 +16,12 @@ limitations under the License.
 
 package topologymanager
 
-import (
-	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager/bitmask"
-)
+import "k8s.io/klog/v2"
 
 type singleNumaNodePolicy struct {
-	//List of NUMA Nodes available on the underlying machine
-	numaNodes []int
+	// numaInfo represents list of NUMA Nodes available on the underlying machine and distances between them
+	numaInfo *NUMAInfo
+	opts     PolicyOptions
 }
 
 var _ Policy = &singleNumaNodePolicy{}
@@ -31,8 +30,8 @@ var _ Policy = &singleNumaNodePolicy{}
 const PolicySingleNumaNode string = "single-numa-node"
 
 // NewSingleNumaNodePolicy returns single-numa-node policy.
-func NewSingleNumaNodePolicy(numaNodes []int) Policy {
-	return &singleNumaNodePolicy{numaNodes: numaNodes}
+func NewSingleNumaNodePolicy(numaInfo *NUMAInfo, opts PolicyOptions) Policy {
+	return &singleNumaNodePolicy{numaInfo: numaInfo, opts: opts}
 }
 
 func (p *singleNumaNodePolicy) Name() string {
@@ -49,10 +48,10 @@ func filterSingleNumaHints(allResourcesHints [][]TopologyHint) [][]TopologyHint 
 	for _, oneResourceHints := range allResourcesHints {
 		var filtered []TopologyHint
 		for _, hint := range oneResourceHints {
-			if hint.NUMANodeAffinity == nil && hint.Preferred == true {
+			if hint.NUMANodeAffinity == nil && hint.Preferred {
 				filtered = append(filtered, hint)
 			}
-			if hint.NUMANodeAffinity != nil && hint.NUMANodeAffinity.Count() == 1 && hint.Preferred == true {
+			if hint.NUMANodeAffinity != nil && hint.NUMANodeAffinity.Count() == 1 && hint.Preferred {
 				filtered = append(filtered, hint)
 			}
 		}
@@ -61,15 +60,16 @@ func filterSingleNumaHints(allResourcesHints [][]TopologyHint) [][]TopologyHint 
 	return filteredResourcesHints
 }
 
-func (p *singleNumaNodePolicy) Merge(providersHints []map[string][]TopologyHint) (TopologyHint, bool) {
-	filteredHints := filterProvidersHints(providersHints)
+func (p *singleNumaNodePolicy) Merge(logger klog.Logger, providersHints []map[string][]TopologyHint) (TopologyHint, bool) {
+	filteredHints := filterProvidersHints(logger, providersHints)
 	// Filter to only include don't cares and hints with a single NUMA node.
 	singleNumaHints := filterSingleNumaHints(filteredHints)
-	bestHint := mergeFilteredHints(p.numaNodes, singleNumaHints)
 
-	defaultAffinity, _ := bitmask.NewBitMask(p.numaNodes...)
-	if bestHint.NUMANodeAffinity.IsEqual(defaultAffinity) {
-		bestHint = TopologyHint{nil, bestHint.Preferred}
+	merger := NewHintMerger(p.numaInfo, singleNumaHints, p.Name(), p.opts)
+	bestHint := merger.Merge(logger)
+
+	if bestHint.NUMANodeAffinity.IsEqual(p.numaInfo.DefaultAffinityMask()) {
+		bestHint = TopologyHint{NUMANodeAffinity: nil, Preferred: bestHint.Preferred}
 	}
 
 	admit := p.canAdmitPodResult(&bestHint)
